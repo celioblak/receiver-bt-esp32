@@ -67,7 +67,7 @@ receiver-bt-esp32/
 ## Roadmap
 
 - [x] Etapa 1 — Estrutura inicial do repositório
-- [ ] Etapa 2 — `config.h`, `storage.c` (wrapper NVS), `logger.c` (ring buffer)
+- [x] Etapa 2 — `config.h`, `storage.c` (wrapper NVS), `logger.c` (ring buffer)
 - [ ] Etapa 3 — `audio_codec.c`: pipeline ESP-ADF (BT → I2S → ES8388)
 - [ ] Etapa 4 — `bt_audio.c`: A2DP sink + AVRCP
 - [ ] Etapa 5 — `relay_control.c`: controle do amplificador via GPIO22
