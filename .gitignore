@@ -1,0 +1,24 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# ESP-IDF build
+build/
+sdkconfig
+sdkconfig.old
+
+# Componentes gerenciados / submodules baixados automaticamente
+managed_components/
+
+# VS Code
+.vscode/*
+!.vscode/extensions.json
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Logs e artefatos locais
+*.log
+*.bin.local

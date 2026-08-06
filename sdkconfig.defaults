@@ -1,0 +1,27 @@
+# Receiver Bluetooth DIY — configurações padrão do menuconfig (ESP-IDF)
+# Aplicadas na primeira geração do sdkconfig. Ajustes manuais via
+# `pio run -t menuconfig` sobrescrevem o sdkconfig, não este arquivo.
+
+# --- Bluetooth ---
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CLASSIC_ENABLED=y
+CONFIG_BT_A2DP_ENABLE=y
+CONFIG_BT_AVRC_CT_ENABLE=y
+CONFIG_BT_SPP_ENABLED=n
+
+# --- Partições ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- Memória ---
+# ESP32-A1S do Audio Kit V2.2 não possui PSRAM
+CONFIG_ESP32_SPIRAM_SUPPORT=n
+
+# --- FreeRTOS ---
+CONFIG_FREERTOS_HZ=1000
+
+# --- Flash ---
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# --- SPIFFS ---
+CONFIG_SPIFFS_USE_MAGIC_LENGTH=y
