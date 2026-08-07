@@ -25,6 +25,18 @@
             <label for="relay_timeout_s">Timeout do amplificador (segundos sem tocar)</label>
             <input type="number" id="relay_timeout_s" min="5" max="600">
 
+            <label for="mqtt_host">Broker MQTT (Home Assistant) — endereço</label>
+            <input type="text" id="mqtt_host" maxlength="63" placeholder="deixe em branco para desativar">
+
+            <label for="mqtt_port">Porta MQTT</label>
+            <input type="number" id="mqtt_port" min="1" max="65535">
+
+            <label for="mqtt_user">Usuário MQTT</label>
+            <input type="text" id="mqtt_user" maxlength="31">
+
+            <label for="mqtt_pass">Senha MQTT</label>
+            <input type="password" id="mqtt_pass" maxlength="63" placeholder="deixe em branco para manter">
+
             <button type="submit">Salvar</button>
             <div id="save-msg"></div>
         </form>
@@ -38,6 +50,9 @@ async function load() {
     document.getElementById("device_name").value = c.device_name;
     document.getElementById("wifi_ssid").value = c.wifi_ssid;
     document.getElementById("relay_timeout_s").value = c.relay_timeout_s;
+    document.getElementById("mqtt_host").value = c.mqtt_host;
+    document.getElementById("mqtt_port").value = c.mqtt_port;
+    document.getElementById("mqtt_user").value = c.mqtt_user;
 }
 
 document.getElementById("config-form").addEventListener("submit", async (e) => {
@@ -46,9 +61,14 @@ document.getElementById("config-form").addEventListener("submit", async (e) => {
         device_name: document.getElementById("device_name").value,
         wifi_ssid: document.getElementById("wifi_ssid").value,
         relay_timeout_s: parseInt(document.getElementById("relay_timeout_s").value, 10),
+        mqtt_host: document.getElementById("mqtt_host").value,
+        mqtt_port: parseInt(document.getElementById("mqtt_port").value, 10) || 1883,
+        mqtt_user: document.getElementById("mqtt_user").value,
     };
-    const pass = document.getElementById("wifi_pass").value;
-    if (pass) body.wifi_pass = pass;
+    const wifiPass = document.getElementById("wifi_pass").value;
+    if (wifiPass) body.wifi_pass = wifiPass;
+    const mqttPass = document.getElementById("mqtt_pass").value;
+    if (mqttPass) body.mqtt_pass = mqttPass;
 
     const resp = await apiPost("/api/config", body);
     document.getElementById("save-msg").textContent = resp.message || "Salvo.";

@@ -2,6 +2,7 @@
 #include "bt_audio.h"
 #include "config.h"
 #include "logger.h"
+#include "mqtt_ha.h"
 #include "pairing.h"
 #include "relay_control.h"
 #include "storage.h"
@@ -70,9 +71,11 @@ void app_main(void)
     if (wifi_manager_network_available()) {
         web_server_start();
     }
+    mqtt_ha_init();
 
     while (1) {
         logger_log(ESP_LOG_INFO, TAG, "heap livre: %u bytes", (unsigned)esp_get_free_heap_size());
+        mqtt_ha_publish_state();
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }

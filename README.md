@@ -78,11 +78,12 @@ receiver-bt-esp32/
 - [x] Etapa 6 — `wifi_manager.c`: STA (credenciais em NVS) + fallback AP de configuração + mDNS
 - [x] Etapa 7 — `web_server.c`: API REST (`/api/status`, `/api/config`, `/api/volume`, `/api/logs`) + interface Web (SPIFFS)
 - [x] Etapa 8 — `pairing.c`: lista de autorizados + histórico (`/api/devices`, `/api/pair`)
-- [ ] Etapa 9 — `mqtt_ha.c`: integração com Home Assistant (MQTT Discovery)
+- [x] Etapa 9 — `mqtt_ha.c`: integração com Home Assistant via MQTT Discovery (opcional, silencioso sem broker configurado)
 - [ ] Etapa 10 — `ota_manager.c`: atualização OTA — release `v1.0.0`
 
 ## Notas
 
+- Uso de flash após a Etapa 9 (+ MQTT): ~93% de 1,9 MB (partição OTA), mesmo com `CONFIG_MQTT_TRANSPORT_SSL=n` e `CONFIG_MQTT_TRANSPORT_WEBSOCKET=n` (mbedtls parece vir de outro lugar — Bluedroid SSP, provavelmente — não só do MQTT). Sobram ~140 KB para a Etapa 10 (OTA); deve caber, já que a infraestrutura de OTA (`esp_ota_ops`) já é linkada pelo bootloader/partições.
 - Uso de flash após a Etapa 7 (BT + Wi-Fi + mDNS + HTTP server + SPIFFS): ~87% de 1,9 MB (partição OTA). Margem apertando para as Etapas 8-10 — se necessário, revisitar o particionamento ou remover funcionalidades menos essenciais (ex.: `esp_http_server` tem `max_uri_handlers`/buffers configuráveis para reduzir RAM, mas o gargalo aqui é flash, não RAM).
 - Depois de `pio run --target uploadfs` (sobe `spiffs_image/` para o SPIFFS do dispositivo), a interface web fica em `http://<ip-do-dispositivo>/` ou `http://receiver-bt.local/` (mDNS).
 - Uso de flash após a Etapa 6 (BT + Wi-Fi + mDNS): ~82% de 1,9 MB (partição OTA). O `partitions.csv` já foi rebalanceado uma vez (SPIFFS reduzido de 960 KB para 320 KB, slots OTA aumentados de 1,5 MB para ~1,81 MB cada) — a interface web (Etapa 7) é só HTML/CSS/JS, não precisa de mais que isso. Continuar acompanhando nas próximas etapas.
