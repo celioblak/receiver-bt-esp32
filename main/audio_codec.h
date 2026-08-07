@@ -11,9 +11,16 @@
 
 esp_err_t audio_codec_init(void);
 
-/* Volume 0-100. Persiste em NVS (NVS_KEY_VOLUME). */
+/* Volume 0-VOLUME_STEPS (escala perceptual, ver config.h). Aplica curva
+ * quadrática internamente antes de escrever no ES8388 (0-100) e persiste em
+ * NVS (NVS_KEY_VOLUME_USER). */
 esp_err_t audio_codec_set_volume(int volume);
 int audio_codec_get_volume(void);
+
+/* Como audio_codec_set_volume, mas NÃO persiste em NVS nem altera o valor
+ * retornado por audio_codec_get_volume() — usado pelo AGC (audio_agc.c)
+ * para modular o ganho de saída sem mexer no volume definido pelo usuário. */
+esp_err_t audio_codec_apply_gain(int volume);
 
 esp_err_t audio_codec_set_mute(bool mute);
 

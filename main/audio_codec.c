@@ -10,7 +10,7 @@
 static const char *TAG = "audio_codec";
 
 static i2s_chan_handle_t s_tx_handle = NULL;
-static int s_current_volume = DEFAULT_VOLUME;
+static int s_current_volume = DEFAULT_VOLUME_USER;
 
 static esp_err_t i2s_init(uint32_t sample_rate_hz)
 {
@@ -59,8 +59,8 @@ esp_err_t audio_codec_init(void)
         return err;
     }
 
-    int32_t saved_volume = DEFAULT_VOLUME;
-    storage_get_i32(NVS_KEY_VOLUME, &saved_volume, DEFAULT_VOLUME);
+    int32_t saved_volume = DEFAULT_VOLUME_USER;
+    storage_get_i32(NVS_KEY_VOLUME_USER, &saved_volume, DEFAULT_VOLUME_USER);
     audio_codec_set_volume((int)saved_volume);
 
     ESP_LOGI(TAG, "audio_codec pronto (I2S MCLK=%d BCLK=%d WS=%d DOUT=%d)",
@@ -68,19 +68,41 @@ esp_err_t audio_codec_init(void)
     return ESP_OK;
 }
 
+/* Curva perceptual quadrática: o ouvido é logarítmico e a atenuação do DAC
+ * é linear em dB, então um mapeamento 1:1 faz os primeiros passos do slider
+ * parecerem não fazer nada e os últimos dispararem o volume. x² comprime a
+ * ponta baixa e expande a ponta alta, aproximando a percepção sonora. */
+static esp_err_t apply_curve_and_write(int volume_0_to_steps)
+{
+    if (volume_0_to_steps < 0) {
+        volume_0_to_steps = 0;
+    } else if (volume_0_to_steps > VOLUME_STEPS) {
+        volume_0_to_steps = VOLUME_STEPS;
+    }
+    float normalized = (float)volume_0_to_steps / VOLUME_STEPS; /* 0.0-1.0 */
+    float curved = normalized * normalized;                     /* x² */
+    uint8_t es_vol = (uint8_t)(curved * 100.0f);                 /* 0-100 p/ o ES8388 */
+    return es8388_set_volume(es_vol);
+}
+
 esp_err_t audio_codec_set_volume(int volume)
 {
-    if (volume < 0) {
-        volume = 0;
-    } else if (volume > 100) {
-        volume = 100;
-    }
-    esp_err_t err = es8388_set_volume(volume);
+    esp_err_t err = apply_curve_and_write(volume);
     if (err == ESP_OK) {
+        if (volume < 0) {
+            volume = 0;
+        } else if (volume > VOLUME_STEPS) {
+            volume = VOLUME_STEPS;
+        }
         s_current_volume = volume;
-        storage_set_i32(NVS_KEY_VOLUME, volume);
+        storage_set_i32(NVS_KEY_VOLUME_USER, volume);
     }
     return err;
+}
+
+esp_err_t audio_codec_apply_gain(int volume)
+{
+    return apply_curve_and_write(volume);
 }
 
 int audio_codec_get_volume(void)

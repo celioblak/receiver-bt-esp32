@@ -59,9 +59,32 @@
  * Valores padrão
  * ------------------------------------------------------------------------- */
 
-#define DEFAULT_VOLUME          70      /* 0-100 */
+#define DEFAULT_VOLUME          70      /* 0-100 (legado — ver VOLUME_STEPS abaixo) */
 #define DEFAULT_RELAY_TIMEOUT_S 30      /* segundos sem PLAYING até desligar o ampli */
 #define RELAY_SILENCE_DEBOUNCE_S 2      /* ignora pausas curtas entre faixas */
+
+/* -------------------------------------------------------------------------
+ * Volume fino (escala perceptual) — ver audio_codec.c
+ * ------------------------------------------------------------------------- */
+
+/* Volume exposto pela API/Web é 0-VOLUME_STEPS; audio_codec.c mapeia para
+ * 0-100 no ES8388 com curva quadrática (x²), já que o ouvido é logarítmico
+ * e a atenuação do DAC é linear em dB. */
+#define VOLUME_STEPS       200
+#define DEFAULT_VOLUME_USER 140  /* ~equivalente ao antigo default 70/100 */
+#define NVS_KEY_VOLUME_USER "vol_user"
+
+/* -------------------------------------------------------------------------
+ * AGC (Automatic Gain Control) opcional — ver audio_agc.c
+ * ------------------------------------------------------------------------- */
+
+#define NVS_KEY_AGC_ENABLED "agc_enabled"
+#define NVS_KEY_AGC_TARGET  "agc_target"
+#define NVS_KEY_AGC_MODE    "agc_mode"
+
+#define DEFAULT_AGC_ENABLED     0
+#define DEFAULT_AGC_TARGET_DBFS (-18)  /* -30 a -6 */
+#define DEFAULT_AGC_MODE        1      /* 0=suave 1=medio 2=agressivo */
 
 /* -------------------------------------------------------------------------
  * Logger (ring buffer em memória)
