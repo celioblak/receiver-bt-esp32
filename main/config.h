@@ -29,7 +29,10 @@
  * O áudio sai pela saída de linha para o amplificador externo. */
 #define PIN_PA_ENABLE_DO_NOT_USE 21
 
-/* Controle do relé do amplificador externo (HIGH = liga, LOW = desliga) */
+/* Controle do relé do amplificador externo (HIGH = liga, LOW = desliga).
+ * Este GPIO também está ligado ao LED onboard do kit (ativo em nível baixo,
+ * confirmado de forma independente pelo projeto squeezelite-esp32) — o LED
+ * vai piscar/acender junto com o relé. É cosmético, não um conflito real. */
 #define PIN_RELAY_CONTROL  22
 
 /* -------------------------------------------------------------------------
