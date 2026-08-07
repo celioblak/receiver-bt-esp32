@@ -1,4 +1,5 @@
 #include "audio_codec.h"
+#include "bt_audio.h"
 #include "config.h"
 #include "logger.h"
 #include "storage.h"
@@ -56,6 +57,8 @@ void app_main(void)
 
     ESP_ERROR_CHECK(audio_codec_init());
     play_test_tone();
+
+    bt_audio_init();
 
     while (1) {
         logger_log(ESP_LOG_INFO, TAG, "heap livre: %u bytes", (unsigned)esp_get_free_heap_size());

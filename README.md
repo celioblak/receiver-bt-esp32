@@ -73,13 +73,17 @@ receiver-bt-esp32/
 - [x] Etapa 1 — Estrutura inicial do repositório
 - [x] Etapa 2 — `config.h`, `storage.c` (wrapper NVS), `logger.c` (ring buffer)
 - [x] Etapa 3 — `audio_codec.c` + `es8388.c`: driver I2S nativo + codec ES8388 (testado com tom de 440Hz)
-- [ ] Etapa 4 — `bt_audio.c`: A2DP sink + AVRCP (Bluedroid nativo)
+- [x] Etapa 4 — `bt_audio.c`: A2DP sink + AVRCP CT (Bluedroid nativo), pareamento SSP "Just Works"
 - [ ] Etapa 5 — `relay_control.c`: controle do amplificador via GPIO22
 - [ ] Etapa 6 — `wifi_manager.c`: STA + AP de configuração + mDNS
 - [ ] Etapa 7 — `web_server.c`: API REST + interface Web
 - [ ] Etapa 8 — `pairing.c`: controle de dispositivos Bluetooth autorizados
 - [ ] Etapa 9 — `mqtt_ha.c`: integração com Home Assistant (MQTT Discovery)
 - [ ] Etapa 10 — `ota_manager.c`: atualização OTA — release `v1.0.0`
+
+## Notas
+
+- Uso de flash após a Etapa 4: ~66% de 1,5 MB (partição OTA) — a pilha Bluetooth clássica (Bluedroid) é grande. Acompanhar esse número nas próximas etapas (Wi-Fi, web server, MQTT, OTA); se necessário, ajustar `partitions.csv` para slots OTA maiores (reduzindo o SPIFFS).
 
 ## Regras de projeto
 
