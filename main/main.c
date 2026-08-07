@@ -1,3 +1,4 @@
+#include "audio_agc.h"
 #include "audio_codec.h"
 #include "bt_audio.h"
 #include "config.h"
@@ -66,6 +67,7 @@ void app_main(void)
     pairing_init();
     relay_control_init();
     bt_audio_init();
+    audio_agc_init();
     wifi_manager_init();
 
     if (wifi_manager_network_available()) {

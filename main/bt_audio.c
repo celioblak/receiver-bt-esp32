@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <string.h>
 
+#include "audio_agc.h"
 #include "audio_codec.h"
 #include "config.h"
 #include "logger.h"
@@ -147,6 +148,7 @@ static void bt_i2s_task_handler(void *arg)
                     s_ringbuf_mode = RINGBUF_MODE_PREFETCHING;
                     break;
                 }
+                audio_agc_feed((const int16_t *)data, item_size / sizeof(int16_t));
                 size_t written = 0;
                 audio_codec_write(data, item_size, &written);
                 vRingbufferReturnItem(s_ringbuf_i2s, data);
