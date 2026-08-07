@@ -7,7 +7,7 @@
  * ESP32 Audio Kit V2.2 (módulo ESP32-A1S, codec ES8388)
  * ========================================================================= */
 
-#define FW_VERSION "0.1.0-dev"
+#define FW_VERSION "1.0.0"
 #define FW_DEVICE_NAME_DEFAULT "Receiver-BT"
 
 /* -------------------------------------------------------------------------

@@ -4,7 +4,7 @@ Receiver de áudio Bluetooth A2DP baseado no **ESP32 Audio Kit V2.2** (módulo E
 
 ## Status do projeto
 
-Em desenvolvimento. Veja o progresso por etapas na seção [Roadmap](#roadmap).
+**v1.0.0** — as 10 etapas do roadmap original estão implementadas e compilando. Ainda não testado em hardware real (bring-up físico fica para uma sessão com o dispositivo em mãos). Veja o progresso por etapas na seção [Roadmap](#roadmap).
 
 ## Hardware
 
@@ -79,10 +79,26 @@ receiver-bt-esp32/
 - [x] Etapa 7 — `web_server.c`: API REST (`/api/status`, `/api/config`, `/api/volume`, `/api/logs`) + interface Web (SPIFFS)
 - [x] Etapa 8 — `pairing.c`: lista de autorizados + histórico (`/api/devices`, `/api/pair`)
 - [x] Etapa 9 — `mqtt_ha.c`: integração com Home Assistant via MQTT Discovery (opcional, silencioso sem broker configurado)
-- [ ] Etapa 10 — `ota_manager.c`: atualização OTA — release `v1.0.0`
+- [x] Etapa 10 — `ota_manager.c`: atualização OTA (`POST /ota`) — release `v1.0.0`
+
+## API REST
+
+Todos os endpoints retornam/aceitam JSON (exceto `/ota`, que recebe o `.bin` bruto).
+
+| Método | Rota | Descrição |
+|---|---|---|
+| GET | `/api/status` | Estado atual: conexão BT, faixa/artista/álbum, volume, amplificador, IP, uptime |
+| GET | `/api/config` | Configurações atuais (sem senhas) |
+| POST | `/api/config` | Salva configurações (nome, Wi-Fi, timeout do relé, MQTT) |
+| POST | `/api/volume` | `{"volume": 0-100}` |
+| GET | `/api/logs` | Últimas 100 entradas do log |
+| GET | `/api/devices` | Histórico de dispositivos Bluetooth pareados |
+| POST | `/api/pair` | `{"mac": "...", "action": "allow"\|"block"\|"remove"}` |
+| POST | `/ota` | Corpo bruto = novo firmware (`.bin`); reinicia automaticamente |
 
 ## Notas
 
+- Uso de flash final (v1.0.0, todas as 10 etapas): 93,1% de 1,9 MB (partição OTA) — ~131 KB livres. Auditado com `idf_size.py --archives`; os maiores consumidores (Bluedroid ~513 KB, Wi-Fi+lwIP+wpa_supplicant ~318 KB, mbedcrypto para o pareamento BT ~89 KB) são funcionalidades genuinamente usadas, não código morto. Se uma futura funcionalidade não couber, o próximo lugar a olhar é reduzir SPIFFS ainda mais (atualmente 320 KB, a interface web usa uma fração disso) em favor dos slots OTA.
 - Uso de flash após a Etapa 9 (+ MQTT): ~93% de 1,9 MB (partição OTA), mesmo com `CONFIG_MQTT_TRANSPORT_SSL=n` e `CONFIG_MQTT_TRANSPORT_WEBSOCKET=n` (mbedtls parece vir de outro lugar — Bluedroid SSP, provavelmente — não só do MQTT). Sobram ~140 KB para a Etapa 10 (OTA); deve caber, já que a infraestrutura de OTA (`esp_ota_ops`) já é linkada pelo bootloader/partições.
 - Uso de flash após a Etapa 7 (BT + Wi-Fi + mDNS + HTTP server + SPIFFS): ~87% de 1,9 MB (partição OTA). Margem apertando para as Etapas 8-10 — se necessário, revisitar o particionamento ou remover funcionalidades menos essenciais (ex.: `esp_http_server` tem `max_uri_handlers`/buffers configuráveis para reduzir RAM, mas o gargalo aqui é flash, não RAM).
 - Depois de `pio run --target uploadfs` (sobe `spiffs_image/` para o SPIFFS do dispositivo), a interface web fica em `http://<ip-do-dispositivo>/` ou `http://receiver-bt.local/` (mDNS).

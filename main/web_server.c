@@ -7,6 +7,7 @@
 #include "bt_audio.h"
 #include "config.h"
 #include "logger.h"
+#include "ota_manager.h"
 #include "pairing.h"
 #include "relay_control.h"
 #include "storage.h"
@@ -363,7 +364,9 @@ void web_server_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = 11;
+    config.stack_size = 8192; /* /ota escreve na flash — folga extra de pilha */
+    config.recv_wait_timeout = 10;
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -379,6 +382,7 @@ void web_server_start(void)
         {.uri = "/api/logs", .method = HTTP_GET, .handler = api_logs_get},
         {.uri = "/api/devices", .method = HTTP_GET, .handler = api_devices_get},
         {.uri = "/api/pair", .method = HTTP_POST, .handler = api_pair_post},
+        {.uri = "/ota", .method = HTTP_POST, .handler = ota_manager_upload_handler},
         {.uri = "/*", .method = HTTP_GET, .handler = static_file_get},
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

@@ -41,10 +41,34 @@
             <div id="save-msg"></div>
         </form>
     </div>
+
+    <div class="card">
+        <label for="ota-file">Atualizar firmware (.bin)</label>
+        <input type="file" id="ota-file" accept=".bin">
+        <button id="ota-upload">Enviar e reiniciar</button>
+        <div id="ota-msg" class="track-sub" style="margin-top:0.5rem"></div>
+    </div>
 </main>
 
 <script src="/app.js"></script>
 <script>
+document.getElementById("ota-upload").addEventListener("click", async () => {
+    const input = document.getElementById("ota-file");
+    const msg = document.getElementById("ota-msg");
+    if (!input.files.length) {
+        msg.textContent = "Escolha um arquivo .bin primeiro.";
+        return;
+    }
+    msg.textContent = "Enviando " + input.files[0].name + " (" + input.files[0].size + " bytes)...";
+    try {
+        const res = await fetch("/ota", { method: "POST", body: input.files[0] });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        msg.textContent = "Enviado. O dispositivo esta reiniciando...";
+    } catch (e) {
+        msg.textContent = "Falha no envio: " + e.message;
+    }
+});
+
 async function load() {
     const c = await apiGet("/api/config");
     document.getElementById("device_name").value = c.device_name;
