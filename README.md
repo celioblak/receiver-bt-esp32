@@ -74,7 +74,7 @@ receiver-bt-esp32/
 - [x] Etapa 2 — `config.h`, `storage.c` (wrapper NVS), `logger.c` (ring buffer)
 - [x] Etapa 3 — `audio_codec.c` + `es8388.c`: driver I2S nativo + codec ES8388 (testado com tom de 440Hz)
 - [x] Etapa 4 — `bt_audio.c`: A2DP sink + AVRCP CT (Bluedroid nativo), pareamento SSP "Just Works"
-- [ ] Etapa 5 — `relay_control.c`: controle do amplificador via GPIO22
+- [x] Etapa 5 — `relay_control.c`: controle do amplificador via GPIO22 (liga/desliga conforme estado do A2DP)
 - [ ] Etapa 6 — `wifi_manager.c`: STA + AP de configuração + mDNS
 - [ ] Etapa 7 — `web_server.c`: API REST + interface Web
 - [ ] Etapa 8 — `pairing.c`: controle de dispositivos Bluetooth autorizados

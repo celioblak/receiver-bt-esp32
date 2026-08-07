@@ -2,6 +2,7 @@
 #include "bt_audio.h"
 #include "config.h"
 #include "logger.h"
+#include "relay_control.h"
 #include "storage.h"
 
 #include <math.h>
@@ -58,6 +59,7 @@ void app_main(void)
     ESP_ERROR_CHECK(audio_codec_init());
     play_test_tone();
 
+    relay_control_init();
     bt_audio_init();
 
     while (1) {

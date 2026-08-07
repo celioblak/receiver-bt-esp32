@@ -6,6 +6,7 @@
 #include "audio_codec.h"
 #include "config.h"
 #include "logger.h"
+#include "relay_control.h"
 #include "storage.h"
 
 #include "esp_a2dp_api.h"
@@ -226,12 +227,14 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
             } else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
                 esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
                 bt_i2s_task_stop();
+                relay_control_notify_playing(false);
             }
             break;
         }
         case ESP_A2D_AUDIO_STATE_EVT: {
             bool playing = (a2d->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
             logger_log(ESP_LOG_INFO, TAG, "A2DP audio %s", playing ? "iniciado" : "suspenso/parado");
+            relay_control_notify_playing(playing);
             break;
         }
         case ESP_A2D_AUDIO_CFG_EVT: {
