@@ -7,6 +7,7 @@
 #include "bt_audio.h"
 #include "config.h"
 #include "logger.h"
+#include "pairing.h"
 #include "relay_control.h"
 #include "storage.h"
 #include "wifi_manager.h"
@@ -196,6 +197,65 @@ static esp_err_t api_logs_get(httpd_req_t *req)
     return send_json(req, arr);
 }
 
+static esp_err_t api_devices_get(httpd_req_t *req)
+{
+    pairing_device_t history[PAIRING_HISTORY_MAX];
+    size_t n = pairing_get_history(history, PAIRING_HISTORY_MAX);
+
+    cJSON *arr = cJSON_CreateArray();
+    for (size_t i = 0; i < n; i++) {
+        char mac_str[18];
+        pairing_format_mac(history[i].mac, mac_str, sizeof(mac_str));
+
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "mac", mac_str);
+        cJSON_AddStringToObject(item, "name", history[i].name);
+        cJSON_AddNumberToObject(item, "last_seen_ms", (double)history[i].last_seen_ms);
+        cJSON_AddBoolToObject(item, "allowed", pairing_is_allowed(history[i].mac));
+        cJSON_AddItemToArray(arr, item);
+    }
+
+    return send_json(req, arr);
+}
+
+static esp_err_t api_pair_post(httpd_req_t *req)
+{
+    char buf[256];
+    cJSON *root = recv_json_body(req, buf, sizeof(buf));
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+
+    cJSON *mac_item = cJSON_GetObjectItem(root, "mac");
+    cJSON *action_item = cJSON_GetObjectItem(root, "action");
+    uint8_t mac[6];
+
+    if (!cJSON_IsString(mac_item) || !cJSON_IsString(action_item) ||
+        !pairing_parse_mac(mac_item->valuestring, mac)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "\"mac\" ou \"action\" invalidos");
+        return ESP_FAIL;
+    }
+
+    const char *action = action_item->valuestring;
+    if (strcmp(action, "allow") == 0) {
+        pairing_set_allowed(mac, true);
+    } else if (strcmp(action, "block") == 0) {
+        pairing_set_allowed(mac, false);
+    } else if (strcmp(action, "remove") == 0) {
+        pairing_remove_from_history(mac);
+    } else {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "action deve ser allow, block ou remove");
+        return ESP_FAIL;
+    }
+    cJSON_Delete(root);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    return send_json(req, resp);
+}
+
 /* -------------------------------------------------------------------------
  * Arquivos estáticos (interface web) — servidos direto do SPIFFS
  * ------------------------------------------------------------------------- */
@@ -288,6 +348,8 @@ void web_server_start(void)
         {.uri = "/api/config", .method = HTTP_POST, .handler = api_config_post},
         {.uri = "/api/volume", .method = HTTP_POST, .handler = api_volume_post},
         {.uri = "/api/logs", .method = HTTP_GET, .handler = api_logs_get},
+        {.uri = "/api/devices", .method = HTTP_GET, .handler = api_devices_get},
+        {.uri = "/api/pair", .method = HTTP_POST, .handler = api_pair_post},
         {.uri = "/*", .method = HTTP_GET, .handler = static_file_get},
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

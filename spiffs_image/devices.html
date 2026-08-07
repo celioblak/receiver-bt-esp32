@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dispositivos — Receiver Bluetooth DIY</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+    <h1>Dispositivos Bluetooth</h1>
+    <nav><a href="/index.html">&larr; Voltar</a></nav>
+
+    <div class="card">
+        <p class="track-sub" style="margin:0 0 0.5rem">
+            Sem nenhum dispositivo "autorizado", qualquer um pode parear.
+            Autorizar pelo menos um restringe o pareamento só à lista.
+        </p>
+        <div id="device-list">Carregando...</div>
+    </div>
+</main>
+
+<script src="/app.js"></script>
+<script>
+async function pair(mac, action) {
+    await apiPost("/api/pair", { mac, action });
+    load();
+}
+
+async function load() {
+    const devices = await apiGet("/api/devices");
+    const list = document.getElementById("device-list");
+    if (devices.length === 0) {
+        list.innerHTML = '<p class="track-sub">Nenhum dispositivo pareado ainda.</p>';
+        return;
+    }
+    list.innerHTML = "";
+    for (const d of devices) {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.style.flexDirection = "column";
+        row.style.alignItems = "stretch";
+        row.style.borderBottom = "1px solid var(--border)";
+        row.style.paddingBottom = "0.6rem";
+        row.style.marginBottom = "0.6rem";
+        row.innerHTML = `
+            <div style="display:flex; justify-content:space-between;">
+                <strong>${d.name || "(sem nome)"}</strong>
+                <span class="badge ${d.allowed ? "on" : "off"}">${d.allowed ? "autorizado" : "nao autorizado"}</span>
+            </div>
+            <div class="track-sub">${d.mac}</div>
+        `;
+        const actions = document.createElement("div");
+        actions.style.marginTop = "0.4rem";
+        actions.style.display = "flex";
+        actions.style.gap = "0.5rem";
+
+        const allowBtn = document.createElement("button");
+        allowBtn.textContent = "Autorizar";
+        allowBtn.style.marginTop = "0";
+        allowBtn.onclick = () => pair(d.mac, "allow");
+
+        const blockBtn = document.createElement("button");
+        blockBtn.textContent = "Bloquear";
+        blockBtn.style.marginTop = "0";
+        blockBtn.style.background = "var(--off)";
+        blockBtn.onclick = () => pair(d.mac, "block");
+
+        const removeBtn = document.createElement("button");
+        removeBtn.textContent = "Remover do historico";
+        removeBtn.style.marginTop = "0";
+        removeBtn.style.background = "transparent";
+        removeBtn.style.border = "1px solid var(--border)";
+        removeBtn.onclick = () => pair(d.mac, "remove");
+
+        actions.append(allowBtn, blockBtn, removeBtn);
+        row.appendChild(actions);
+        list.appendChild(row);
+    }
+}
+
+load();
+</script>
+</body>
+</html>

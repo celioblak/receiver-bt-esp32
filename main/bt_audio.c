@@ -6,6 +6,7 @@
 #include "audio_codec.h"
 #include "config.h"
 #include "logger.h"
+#include "pairing.h"
 #include "relay_control.h"
 #include "storage.h"
 
@@ -190,13 +191,20 @@ static void bt_app_gap_handler(uint16_t event, void *p_param)
         case ESP_BT_GAP_AUTH_CMPL_EVT:
             if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
                 logger_log(ESP_LOG_INFO, TAG, "Pareamento OK: %s", param->auth_cmpl.device_name);
+                pairing_record_device(param->auth_cmpl.bda, (const char *)param->auth_cmpl.device_name);
             } else {
                 logger_log(ESP_LOG_WARN, TAG, "Falha no pareamento, status=%d", param->auth_cmpl.stat);
             }
             break;
         case ESP_BT_GAP_CFM_REQ_EVT:
-            /* "Just Works": confirma automaticamente sem exigir interação do usuário. */
-            esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+            /* "Just Works": confirma automaticamente, exceto se houver lista de
+             * dispositivos autorizados e este MAC não estiver nela. */
+            if (pairing_is_allowed(param->cfm_req.bda)) {
+                esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+            } else {
+                logger_log(ESP_LOG_WARN, TAG, "Pareamento rejeitado (dispositivo nao autorizado)");
+                esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, false);
+            }
             break;
         case ESP_BT_GAP_KEY_NOTIF_EVT:
         case ESP_BT_GAP_KEY_REQ_EVT:

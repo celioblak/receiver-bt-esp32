@@ -2,6 +2,7 @@
 #include "bt_audio.h"
 #include "config.h"
 #include "logger.h"
+#include "pairing.h"
 #include "relay_control.h"
 #include "storage.h"
 #include "web_server.h"
@@ -61,6 +62,7 @@ void app_main(void)
     ESP_ERROR_CHECK(audio_codec_init());
     play_test_tone();
 
+    pairing_init();
     relay_control_init();
     bt_audio_init();
     wifi_manager_init();

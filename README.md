@@ -77,7 +77,7 @@ receiver-bt-esp32/
 - [x] Etapa 5 — `relay_control.c`: controle do amplificador via GPIO22 (liga/desliga conforme estado do A2DP)
 - [x] Etapa 6 — `wifi_manager.c`: STA (credenciais em NVS) + fallback AP de configuração + mDNS
 - [x] Etapa 7 — `web_server.c`: API REST (`/api/status`, `/api/config`, `/api/volume`, `/api/logs`) + interface Web (SPIFFS)
-- [ ] Etapa 8 — `pairing.c`: controle de dispositivos Bluetooth autorizados
+- [x] Etapa 8 — `pairing.c`: lista de autorizados + histórico (`/api/devices`, `/api/pair`)
 - [ ] Etapa 9 — `mqtt_ha.c`: integração com Home Assistant (MQTT Discovery)
 - [ ] Etapa 10 — `ota_manager.c`: atualização OTA — release `v1.0.0`
 
