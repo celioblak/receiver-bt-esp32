@@ -21,6 +21,7 @@ static const char *TAG = "wifi_manager";
 
 static EventGroupHandle_t s_wifi_event_group;
 static bool s_connected = false;
+static bool s_ap_mode = false;
 static esp_netif_ip_info_t s_ip_info;
 
 static void start_mdns(void)
@@ -74,6 +75,7 @@ static void start_ap(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    s_ap_mode = true;
     logger_log(ESP_LOG_INFO, TAG, "Sem credenciais salvas — AP de configuracao ativo: %s", WIFI_AP_SSID_DEFAULT);
 }
 
@@ -128,6 +130,11 @@ void wifi_manager_init(void)
 bool wifi_manager_is_connected(void)
 {
     return s_connected;
+}
+
+bool wifi_manager_network_available(void)
+{
+    return s_connected || s_ap_mode;
 }
 
 void wifi_manager_get_ip_str(char *out, size_t max_len)

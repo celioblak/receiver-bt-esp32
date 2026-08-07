@@ -76,13 +76,15 @@ receiver-bt-esp32/
 - [x] Etapa 4 — `bt_audio.c`: A2DP sink + AVRCP CT (Bluedroid nativo), pareamento SSP "Just Works"
 - [x] Etapa 5 — `relay_control.c`: controle do amplificador via GPIO22 (liga/desliga conforme estado do A2DP)
 - [x] Etapa 6 — `wifi_manager.c`: STA (credenciais em NVS) + fallback AP de configuração + mDNS
-- [ ] Etapa 7 — `web_server.c`: API REST + interface Web
+- [x] Etapa 7 — `web_server.c`: API REST (`/api/status`, `/api/config`, `/api/volume`, `/api/logs`) + interface Web (SPIFFS)
 - [ ] Etapa 8 — `pairing.c`: controle de dispositivos Bluetooth autorizados
 - [ ] Etapa 9 — `mqtt_ha.c`: integração com Home Assistant (MQTT Discovery)
 - [ ] Etapa 10 — `ota_manager.c`: atualização OTA — release `v1.0.0`
 
 ## Notas
 
+- Uso de flash após a Etapa 7 (BT + Wi-Fi + mDNS + HTTP server + SPIFFS): ~87% de 1,9 MB (partição OTA). Margem apertando para as Etapas 8-10 — se necessário, revisitar o particionamento ou remover funcionalidades menos essenciais (ex.: `esp_http_server` tem `max_uri_handlers`/buffers configuráveis para reduzir RAM, mas o gargalo aqui é flash, não RAM).
+- Depois de `pio run --target uploadfs` (sobe `spiffs_image/` para o SPIFFS do dispositivo), a interface web fica em `http://<ip-do-dispositivo>/` ou `http://receiver-bt.local/` (mDNS).
 - Uso de flash após a Etapa 6 (BT + Wi-Fi + mDNS): ~82% de 1,9 MB (partição OTA). O `partitions.csv` já foi rebalanceado uma vez (SPIFFS reduzido de 960 KB para 320 KB, slots OTA aumentados de 1,5 MB para ~1,81 MB cada) — a interface web (Etapa 7) é só HTML/CSS/JS, não precisa de mais que isso. Continuar acompanhando nas próximas etapas.
 - `CONFIG_ESP_WIFI_IRAM_OPT=n` e `CONFIG_ESP_WIFI_RX_IRAM_OPT=n` em `sdkconfig.defaults`: sem isso, a seção IRAM estoura com Bluetooth clássico (Bluedroid) + Wi-Fi + mDNS juntos nesta placa sem PSRAM. Custo: leve aumento no consumo de energia em modo power-save do Wi-Fi (irrelevante — o dispositivo é alimentado por fonte externa).
 - Depois de mudar `sdkconfig.defaults`, pode ser necessário apagar o `sdkconfig.<env>` gerado (ex.: `sdkconfig.esp32-a1s`, já no `.gitignore`) para forçar a regeneração — o PlatformIO nem sempre detecta a mudança sozinho.

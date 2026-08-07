@@ -73,3 +73,8 @@ void relay_control_notify_playing(bool playing)
 
     xSemaphoreGive(s_mutex);
 }
+
+bool relay_control_is_on(void)
+{
+    return s_relay_on;
+}

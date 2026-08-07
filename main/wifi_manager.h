@@ -13,5 +13,10 @@ void wifi_manager_init(void);
 
 bool wifi_manager_is_connected(void);
 
+/* true se STA conectado OU AP de configuração ativo — indica que dá pra
+ * acessar a interface web. false só no caso "offline de verdade" (STA
+ * configurado mas fora do ar). */
+bool wifi_manager_network_available(void);
+
 /* Formato "xxx.xxx.xxx.xxx", ou string vazia se não conectado. */
 void wifi_manager_get_ip_str(char *out, size_t max_len);

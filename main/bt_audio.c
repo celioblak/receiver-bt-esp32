@@ -26,6 +26,13 @@
 static const char *TAG = "bt_audio";
 
 /* -------------------------------------------------------------------------
+ * Estado atual (consultado pela API REST — ver web_server.c)
+ * ------------------------------------------------------------------------- */
+
+static SemaphoreHandle_t s_status_mutex = NULL;
+static bt_audio_status_t s_status = {0};
+
+/* -------------------------------------------------------------------------
  * Fila de trabalho: os callbacks do Bluedroid rodam na task da pilha BT e
  * precisam retornar rápido. Todo processamento (log, AVRCP, etc.) é
  * despachado para bt_app_task_handler, seguindo o padrão do exemplo oficial
@@ -221,10 +228,25 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
                        a2d_conn_state_str[a2d->conn_stat.state],
                        bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
 
-            if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+            bool connected = (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED);
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_status.connected = connected;
+            if (connected) {
+                snprintf(s_status.remote_mac, sizeof(s_status.remote_mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                         bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+            } else {
+                s_status.playing = false;
+                s_status.remote_mac[0] = '\0';
+                s_status.title[0] = '\0';
+                s_status.artist[0] = '\0';
+                s_status.album[0] = '\0';
+            }
+            xSemaphoreGive(s_status_mutex);
+
+            if (connected) {
                 esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
                 bt_i2s_task_start();
-            } else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+            } else {
                 esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
                 bt_i2s_task_stop();
                 relay_control_notify_playing(false);
@@ -234,6 +256,11 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
         case ESP_A2D_AUDIO_STATE_EVT: {
             bool playing = (a2d->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
             logger_log(ESP_LOG_INFO, TAG, "A2DP audio %s", playing ? "iniciado" : "suspenso/parado");
+
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_status.playing = playing;
+            xSemaphoreGive(s_status_mutex);
+
             relay_control_notify_playing(playing);
             break;
         }
@@ -321,14 +348,42 @@ static void bt_app_avrc_ct_handler(uint16_t event, void *p_param)
 
         case ESP_AVRC_CT_METADATA_RSP_EVT: {
             const char *attr_name = "?";
+            char *dest = NULL;
+            size_t dest_size = 0;
+
             switch (rc->meta_rsp.attr_id) {
-                case ESP_AVRC_MD_ATTR_TITLE:  attr_name = "faixa"; break;
-                case ESP_AVRC_MD_ATTR_ARTIST: attr_name = "artista"; break;
-                case ESP_AVRC_MD_ATTR_ALBUM:  attr_name = "album"; break;
-                case ESP_AVRC_MD_ATTR_GENRE:  attr_name = "genero"; break;
-                default: break;
+                case ESP_AVRC_MD_ATTR_TITLE:
+                    attr_name = "faixa";
+                    dest = s_status.title;
+                    dest_size = sizeof(s_status.title);
+                    break;
+                case ESP_AVRC_MD_ATTR_ARTIST:
+                    attr_name = "artista";
+                    dest = s_status.artist;
+                    dest_size = sizeof(s_status.artist);
+                    break;
+                case ESP_AVRC_MD_ATTR_ALBUM:
+                    attr_name = "album";
+                    dest = s_status.album;
+                    dest_size = sizeof(s_status.album);
+                    break;
+                case ESP_AVRC_MD_ATTR_GENRE:
+                    attr_name = "genero";
+                    break;
+                default:
+                    break;
             }
+
             logger_log(ESP_LOG_INFO, TAG, "%s: %.*s", attr_name, (int)rc->meta_rsp.attr_length, rc->meta_rsp.attr_text);
+
+            if (dest != NULL) {
+                xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+                size_t len = rc->meta_rsp.attr_length < dest_size - 1 ? rc->meta_rsp.attr_length : dest_size - 1;
+                memcpy(dest, rc->meta_rsp.attr_text, len);
+                dest[len] = '\0';
+                xSemaphoreGive(s_status_mutex);
+            }
+
             free(rc->meta_rsp.attr_text);
             break;
         }
@@ -403,8 +458,20 @@ static void bt_stack_up(uint16_t event, void *p_param)
     logger_log(ESP_LOG_INFO, TAG, "Bluetooth pronto, nome: %s", device_name);
 }
 
+void bt_audio_get_status(bt_audio_status_t *out)
+{
+    if (out == NULL || s_status_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    *out = s_status;
+    xSemaphoreGive(s_status_mutex);
+}
+
 void bt_audio_init(void)
 {
+    s_status_mutex = xSemaphoreCreateMutex();
+
     s_bt_app_task_queue = xQueueCreate(10, sizeof(bt_app_msg_t));
     xTaskCreate(bt_app_task_handler, "bt_app_task", 3072, NULL, 10, &s_bt_app_task_handle);
 

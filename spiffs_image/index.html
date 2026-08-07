@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Receiver Bluetooth DIY</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+    <h1 id="device-name">Receiver Bluetooth DIY</h1>
+
+    <div class="card">
+        <div class="track" id="track">—</div>
+        <div class="track-sub" id="artist-album">—</div>
+        <div class="row">
+            <span class="label">Bluetooth</span>
+            <span class="badge off" id="bt-badge">desconectado</span>
+        </div>
+        <div class="row">
+            <span class="label">Amplificador</span>
+            <span class="badge off" id="amp-badge">desligado</span>
+        </div>
+    </div>
+
+    <div class="card">
+        <label for="volume">Volume</label>
+        <input type="range" id="volume" min="0" max="100" value="70">
+    </div>
+
+    <div class="card">
+        <div class="row"><span class="label">IP</span><span id="wifi-ip">—</span></div>
+        <div class="row"><span class="label">MAC Bluetooth</span><span id="device-mac">—</span></div>
+        <div class="row"><span class="label">Uptime</span><span id="uptime">—</span></div>
+    </div>
+
+    <nav><a href="/settings.html">Configurações</a></nav>
+</main>
+
+<script src="/app.js"></script>
+<script>
+let volumeDragging = false;
+
+document.getElementById("volume").addEventListener("input", (e) => {
+    volumeDragging = true;
+});
+document.getElementById("volume").addEventListener("change", async (e) => {
+    await apiPost("/api/volume", { volume: parseInt(e.target.value, 10) });
+    volumeDragging = false;
+});
+
+async function refresh() {
+    try {
+        const s = await apiGet("/api/status");
+        document.getElementById("device-name").textContent = s.device_name;
+        document.getElementById("track").textContent = s.track || "Nenhuma faixa";
+        document.getElementById("artist-album").textContent =
+            [s.artist, s.album].filter(Boolean).join(" — ") || "—";
+
+        const btBadge = document.getElementById("bt-badge");
+        btBadge.textContent = s.bt_connected ? (s.playing ? "tocando" : "conectado") : "desconectado";
+        btBadge.className = "badge " + (s.bt_connected ? "on" : "off");
+
+        const ampBadge = document.getElementById("amp-badge");
+        ampBadge.textContent = s.amplifier ? "ligado" : "desligado";
+        ampBadge.className = "badge " + (s.amplifier ? "on" : "off");
+
+        if (!volumeDragging) {
+            document.getElementById("volume").value = s.volume;
+        }
+        document.getElementById("wifi-ip").textContent = s.wifi_ip || "sem rede";
+        document.getElementById("device-mac").textContent = s.device_mac;
+        document.getElementById("uptime").textContent = fmtUptime(s.uptime_s);
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

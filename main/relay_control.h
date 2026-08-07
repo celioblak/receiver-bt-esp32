@@ -12,3 +12,5 @@ void relay_control_init(void);
 
 /* Chamar a cada mudança de estado do A2DP (tocando/pausado/desconectado). */
 void relay_control_notify_playing(bool playing);
+
+bool relay_control_is_on(void);

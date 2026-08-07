@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Configurações — Receiver Bluetooth DIY</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+    <h1>Configurações</h1>
+    <nav><a href="/index.html">&larr; Voltar</a></nav>
+
+    <div class="card">
+        <form id="config-form">
+            <label for="device_name">Nome do dispositivo (Bluetooth)</label>
+            <input type="text" id="device_name" maxlength="31">
+
+            <label for="wifi_ssid">Rede Wi-Fi (SSID)</label>
+            <input type="text" id="wifi_ssid" maxlength="32">
+
+            <label for="wifi_pass">Senha Wi-Fi</label>
+            <input type="password" id="wifi_pass" maxlength="64" placeholder="deixe em branco para manter">
+
+            <label for="relay_timeout_s">Timeout do amplificador (segundos sem tocar)</label>
+            <input type="number" id="relay_timeout_s" min="5" max="600">
+
+            <button type="submit">Salvar</button>
+            <div id="save-msg"></div>
+        </form>
+    </div>
+</main>
+
+<script src="/app.js"></script>
+<script>
+async function load() {
+    const c = await apiGet("/api/config");
+    document.getElementById("device_name").value = c.device_name;
+    document.getElementById("wifi_ssid").value = c.wifi_ssid;
+    document.getElementById("relay_timeout_s").value = c.relay_timeout_s;
+}
+
+document.getElementById("config-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = {
+        device_name: document.getElementById("device_name").value,
+        wifi_ssid: document.getElementById("wifi_ssid").value,
+        relay_timeout_s: parseInt(document.getElementById("relay_timeout_s").value, 10),
+    };
+    const pass = document.getElementById("wifi_pass").value;
+    if (pass) body.wifi_pass = pass;
+
+    const resp = await apiPost("/api/config", body);
+    document.getElementById("save-msg").textContent = resp.message || "Salvo.";
+});
+
+load();
+</script>
+</body>
+</html>
