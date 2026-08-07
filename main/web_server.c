@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "audio_agc.h"
 #include "audio_codec.h"
 #include "bt_audio.h"
 #include "config.h"
@@ -91,6 +92,10 @@ static esp_err_t api_status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "playing", bt.playing);
     cJSON_AddBoolToObject(root, "amplifier", relay_control_is_on());
     cJSON_AddNumberToObject(root, "volume", audio_codec_get_volume());
+    cJSON_AddBoolToObject(root, "agc_enabled", audio_agc_is_enabled());
+    cJSON_AddNumberToObject(root, "agc_gain", audio_agc_get_current_gain());
+    cJSON_AddNumberToObject(root, "agc_target", audio_agc_get_target());
+    cJSON_AddNumberToObject(root, "agc_mode", audio_agc_get_mode());
     cJSON_AddStringToObject(root, "wifi_ip", ip);
     cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
 
@@ -201,12 +206,43 @@ static esp_err_t api_volume_post(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    /* Escala 0-VOLUME_STEPS (ver config.h). Se o AGC estiver ligado, a
+     * próxima iteração da agc_task já lê este novo valor via
+     * audio_codec_get_volume() — não precisa sincronizar nada aqui. */
     audio_codec_set_volume(item->valueint);
     cJSON_Delete(root);
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", true);
     cJSON_AddNumberToObject(resp, "volume", audio_codec_get_volume());
+    return send_json(req, resp);
+}
+
+static esp_err_t api_agc_post(httpd_req_t *req)
+{
+    char buf[128];
+    cJSON *root = recv_json_body(req, buf, sizeof(buf));
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+
+    cJSON *item;
+    if ((item = cJSON_GetObjectItem(root, "target")) && cJSON_IsNumber(item)) {
+        audio_agc_set_target((int8_t)item->valueint);
+    }
+    if ((item = cJSON_GetObjectItem(root, "mode")) && cJSON_IsNumber(item)) {
+        audio_agc_set_mode((uint8_t)item->valueint);
+    }
+    if ((item = cJSON_GetObjectItem(root, "enabled")) && cJSON_IsBool(item)) {
+        audio_agc_enable(cJSON_IsTrue(item));
+    }
+    cJSON_Delete(root);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddBoolToObject(resp, "agc_enabled", audio_agc_is_enabled());
+    cJSON_AddNumberToObject(resp, "agc_target", audio_agc_get_target());
+    cJSON_AddNumberToObject(resp, "agc_mode", audio_agc_get_mode());
     return send_json(req, resp);
 }
 
@@ -364,7 +400,7 @@ void web_server_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.max_uri_handlers = 11;
+    config.max_uri_handlers = 12;
     config.stack_size = 8192; /* /ota escreve na flash — folga extra de pilha */
     config.recv_wait_timeout = 10;
 
@@ -379,6 +415,7 @@ void web_server_start(void)
         {.uri = "/api/config", .method = HTTP_GET, .handler = api_config_get},
         {.uri = "/api/config", .method = HTTP_POST, .handler = api_config_post},
         {.uri = "/api/volume", .method = HTTP_POST, .handler = api_volume_post},
+        {.uri = "/api/agc", .method = HTTP_POST, .handler = api_agc_post},
         {.uri = "/api/logs", .method = HTTP_GET, .handler = api_logs_get},
         {.uri = "/api/devices", .method = HTTP_GET, .handler = api_devices_get},
         {.uri = "/api/pair", .method = HTTP_POST, .handler = api_pair_post},

@@ -43,6 +43,30 @@
     </div>
 
     <div class="card">
+        <label for="volume-fine">Volume</label>
+        <input type="range" id="volume-fine" min="0" max="200" value="140">
+
+        <div class="row">
+            <span class="label">AGC (normalização entre fontes)</span>
+            <input type="checkbox" id="agc-enabled">
+        </div>
+
+        <div id="agc-details" style="display:none">
+            <label for="agc-target">Nível alvo (dBFS)</label>
+            <input type="range" id="agc-target" min="-30" max="-6" value="-18">
+
+            <label for="agc-mode">Modo</label>
+            <select id="agc-mode">
+                <option value="0">Suave</option>
+                <option value="1" selected>Médio</option>
+                <option value="2">Agressivo</option>
+            </select>
+
+            <div class="row"><span class="label">Ganho atual</span><span id="agc-gain">1.00x</span></div>
+        </div>
+    </div>
+
+    <div class="card">
         <label for="ota-file">Atualizar firmware (.bin)</label>
         <input type="file" id="ota-file" accept=".bin">
         <button id="ota-upload">Enviar e reiniciar</button>
@@ -78,6 +102,55 @@ async function load() {
     document.getElementById("mqtt_port").value = c.mqtt_port;
     document.getElementById("mqtt_user").value = c.mqtt_user;
 }
+
+/* -------------------------------------------------------------------------
+ * Volume fino + AGC
+ * ------------------------------------------------------------------------- */
+
+let volumeDragging = false;
+const agcDetails = document.getElementById("agc-details");
+
+function setAgcDetailsVisible(visible) {
+    agcDetails.style.display = visible ? "block" : "none";
+}
+
+document.getElementById("volume-fine").addEventListener("input", () => {
+    volumeDragging = true;
+});
+document.getElementById("volume-fine").addEventListener("change", async (e) => {
+    await apiPost("/api/volume", { volume: parseInt(e.target.value, 10) });
+    volumeDragging = false;
+});
+
+document.getElementById("agc-enabled").addEventListener("change", async (e) => {
+    setAgcDetailsVisible(e.target.checked);
+    await apiPost("/api/agc", { enabled: e.target.checked });
+});
+document.getElementById("agc-target").addEventListener("change", async (e) => {
+    await apiPost("/api/agc", { target: parseInt(e.target.value, 10) });
+});
+document.getElementById("agc-mode").addEventListener("change", async (e) => {
+    await apiPost("/api/agc", { mode: parseInt(e.target.value, 10) });
+});
+
+async function refreshVolumeAgc() {
+    try {
+        const s = await apiGet("/api/status");
+        if (!volumeDragging) {
+            document.getElementById("volume-fine").value = s.volume;
+        }
+        document.getElementById("agc-enabled").checked = s.agc_enabled;
+        document.getElementById("agc-target").value = s.agc_target;
+        document.getElementById("agc-mode").value = s.agc_mode;
+        document.getElementById("agc-gain").textContent = s.agc_gain.toFixed(2) + "x";
+        setAgcDetailsVisible(s.agc_enabled);
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+refreshVolumeAgc();
+setInterval(refreshVolumeAgc, 2000);
 
 document.getElementById("config-form").addEventListener("submit", async (e) => {
     e.preventDefault();

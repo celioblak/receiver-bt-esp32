@@ -6,6 +6,8 @@ Receiver de áudio Bluetooth A2DP baseado no **ESP32 Audio Kit V2.2** (módulo E
 
 **v1.0.0** — as 10 etapas do roadmap original estão implementadas e compilando. Ainda não testado em hardware real (bring-up físico fica para uma sessão com o dispositivo em mãos). Veja o progresso por etapas na seção [Roadmap](#roadmap).
 
+**Pós-v1.0.0:** volume fino (escala perceptual 0-200) e AGC ativável (normalização de volume entre fontes) — ver [Volume fino e AGC](#volume-fino-e-agc).
+
 ## Hardware
 
 - **Módulo principal:** ESP32 Audio Kit V2.2 (ESP32-A1S + ES8388)
@@ -81,16 +83,25 @@ receiver-bt-esp32/
 - [x] Etapa 9 — `mqtt_ha.c`: integração com Home Assistant via MQTT Discovery (opcional, silencioso sem broker configurado)
 - [x] Etapa 10 — `ota_manager.c`: atualização OTA (`POST /ota`) — release `v1.0.0`
 
+## Volume fino e AGC
+
+Duas funcionalidades incrementais além das 10 etapas do roadmap original:
+
+- **Volume fino** (`main/audio_codec.c`): a escala exposta pela API/Web passou de 0-100 (linear) para 0-200, com curva perceptual quadrática (`x²`) mapeando para os 0-100 que o ES8388 realmente usa. O ouvido humano é logarítmico e a atenuação do DAC é linear em dB — sem a curva, os primeiros passos do slider pareciam não fazer nada e os últimos disparavam o volume. Persistido em NVS na chave `vol_user`.
+- **AGC opcional** (`main/audio_agc.c`/`.h`): normaliza o volume percebido entre fontes diferentes (celular, TV, Echo Dot) sem o usuário precisar reajustar ao trocar de fonte. Calcula RMS sobre os blocos PCM que `bt_audio.c` está prestes a tocar (entregues via `audio_agc_feed()`, chamada logo antes de `audio_codec_write()` — este projeto não usa ESP-ADF, então não há um pipeline com buffer de leitura para o AGC amostrar; os mesmos bytes que serão tocados é que servem de amostra), com suavização attack/release por modo (suave/médio/agressivo) para evitar "bombeamento". Roda numa task FreeRTOS de baixa prioridade (nível 3) a 20 Hz, auto-suspensa quando desligado. O ganho do AGC é aplicado via `audio_codec_apply_gain()`, que **não** persiste em NVS nem altera o volume definido pelo usuário — ao desligar o AGC, o volume original volta imediatamente.
+- Ativável/desativável e configurável pela interface Web (`spiffs_image/settings.html`, seção "Volume") e pela API REST (`POST /api/agc`).
+
 ## API REST
 
 Todos os endpoints retornam/aceitam JSON (exceto `/ota`, que recebe o `.bin` bruto).
 
 | Método | Rota | Descrição |
 |---|---|---|
-| GET | `/api/status` | Estado atual: conexão BT, faixa/artista/álbum, volume, amplificador, IP, uptime |
+| GET | `/api/status` | Estado atual: conexão BT, faixa/artista/álbum, volume (0-200), AGC (`agc_enabled`/`agc_gain`/`agc_target`/`agc_mode`), amplificador, IP, uptime |
 | GET | `/api/config` | Configurações atuais (sem senhas) |
 | POST | `/api/config` | Salva configurações (nome, Wi-Fi, timeout do relé, MQTT) |
-| POST | `/api/volume` | `{"volume": 0-100}` |
+| POST | `/api/volume` | `{"volume": 0-200}` (escala perceptual — ver [Volume fino e AGC](#volume-fino-e-agc)) |
+| POST | `/api/agc` | `{"enabled": bool, "target": -30 a -6 (dBFS), "mode": 0\|1\|2}` |
 | GET | `/api/logs` | Últimas 100 entradas do log |
 | GET | `/api/devices` | Histórico de dispositivos Bluetooth pareados |
 | POST | `/api/pair` | `{"mac": "...", "action": "allow"\|"block"\|"remove"}` |
