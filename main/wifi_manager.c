@@ -1,0 +1,143 @@
+#include "wifi_manager.h"
+
+#include <string.h>
+
+#include "config.h"
+#include "logger.h"
+#include "storage.h"
+
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "mdns.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+
+static const char *TAG = "wifi_manager";
+
+#define WIFI_CONNECTED_BIT BIT0
+
+static EventGroupHandle_t s_wifi_event_group;
+static bool s_connected = false;
+static esp_netif_ip_info_t s_ip_info;
+
+static void start_mdns(void)
+{
+    if (mdns_init() != ESP_OK) {
+        ESP_LOGE(TAG, "falha ao iniciar mDNS");
+        return;
+    }
+    mdns_hostname_set(MDNS_HOSTNAME);
+    mdns_instance_name_set("Receiver Bluetooth DIY");
+    logger_log(ESP_LOG_INFO, TAG, "mDNS ativo: %s.local", MDNS_HOSTNAME);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_connected = false;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        logger_log(ESP_LOG_WARN, TAG, "Wi-Fi desconectado, tentando reconectar...");
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
+        s_ip_info.ip = event->ip_info.ip;
+        s_connected = true;
+        logger_log(ESP_LOG_INFO, TAG, "Wi-Fi conectado, IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        start_mdns();
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void start_ap(void)
+{
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+
+    wifi_config_t ap_config = {
+        .ap = {
+            .channel = 1,
+            .authmode = WIFI_AUTH_OPEN,
+            .max_connection = 4,
+        },
+    };
+    strlcpy((char *)ap_config.ap.ssid, WIFI_AP_SSID_DEFAULT, sizeof(ap_config.ap.ssid));
+    ap_config.ap.ssid_len = strlen(WIFI_AP_SSID_DEFAULT);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    logger_log(ESP_LOG_INFO, TAG, "Sem credenciais salvas — AP de configuracao ativo: %s", WIFI_AP_SSID_DEFAULT);
+}
+
+static void start_sta_and_wait(const char *ssid, const char *pass)
+{
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+
+    wifi_config_t wifi_config = {0};
+    strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    logger_log(ESP_LOG_INFO, TAG, "Conectando ao Wi-Fi \"%s\"...", ssid);
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE,
+                                            pdMS_TO_TICKS(WIFI_STA_CONNECT_TIMEOUT_MS));
+    if (!(bits & WIFI_CONNECTED_BIT)) {
+        logger_log(ESP_LOG_WARN, TAG,
+                   "Nao conectou em %d ms, seguindo offline (Bluetooth e rele funcionam normalmente)",
+                   WIFI_STA_CONNECT_TIMEOUT_MS);
+    }
+}
+
+void wifi_manager_init(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    char ssid[33] = {0};
+    char pass[65] = {0};
+    esp_err_t err = storage_get_str(NVS_KEY_WIFI_SSID, ssid, sizeof(ssid));
+
+    if (err != ESP_OK || strlen(ssid) == 0) {
+        start_ap();
+        return;
+    }
+
+    storage_get_str(NVS_KEY_WIFI_PASS, pass, sizeof(pass));
+    start_sta_and_wait(ssid, pass);
+}
+
+bool wifi_manager_is_connected(void)
+{
+    return s_connected;
+}
+
+void wifi_manager_get_ip_str(char *out, size_t max_len)
+{
+    if (out == NULL || max_len == 0) {
+        return;
+    }
+    if (!s_connected) {
+        out[0] = '\0';
+        return;
+    }
+    snprintf(out, max_len, IPSTR, IP2STR(&s_ip_info.ip));
+}

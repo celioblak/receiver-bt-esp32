@@ -11,7 +11,7 @@
 #define FW_DEVICE_NAME_DEFAULT "Receiver-BT"
 
 /* -------------------------------------------------------------------------
- * Pinagem (ESP32-A1S / board "ai_thinker" do ESP-ADF)
+ * Pinagem (ESP32-A1S / ESP32 Audio Kit V2.2)
  * ------------------------------------------------------------------------- */
 
 /* I2C — ES8388 (codec) e expansão futura (display OLED SSD1306) */
@@ -69,3 +69,14 @@
 
 #define LOGGER_MAX_ENTRIES  100
 #define LOGGER_MSG_MAX_LEN  128
+
+/* -------------------------------------------------------------------------
+ * Wi-Fi / mDNS
+ * ------------------------------------------------------------------------- */
+
+/* Subida do AP de configuração só quando não há credenciais salvas —
+ * não é um fallback permanente para instabilidade de rede (ver
+ * wifi_manager.c). Sem senha (rede aberta) para facilitar a config inicial. */
+#define WIFI_AP_SSID_DEFAULT "ReceiverBT-Config"
+#define WIFI_STA_CONNECT_TIMEOUT_MS 10000
+#define MDNS_HOSTNAME "receiver-bt"

@@ -4,6 +4,7 @@
 #include "logger.h"
 #include "relay_control.h"
 #include "storage.h"
+#include "wifi_manager.h"
 
 #include <math.h>
 #include "esp_log.h"
@@ -61,6 +62,7 @@ void app_main(void)
 
     relay_control_init();
     bt_audio_init();
+    wifi_manager_init();
 
     while (1) {
         logger_log(ESP_LOG_INFO, TAG, "heap livre: %u bytes", (unsigned)esp_get_free_heap_size());

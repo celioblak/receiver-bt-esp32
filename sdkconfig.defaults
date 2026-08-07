@@ -20,6 +20,14 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # ESP32-A1S do Audio Kit V2.2 não possui PSRAM
 CONFIG_ESP32_SPIRAM_SUPPORT=n
 
+# Sem essas duas, IRAM estoura com BT (Bluedroid) + Wi-Fi + mDNS juntos.
+# O default dessas opções só vira "n" automaticamente com BT_ENABLED=y
+# quando há PSRAM — não é o nosso caso, então precisa ser explícito.
+# Custo: leve aumento no consumo de energia em modo power-save do Wi-Fi
+# (irrelevante aqui, o dispositivo é alimentado via fonte externa).
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
 # --- FreeRTOS ---
 CONFIG_FREERTOS_HZ=1000
 

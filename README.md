@@ -75,7 +75,7 @@ receiver-bt-esp32/
 - [x] Etapa 3 — `audio_codec.c` + `es8388.c`: driver I2S nativo + codec ES8388 (testado com tom de 440Hz)
 - [x] Etapa 4 — `bt_audio.c`: A2DP sink + AVRCP CT (Bluedroid nativo), pareamento SSP "Just Works"
 - [x] Etapa 5 — `relay_control.c`: controle do amplificador via GPIO22 (liga/desliga conforme estado do A2DP)
-- [ ] Etapa 6 — `wifi_manager.c`: STA + AP de configuração + mDNS
+- [x] Etapa 6 — `wifi_manager.c`: STA (credenciais em NVS) + fallback AP de configuração + mDNS
 - [ ] Etapa 7 — `web_server.c`: API REST + interface Web
 - [ ] Etapa 8 — `pairing.c`: controle de dispositivos Bluetooth autorizados
 - [ ] Etapa 9 — `mqtt_ha.c`: integração com Home Assistant (MQTT Discovery)
@@ -83,7 +83,9 @@ receiver-bt-esp32/
 
 ## Notas
 
-- Uso de flash após a Etapa 4: ~66% de 1,5 MB (partição OTA) — a pilha Bluetooth clássica (Bluedroid) é grande. Acompanhar esse número nas próximas etapas (Wi-Fi, web server, MQTT, OTA); se necessário, ajustar `partitions.csv` para slots OTA maiores (reduzindo o SPIFFS).
+- Uso de flash após a Etapa 6 (BT + Wi-Fi + mDNS): ~82% de 1,9 MB (partição OTA). O `partitions.csv` já foi rebalanceado uma vez (SPIFFS reduzido de 960 KB para 320 KB, slots OTA aumentados de 1,5 MB para ~1,81 MB cada) — a interface web (Etapa 7) é só HTML/CSS/JS, não precisa de mais que isso. Continuar acompanhando nas próximas etapas.
+- `CONFIG_ESP_WIFI_IRAM_OPT=n` e `CONFIG_ESP_WIFI_RX_IRAM_OPT=n` em `sdkconfig.defaults`: sem isso, a seção IRAM estoura com Bluetooth clássico (Bluedroid) + Wi-Fi + mDNS juntos nesta placa sem PSRAM. Custo: leve aumento no consumo de energia em modo power-save do Wi-Fi (irrelevante — o dispositivo é alimentado por fonte externa).
+- Depois de mudar `sdkconfig.defaults`, pode ser necessário apagar o `sdkconfig.<env>` gerado (ex.: `sdkconfig.esp32-a1s`, já no `.gitignore`) para forçar a regeneração — o PlatformIO nem sempre detecta a mudança sozinho.
 
 ## Regras de projeto
 
