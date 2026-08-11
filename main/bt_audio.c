@@ -18,6 +18,7 @@
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -33,6 +34,8 @@ static const char *TAG = "bt_audio";
 
 static SemaphoreHandle_t s_status_mutex = NULL;
 static bt_audio_status_t s_status = {0};
+static volatile bool s_discoverable = DEFAULT_BT_DISCOVERABLE;
+static volatile bool s_require_pin = DEFAULT_BT_REQUIRE_PIN;
 
 /* -------------------------------------------------------------------------
  * Fila de trabalho: os callbacks do Bluedroid rodam na task da pilha BT e
@@ -90,8 +93,13 @@ static void bt_app_task_handler(void *arg)
  * (que não pode bloquear) da escrita bloqueante em audio_codec_write().
  * ------------------------------------------------------------------------- */
 
-#define RINGBUF_HIGHEST_WATER_LEVEL  (32 * 1024)
-#define RINGBUF_PREFETCH_WATER_LEVEL (20 * 1024)
+/* Descobrimos que a placa TEM PSRAM (8MB, esp_psram detecta e mapeia 4MB) —
+ * o heap livre foi de ~11-26KB (brigando com WiFi+BT na DRAM interna) pra
+ * ~4MB. Toda a novela de reduzir esse buffer pra 8-24KB pra não estourar o
+ * heap (ver histórico no git) não é mais necessária; volta bem folgado —
+ * 64KB absorve tranquilamente rajadas de pacotes A2DP sem picotar. */
+#define RINGBUF_HIGHEST_WATER_LEVEL  (64 * 1024)
+#define RINGBUF_PREFETCH_WATER_LEVEL (40 * 1024)
 
 typedef enum {
     RINGBUF_MODE_PROCESSING,
@@ -106,6 +114,11 @@ static ringbuf_mode_t s_ringbuf_mode = RINGBUF_MODE_PROCESSING;
 
 static size_t write_ringbuf(const uint8_t *data, size_t size)
 {
+    if (s_ringbuf_i2s == NULL) {
+        /* bt_i2s_task_start() falhou ao alocar (sem heap contiguo
+         * suficiente) — descarta em vez de crashar em xRingbufferSend. */
+        return 0;
+    }
     if (s_ringbuf_mode == RINGBUF_MODE_DROPPING) {
         size_t used = 0;
         vRingbufferGetInfo(s_ringbuf_i2s, NULL, NULL, NULL, NULL, &used);
@@ -145,6 +158,9 @@ static void bt_i2s_task_handler(void *arg)
                 uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(
                     s_ringbuf_i2s, &item_size, pdMS_TO_TICKS(20), max_chunk);
                 if (item_size == 0) {
+                    /* auto_clear_after_cb (ver audio_codec.c) ja zera o
+                     * buffer DMA do I2S sozinho quando fica sem dado novo --
+                     * nao precisa de flush manual aqui. */
                     s_ringbuf_mode = RINGBUF_MODE_PREFETCHING;
                     break;
                 }
@@ -157,12 +173,31 @@ static void bt_i2s_task_handler(void *arg)
     }
 }
 
-static void bt_i2s_task_start(void)
+/* Aloca o ring buffer e o semaforo uma unica vez, no boot, antes do Wi-Fi
+ * e do proprio controlador Bluetooth subirem (chamado no inicio de
+ * bt_audio_init()). Alocar/liberar esses ~16KB a cada conexao A2DP fazia
+ * a alocacao concorrer com WiFi/HTTP/mDNS ja fragmentando o heap havia
+ * dezenas de segundos — o heap total livre parecia suficiente (~18KB),
+ * mas o maior bloco contiguo as vezes nao chegava aos ~980 bytes que o
+ * Bluedroid precisa pra remontar um pacote HCI, travando o dispositivo. */
+static void bt_audio_prealloc_ring_buffer(void)
 {
-    s_ringbuf_mode = RINGBUF_MODE_PREFETCHING;
     s_i2s_write_sem = xSemaphoreCreateBinary();
     s_ringbuf_i2s = xRingbufferCreate(RINGBUF_HIGHEST_WATER_LEVEL, RINGBUF_TYPE_BYTEBUF);
-    xTaskCreate(bt_i2s_task_handler, "bt_i2s_task", 2560, NULL, configMAX_PRIORITIES - 3, &s_i2s_task_handle);
+    if (s_i2s_write_sem == NULL || s_ringbuf_i2s == NULL) {
+        ESP_LOGE(TAG, "falha ao pre-alocar buffer/semaforo de audio — sem audio em toda a sessao");
+    }
+}
+
+static void bt_i2s_task_start(void)
+{
+    if (s_ringbuf_i2s == NULL || s_i2s_write_sem == NULL) {
+        return; /* bt_audio_prealloc_ring_buffer() falhou no boot */
+    }
+    s_ringbuf_mode = RINGBUF_MODE_PREFETCHING;
+    if (xTaskCreate(bt_i2s_task_handler, "bt_i2s_task", 2560, NULL, configMAX_PRIORITIES - 3, &s_i2s_task_handle) != pdPASS) {
+        ESP_LOGE(TAG, "falha ao criar task de I2S (heap insuficiente) — sem audio nesta sessao");
+    }
 }
 
 static void bt_i2s_task_stop(void)
@@ -171,14 +206,16 @@ static void bt_i2s_task_stop(void)
         vTaskDelete(s_i2s_task_handle);
         s_i2s_task_handle = NULL;
     }
+    /* Buffer e semaforo continuam vivos (ver bt_audio_prealloc_ring_buffer)
+     * — só descarta qualquer resto de áudio da sessão anterior. */
     if (s_ringbuf_i2s) {
-        vRingbufferDelete(s_ringbuf_i2s);
-        s_ringbuf_i2s = NULL;
+        size_t item_size;
+        void *data;
+        while ((data = xRingbufferReceive(s_ringbuf_i2s, &item_size, 0)) != NULL) {
+            vRingbufferReturnItem(s_ringbuf_i2s, data);
+        }
     }
-    if (s_i2s_write_sem) {
-        vSemaphoreDelete(s_i2s_write_sem);
-        s_i2s_write_sem = NULL;
-    }
+    s_ringbuf_mode = RINGBUF_MODE_PROCESSING;
 }
 
 /* -------------------------------------------------------------------------
@@ -197,10 +234,19 @@ static void bt_app_gap_handler(uint16_t event, void *p_param)
             } else {
                 logger_log(ESP_LOG_WARN, TAG, "Falha no pareamento, status=%d", param->auth_cmpl.stat);
             }
+            /* limpa o codigo pendente (ver ESP_BT_GAP_KEY_NOTIF_EVT) --
+             * pareamento terminou, com sucesso ou nao */
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_status.pending_pin_mac[0] = '\0';
+            s_status.pending_pin_code[0] = '\0';
+            xSemaphoreGive(s_status_mutex);
             break;
         case ESP_BT_GAP_CFM_REQ_EVT:
             /* "Just Works": confirma automaticamente, exceto se houver lista de
-             * dispositivos autorizados e este MAC não estiver nela. */
+             * dispositivos autorizados e este MAC não estiver nela. So
+             * dispara com IO capability NoInputNoOutput (require_pin=false,
+             * ver bt_stack_up) -- com require_pin=true o fluxo e Passkey
+             * Entry (ESP_BT_GAP_KEY_NOTIF_EVT abaixo), sem confirmacao. */
             if (pairing_is_allowed(param->cfm_req.bda)) {
                 esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
             } else {
@@ -208,7 +254,24 @@ static void bt_app_gap_handler(uint16_t event, void *p_param)
                 esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, false);
             }
             break;
-        case ESP_BT_GAP_KEY_NOTIF_EVT:
+        case ESP_BT_GAP_KEY_NOTIF_EVT: {
+            /* IO capability DisplayOnly (require_pin=true): o stack gerou
+             * um passkey de 6 digitos que PRECISAMOS mostrar pro usuario
+             * (sem tela fisica, mostramos via /api/status) -- a pessoa
+             * digita esse numero no celular pra completar o pareamento.
+             * A lista de autorizados (pairing_is_allowed) continua
+             * valendo depois: ver o recheck em ESP_A2D_CONNECTION_STATE_EVT. */
+            uint8_t *bda = param->key_notif.bda;
+            logger_log(ESP_LOG_INFO, TAG, "Passkey pra parear [%02x:%02x:%02x:%02x:%02x:%02x]: %06" PRIu32,
+                       bda[0], bda[1], bda[2], bda[3], bda[4], bda[5], param->key_notif.passkey);
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            snprintf(s_status.pending_pin_mac, sizeof(s_status.pending_pin_mac),
+                     "%02x:%02x:%02x:%02x:%02x:%02x", bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+            snprintf(s_status.pending_pin_code, sizeof(s_status.pending_pin_code),
+                     "%06" PRIu32, param->key_notif.passkey);
+            xSemaphoreGive(s_status_mutex);
+            break;
+        }
         case ESP_BT_GAP_KEY_REQ_EVT:
             break;
         default:
@@ -239,6 +302,23 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
                        bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
 
             bool connected = (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED);
+
+            /* pairing_is_allowed() so e checado no pareamento inicial
+             * (ESP_BT_GAP_CFM_REQ_EVT) -- um dispositivo que ja pareou
+             * antes (com link key salva no controlador BT) reconecta
+             * direto sem passar por ali de novo, ignorando a lista de
+             * autorizados. Checar de novo aqui, na conexao, fecha essa
+             * brecha: se nao for mais autorizado, desconecta e remove o
+             * bond pra nao voltar a conectar sozinho. */
+            if (connected && !pairing_is_allowed(bda)) {
+                logger_log(ESP_LOG_WARN, TAG,
+                           "Conexao rejeitada (dispositivo nao autorizado) [%02x:%02x:%02x:%02x:%02x:%02x]",
+                           bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+                esp_bt_gap_remove_bond_device(bda);
+                esp_a2d_sink_disconnect(bda);
+                break;
+            }
+
             xSemaphoreTake(s_status_mutex, portMAX_DELAY);
             s_status.connected = connected;
             if (connected) {
@@ -257,9 +337,11 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
                 esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
                 bt_i2s_task_start();
             } else {
-                esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
+                                          s_discoverable ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
                 bt_i2s_task_stop();
                 relay_control_notify_playing(false);
+                audio_codec_set_mute(true);
             }
             break;
         }
@@ -271,6 +353,10 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
             s_status.playing = playing;
             xSemaphoreGive(s_status_mutex);
 
+            /* Mudo fora do estado "tocando": evita que ruido digital/RF
+             * (WiFi, handshake do proprio Bluetooth) vaze pelo fone entre
+             * faixas ou enquanto so esta conectado sem tocar nada. */
+            audio_codec_set_mute(!playing);
             relay_control_notify_playing(playing);
             break;
         }
@@ -281,15 +367,15 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
             }
             int sample_rate = 16000;
             int channels = 2;
-            uint8_t oct0 = a2d->audio_cfg.mcc.cie.sbc[0];
-            if (oct0 & (0x01 << 6)) {
+            const esp_a2d_cie_sbc_t *sbc = &a2d->audio_cfg.mcc.cie.sbc_info;
+            if (sbc->samp_freq & ESP_A2D_SBC_CIE_SF_32K) {
                 sample_rate = 32000;
-            } else if (oct0 & (0x01 << 5)) {
+            } else if (sbc->samp_freq & ESP_A2D_SBC_CIE_SF_44K) {
                 sample_rate = 44100;
-            } else if (oct0 & (0x01 << 4)) {
+            } else if (sbc->samp_freq & ESP_A2D_SBC_CIE_SF_48K) {
                 sample_rate = 48000;
             }
-            if (oct0 & (0x01 << 3)) {
+            if (sbc->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO) {
                 channels = 1;
             }
             audio_codec_reconfigure_clock((uint32_t)sample_rate);
@@ -319,8 +405,20 @@ static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 #define RC_TL_GET_META_DATA  1
 #define RC_TL_RN_TRACK       2
 #define RC_TL_RN_PLAY_STATUS 3
+#define RC_TL_PASSTHROUGH    4
 
 static esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap;
+
+/* Atraso antes de buscar metadados (titulo/artista/album) apos troca de
+ * faixa: pedir na hora colocava trafego AVRCP (canal de controle)
+ * disputando o mesmo radio BT com o inicio do audio A2DP da faixa nova,
+ * causando engasgo audivel bem na troca (visto em log: rajada de
+ * "Sequence numbers error" exatamente nesse momento, mesmo a <20cm do
+ * celular -- nao e sinal fraco, e disputa interna WiFi/BT pelo radio
+ * unico do ESP32). Dar essa folga deixa o audio da faixa nova estabilizar
+ * primeiro. */
+#define METADATA_FETCH_DELAY_US (1200 * 1000)
+static esp_timer_handle_t s_metadata_delay_timer;
 
 static void request_track_metadata(void)
 {
@@ -340,6 +438,11 @@ static void request_playback_status_notify(void)
                                             ESP_AVRC_RN_PLAY_STATUS_CHANGE)) {
         esp_avrc_ct_send_register_notification_cmd(RC_TL_RN_PLAY_STATUS, ESP_AVRC_RN_PLAY_STATUS_CHANGE, 0);
     }
+}
+
+static void metadata_delay_timer_cb(void *arg)
+{
+    request_track_metadata();
 }
 
 static void bt_app_avrc_ct_handler(uint16_t event, void *p_param)
@@ -400,7 +503,10 @@ static void bt_app_avrc_ct_handler(uint16_t event, void *p_param)
 
         case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
             if (rc->change_ntf.event_id == ESP_AVRC_RN_TRACK_CHANGE) {
-                request_track_metadata();
+                /* atrasado (METADATA_FETCH_DELAY_US) -- ver comentario
+                 * acima de request_track_metadata() */
+                esp_timer_stop(s_metadata_delay_timer); /* ESP_ERR_INVALID_STATE se ja parado, inofensivo */
+                esp_timer_start_once(s_metadata_delay_timer, METADATA_FETCH_DELAY_US);
             } else if (rc->change_ntf.event_id == ESP_AVRC_RN_PLAY_STATUS_CHANGE) {
                 logger_log(ESP_LOG_INFO, TAG, "Status de reproducao: 0x%x", rc->change_ntf.event_parameter.playback);
                 request_playback_status_notify();
@@ -438,11 +544,162 @@ static void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t
 }
 
 /* -------------------------------------------------------------------------
+ * AVRCP (Target) — volume absoluto: sem isso, o slider de volume do
+ * celular fica sem efeito nenhum no som (o A2DP manda PCM em escala cheia
+ * e quem decide o volume real é sempre o sink; o celular só sincroniza via
+ * essa extensão do AVRCP, que precisa ser implementada nos dois lados).
+ * ------------------------------------------------------------------------- */
+
+/* true entre o REGISTER_NOTIFICATION do celular e nossa resposta CHANGED —
+ * AVRCP só permite uma notificação não solicitada por registro; o celular
+ * tem que re-registrar (o que ele faz automaticamente) para receber a próxima. */
+static volatile bool s_avrc_vol_ntf_registered = false;
+
+static void bt_app_avrc_tg_handler(uint16_t event, void *p_param)
+{
+    esp_avrc_tg_cb_param_t *rc = (esp_avrc_tg_cb_param_t *)p_param;
+
+    switch ((esp_avrc_tg_cb_event_t)event) {
+        case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT: {
+            /* celular -> receiver: volume vem em 0-127 (7 bits, padrão AVRCP) */
+            int volume = (rc->set_abs_vol.volume * VOLUME_STEPS) / 127;
+            audio_codec_set_volume(volume);
+            break;
+        }
+
+        case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT:
+            if (rc->reg_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE) {
+                esp_avrc_rn_param_t param = {
+                    .volume = (uint8_t)((audio_codec_get_volume() * 127) / VOLUME_STEPS),
+                };
+                esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_INTERIM, &param);
+                s_avrc_vol_ntf_registered = true;
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void bt_app_rc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
+{
+    bt_app_work_dispatch((bt_app_cb_t)bt_app_avrc_tg_handler, event, param, sizeof(esp_avrc_tg_cb_param_t));
+}
+
+void bt_audio_notify_volume_changed(int volume_0_to_steps)
+{
+    if (!s_avrc_vol_ntf_registered) {
+        return;
+    }
+    s_avrc_vol_ntf_registered = false;
+
+    esp_avrc_rn_param_t param = {
+        .volume = (uint8_t)((volume_0_to_steps * 127) / VOLUME_STEPS),
+    };
+    esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_CHANGED, &param);
+}
+
+void bt_audio_forget_device(const uint8_t mac[6])
+{
+    logger_log(ESP_LOG_INFO, TAG, "Esquecendo dispositivo [%02x:%02x:%02x:%02x:%02x:%02x]",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    pairing_set_allowed(mac, false);
+    /* esp_a2d_sink_disconnect() em um MAC nao conectado so retorna erro,
+     * inofensivo -- mais simples que checar s_status.remote_mac antes. */
+    esp_a2d_sink_disconnect((uint8_t *)mac);
+    esp_bt_gap_remove_bond_device((uint8_t *)mac);
+}
+
+void bt_audio_disconnect_device(const uint8_t mac[6])
+{
+    /* So derruba a conexao -- diferente de bt_audio_forget_device(), NAO
+     * mexe no bond nem na lista de autorizados, entao o dispositivo pode
+     * reconectar depois normalmente, sem precisar parear de novo. */
+    logger_log(ESP_LOG_INFO, TAG, "Desconectando [%02x:%02x:%02x:%02x:%02x:%02x]",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    esp_a2d_sink_disconnect((uint8_t *)mac);
+}
+
+esp_err_t bt_audio_media_control(const char *cmd)
+{
+    uint8_t key_code;
+    if (strcmp(cmd, "play") == 0) {
+        key_code = ESP_AVRC_PT_CMD_PLAY;
+    } else if (strcmp(cmd, "pause") == 0) {
+        key_code = ESP_AVRC_PT_CMD_PAUSE;
+    } else if (strcmp(cmd, "playpause") == 0) {
+        /* AVRCP nao tem um "toggle" nativo -- decide com base no ultimo
+         * estado de reproducao conhecido (ESP_A2D_AUDIO_STATE_EVT). */
+        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+        bool playing = s_status.playing;
+        xSemaphoreGive(s_status_mutex);
+        key_code = playing ? ESP_AVRC_PT_CMD_PAUSE : ESP_AVRC_PT_CMD_PLAY;
+    } else if (strcmp(cmd, "stop") == 0) {
+        key_code = ESP_AVRC_PT_CMD_STOP;
+    } else if (strcmp(cmd, "next") == 0) {
+        key_code = ESP_AVRC_PT_CMD_FORWARD;
+    } else if (strcmp(cmd, "previous") == 0) {
+        key_code = ESP_AVRC_PT_CMD_BACKWARD;
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Passthrough exige os dois eventos (tecla apertada e solta) pra
+     * comandos momentaneos como play/pause/next/previous. */
+    esp_avrc_ct_send_passthrough_cmd(RC_TL_PASSTHROUGH, key_code, ESP_AVRC_PT_CMD_STATE_PRESSED);
+    esp_avrc_ct_send_passthrough_cmd(RC_TL_PASSTHROUGH, key_code, ESP_AVRC_PT_CMD_STATE_RELEASED);
+    return ESP_OK;
+}
+
+void bt_audio_set_discoverable(bool discoverable)
+{
+    s_discoverable = discoverable;
+    storage_set_i32(NVS_KEY_BT_DISCOVERABLE, discoverable ? 1 : 0);
+    /* So aplica na hora se nao tiver ninguem conectado -- enquanto
+     * conectado o modo ja fica NON_DISCOVERABLE (ver ESP_A2D_CONNECTION_
+     * STATE_EVT), o que essa chamada respeitaria errado se disparasse aqui. */
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    bool connected = s_status.connected;
+    xSemaphoreGive(s_status_mutex);
+    if (!connected) {
+        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
+                                  discoverable ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+    }
+}
+
+bool bt_audio_get_discoverable(void)
+{
+    return s_discoverable;
+}
+
+void bt_audio_set_require_pin(bool require_pin)
+{
+    s_require_pin = require_pin;
+    storage_set_i32(NVS_KEY_BT_REQUIRE_PIN, require_pin ? 1 : 0);
+    esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
+    esp_bt_io_cap_t iocap = require_pin ? ESP_BT_IO_CAP_OUT : ESP_BT_IO_CAP_NONE;
+    esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
+}
+
+bool bt_audio_get_require_pin(void)
+{
+    return s_require_pin;
+}
+
+/* -------------------------------------------------------------------------
  * Inicialização
  * ------------------------------------------------------------------------- */
 
 static void bt_stack_up(uint16_t event, void *p_param)
 {
+    /* esp_coex_preference_set(ESP_COEX_PREFER_BT) foi tentado aqui pra
+     * reduzir perda de pacote BT durante audio A2DP, mas piorou bastante
+     * (rajada de "Sequence numbers error" foi de ~5s isolados pra ~8s
+     * continuos) -- API deprecated, comportamento parece inconsistente
+     * nesta versao do stack (5.5.3). Revertido; fica so o balanceamento
+     * padrao do coexistidor. */
+
     char device_name[32];
     if (storage_get_str(NVS_KEY_DEVICE_NAME, device_name, sizeof(device_name)) != ESP_OK) {
         strlcpy(device_name, FW_DEVICE_NAME_DEFAULT, sizeof(device_name));
@@ -451,19 +708,40 @@ static void bt_stack_up(uint16_t event, void *p_param)
     esp_bt_gap_set_device_name(device_name);
     esp_bt_gap_register_callback(bt_app_gap_cb);
 
-    /* Secure Simple Pairing "Just Works" — sem exigir confirmação manual do usuário. */
+    int32_t v;
+    storage_get_i32(NVS_KEY_BT_DISCOVERABLE, &v, DEFAULT_BT_DISCOVERABLE);
+    s_discoverable = (v != 0);
+    storage_get_i32(NVS_KEY_BT_REQUIRE_PIN, &v, DEFAULT_BT_REQUIRE_PIN);
+    s_require_pin = (v != 0);
+
+    /* Secure Simple Pairing: "Just Works" (NoInputNoOutput) por padrao --
+     * sem confirmacao manual, so a lista de autorizados (pairing_is_allowed)
+     * decide. Com require_pin=true, DisplayOnly forca o fluxo "Passkey
+     * Entry": o stack gera um codigo de 6 digitos (ESP_BT_GAP_KEY_NOTIF_EVT)
+     * que mostramos em /api/status, e a pessoa digita no celular -- funciona
+     * de verdade em celulares modernos (diferente de PIN legado, que a
+     * maioria ignora quando SSP esta disponivel). */
     esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
+    esp_bt_io_cap_t iocap = s_require_pin ? ESP_BT_IO_CAP_OUT : ESP_BT_IO_CAP_NONE;
     esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
 
     ESP_ERROR_CHECK(esp_avrc_ct_init());
     esp_avrc_ct_register_callback(bt_app_rc_ct_cb);
 
+    /* Papel Target: só para volume absoluto (ver bt_app_avrc_tg_handler acima)
+     * — sem isso o slider de volume do celular não tem nenhum efeito real. */
+    ESP_ERROR_CHECK(esp_avrc_tg_init());
+    esp_avrc_tg_register_callback(bt_app_rc_tg_cb);
+    esp_avrc_rn_evt_cap_mask_t tg_evt_set = {0};
+    esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &tg_evt_set, ESP_AVRC_RN_VOLUME_CHANGE);
+    ESP_ERROR_CHECK(esp_avrc_tg_set_rn_evt_cap(&tg_evt_set));
+
     ESP_ERROR_CHECK(esp_a2d_sink_init());
     esp_a2d_register_callback(bt_app_a2d_cb);
     esp_a2d_sink_register_data_callback(bt_app_a2d_data_cb);
 
-    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
+                              s_discoverable ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
 
     logger_log(ESP_LOG_INFO, TAG, "Bluetooth pronto, nome: %s", device_name);
 }
@@ -480,7 +758,15 @@ void bt_audio_get_status(bt_audio_status_t *out)
 
 void bt_audio_init(void)
 {
+    bt_audio_prealloc_ring_buffer();
+
     s_status_mutex = xSemaphoreCreateMutex();
+
+    const esp_timer_create_args_t metadata_timer_args = {
+        .callback = metadata_delay_timer_cb,
+        .name = "avrc_meta_delay",
+    };
+    esp_timer_create(&metadata_timer_args, &s_metadata_delay_timer);
 
     s_bt_app_task_queue = xQueueCreate(10, sizeof(bt_app_msg_t));
     xTaskCreate(bt_app_task_handler, "bt_app_task", 3072, NULL, 10, &s_bt_app_task_handle);
