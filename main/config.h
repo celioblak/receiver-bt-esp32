@@ -42,7 +42,6 @@
 #define NVS_NAMESPACE "recv_bt"
 
 #define NVS_KEY_DEVICE_NAME     "dev_name"
-#define NVS_KEY_VOLUME          "volume"
 #define NVS_KEY_RELAY_TIMEOUT   "rly_timeout"
 #define NVS_KEY_WIFI_SSID       "wifi_ssid"
 #define NVS_KEY_WIFI_PASS       "wifi_pass"
@@ -54,14 +53,18 @@
 #define NVS_KEY_DEVICE_HISTORY  "dev_history"
 #define NVS_KEY_STAT_UPTIME_MIN "stat_uptime"
 #define NVS_KEY_STAT_BT_CONNS   "stat_btconn"
+#define NVS_KEY_BT_DISCOVERABLE "bt_discover"
+#define NVS_KEY_BT_REQUIRE_PIN  "bt_req_pin"
 
 /* -------------------------------------------------------------------------
  * Valores padrão
  * ------------------------------------------------------------------------- */
 
-#define DEFAULT_VOLUME          70      /* 0-100 (legado — ver VOLUME_STEPS abaixo) */
 #define DEFAULT_RELAY_TIMEOUT_S 30      /* segundos sem PLAYING até desligar o ampli */
 #define RELAY_SILENCE_DEBOUNCE_S 2      /* ignora pausas curtas entre faixas */
+
+#define DEFAULT_BT_DISCOVERABLE 1  /* 1 = aparece na busca de dispositivos de quem ainda não pareou */
+#define DEFAULT_BT_REQUIRE_PIN  0  /* 1 = exige passkey de 6 dígitos (mostrado na página Dispositivos) para novos pareamentos */
 
 /* -------------------------------------------------------------------------
  * Volume fino (escala perceptual) — ver audio_codec.c

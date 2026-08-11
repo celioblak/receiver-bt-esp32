@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Wi-Fi STA (credenciais em NVS) com fallback para AP de configuração
  * ("ReceiverBT-Config", sem senha) só quando não há credenciais salvas.
@@ -12,6 +13,21 @@
 void wifi_manager_init(void);
 
 bool wifi_manager_is_connected(void);
+
+typedef struct {
+    char ssid[33];
+    int8_t rssi;
+    bool secure;
+} wifi_manager_scan_result_t;
+
+#define WIFI_MANAGER_SCAN_MAX 20
+
+/* Busca (bloqueante, ~1-3s) as redes Wi-Fi visíveis, mais fortes primeiro,
+ * sem duplicar SSID repetido em vários canais/APs. Funciona tanto em modo
+ * STA (já conectado) quanto no AP de configuração (ver start_ap() —
+ * roda em APSTA justamente para permitir isso). Retorna a quantidade
+ * encontrada (até max_results). */
+size_t wifi_manager_scan(wifi_manager_scan_result_t *out, size_t max_results);
 
 /* true se STA conectado OU AP de configuração ativo — indica que dá pra
  * acessar a interface web. false só no caso "offline de verdade" (STA

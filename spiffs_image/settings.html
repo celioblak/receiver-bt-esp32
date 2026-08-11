@@ -17,10 +17,27 @@
             <input type="text" id="device_name" maxlength="31">
 
             <label for="wifi_ssid">Rede Wi-Fi (SSID)</label>
-            <input type="text" id="wifi_ssid" maxlength="32">
+            <div class="row" style="gap:0.5rem">
+                <input type="text" id="wifi_ssid" maxlength="32" style="flex:1">
+                <button type="button" id="wifi-scan-btn">Buscar redes</button>
+            </div>
+            <select id="wifi-scan-results" style="display:none"></select>
+            <div id="wifi-scan-msg" class="track-sub"></div>
 
             <label for="wifi_pass">Senha Wi-Fi</label>
             <input type="password" id="wifi_pass" maxlength="64" placeholder="deixe em branco para manter">
+
+            <div class="row">
+                <span class="label">Visível na busca de dispositivos Bluetooth</span>
+                <input type="checkbox" id="bt_discoverable">
+            </div>
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Dispositivos já pareados continuam conectando normalmente mesmo oculto.</div>
+
+            <div class="row">
+                <span class="label">Exigir código de 6 dígitos para novos pareamentos</span>
+                <input type="checkbox" id="bt_require_pin">
+            </div>
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Não afeta dispositivos já pareados. Veja o código na página Dispositivos quando alguém tentar parear.</div>
 
             <label for="relay_timeout_s">Timeout do amplificador (segundos sem tocar)</label>
             <input type="number" id="relay_timeout_s" min="5" max="600">
@@ -40,6 +57,8 @@
             <button type="submit">Salvar</button>
             <div id="save-msg"></div>
         </form>
+        <button type="button" id="restart-btn" style="margin-top:0.75rem">Reiniciar dispositivo</button>
+        <div id="restart-msg" class="track-sub"></div>
     </div>
 
     <div class="card">
@@ -93,6 +112,45 @@ document.getElementById("ota-upload").addEventListener("click", async () => {
     }
 });
 
+document.getElementById("wifi-scan-btn").addEventListener("click", async () => {
+    const btn = document.getElementById("wifi-scan-btn");
+    const msg = document.getElementById("wifi-scan-msg");
+    const select = document.getElementById("wifi-scan-results");
+    btn.disabled = true;
+    msg.textContent = "Buscando redes...";
+    select.style.display = "none";
+    try {
+        const nets = await apiGet("/api/wifi/scan");
+        if (!nets.length) {
+            msg.textContent = "Nenhuma rede encontrada.";
+        } else {
+            select.innerHTML = "";
+            const placeholder = document.createElement("option");
+            placeholder.textContent = "Selecione uma rede...";
+            placeholder.value = "";
+            select.appendChild(placeholder);
+            for (const net of nets) {
+                const opt = document.createElement("option");
+                opt.value = net.ssid;
+                opt.textContent = net.ssid + " (" + net.rssi + " dBm" + (net.secure ? ", protegida" : ", aberta") + ")";
+                select.appendChild(opt);
+            }
+            select.style.display = "block";
+            msg.textContent = nets.length + " rede(s) encontrada(s).";
+        }
+    } catch (e) {
+        msg.textContent = "Falha ao buscar redes: " + e.message;
+    } finally {
+        btn.disabled = false;
+    }
+});
+
+document.getElementById("wifi-scan-results").addEventListener("change", (e) => {
+    if (e.target.value) {
+        document.getElementById("wifi_ssid").value = e.target.value;
+    }
+});
+
 async function load() {
     const c = await apiGet("/api/config");
     document.getElementById("device_name").value = c.device_name;
@@ -101,6 +159,8 @@ async function load() {
     document.getElementById("mqtt_host").value = c.mqtt_host;
     document.getElementById("mqtt_port").value = c.mqtt_port;
     document.getElementById("mqtt_user").value = c.mqtt_user;
+    document.getElementById("bt_discoverable").checked = c.bt_discoverable;
+    document.getElementById("bt_require_pin").checked = c.bt_require_pin;
 }
 
 /* -------------------------------------------------------------------------
@@ -150,7 +210,7 @@ async function refreshVolumeAgc() {
 }
 
 refreshVolumeAgc();
-setInterval(refreshVolumeAgc, 2000);
+setInterval(refreshVolumeAgc, 4000);
 
 document.getElementById("config-form").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -161,6 +221,8 @@ document.getElementById("config-form").addEventListener("submit", async (e) => {
         mqtt_host: document.getElementById("mqtt_host").value,
         mqtt_port: parseInt(document.getElementById("mqtt_port").value, 10) || 1883,
         mqtt_user: document.getElementById("mqtt_user").value,
+        bt_discoverable: document.getElementById("bt_discoverable").checked,
+        bt_require_pin: document.getElementById("bt_require_pin").checked,
     };
     const wifiPass = document.getElementById("wifi_pass").value;
     if (wifiPass) body.wifi_pass = wifiPass;
@@ -169,6 +231,20 @@ document.getElementById("config-form").addEventListener("submit", async (e) => {
 
     const resp = await apiPost("/api/config", body);
     document.getElementById("save-msg").textContent = resp.message || "Salvo.";
+});
+
+document.getElementById("restart-btn").addEventListener("click", async () => {
+    if (!confirm("Reiniciar o dispositivo agora? A conexao Bluetooth/audio sera interrompida por alguns segundos.")) {
+        return;
+    }
+    const msg = document.getElementById("restart-msg");
+    try {
+        await apiPost("/api/system/restart", {});
+        msg.textContent = "Reiniciando...";
+    } catch (e) {
+        /* a resposta pode nao chegar por causa do proprio reinicio -- normal */
+        msg.textContent = "Reiniciando...";
+    }
 });
 
 load();

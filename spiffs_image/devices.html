@@ -11,6 +11,14 @@
     <h1>Dispositivos Bluetooth</h1>
     <nav><a href="/index.html">&larr; Voltar</a></nav>
 
+    <div class="card" id="pending-pin-card" style="display:none">
+        <span class="label">Pareamento em andamento</span>
+        <p class="track-sub" style="margin:0.3rem 0">Dispositivo <strong id="pending-pin-mac"></strong> — digite este código no celular:</p>
+        <p style="font-size:1.8rem; font-weight:bold; letter-spacing:0.2rem; margin:0">
+            <span id="pending-pin-code"></span>
+        </p>
+    </div>
+
     <div class="card">
         <p class="track-sub" style="margin:0 0 0.5rem">
             Sem nenhum dispositivo "autorizado", qualquer um pode parear.
@@ -26,6 +34,24 @@ async function pair(mac, action) {
     await apiPost("/api/pair", { mac, action });
     load();
 }
+
+async function refreshPendingPin() {
+    try {
+        const s = await apiGet("/api/status");
+        const card = document.getElementById("pending-pin-card");
+        if (s.pending_pin_code) {
+            card.style.display = "block";
+            document.getElementById("pending-pin-mac").textContent = s.pending_pin_mac;
+            document.getElementById("pending-pin-code").textContent = s.pending_pin_code;
+        } else {
+            card.style.display = "none";
+        }
+    } catch (e) {
+        console.error(e);
+    }
+}
+refreshPendingPin();
+setInterval(refreshPendingPin, 2000);
 
 async function load() {
     const devices = await apiGet("/api/devices");
@@ -66,6 +92,16 @@ async function load() {
         blockBtn.style.background = "var(--off)";
         blockBtn.onclick = () => pair(d.mac, "block");
 
+        const forgetBtn = document.createElement("button");
+        forgetBtn.textContent = "Esquecer (remove o pareamento)";
+        forgetBtn.style.marginTop = "0";
+        forgetBtn.style.background = "var(--off)";
+        forgetBtn.onclick = () => {
+            if (confirm("Esquecer " + (d.name || d.mac) + "? Ele vai desconectar e precisar parear de novo pra voltar a usar.")) {
+                pair(d.mac, "forget");
+            }
+        };
+
         const removeBtn = document.createElement("button");
         removeBtn.textContent = "Remover do historico";
         removeBtn.style.marginTop = "0";
@@ -73,7 +109,7 @@ async function load() {
         removeBtn.style.border = "1px solid var(--border)";
         removeBtn.onclick = () => pair(d.mac, "remove");
 
-        actions.append(allowBtn, blockBtn, removeBtn);
+        actions.append(allowBtn, blockBtn, forgetBtn, removeBtn);
         row.appendChild(actions);
         list.appendChild(row);
     }

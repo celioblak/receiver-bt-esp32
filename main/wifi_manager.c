@@ -57,6 +57,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 static void start_ap(void)
 {
     esp_netif_create_default_wifi_ap();
+    /* STA "sombra" sem se conectar a nada — só para o rádio ter uma
+     * interface capaz de escanear (wifi_manager_scan) enquanto o AP de
+     * configuração está no ar, sem precisar sair dele. */
+    esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
@@ -71,7 +75,7 @@ static void start_ap(void)
     strlcpy((char *)ap_config.ap.ssid, WIFI_AP_SSID_DEFAULT, sizeof(ap_config.ap.ssid));
     ap_config.ap.ssid_len = strlen(WIFI_AP_SSID_DEFAULT);
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
@@ -93,6 +97,16 @@ static void start_sta_and_wait(const char *ssid, const char *pass)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* Sem power-save: o radio WiFi acorda periodicamente (~beacon interval,
+     * ver "wifi:pm start" no log) pra checar por dados quando em modem
+     * sleep, e cada ciclo liga/desliga o radio -- candidato a fonte do
+     * ruido periodico ("toto toto") no ES8388, independente do Bluetooth.
+     * Ja foi tentado antes e revertido por piorar disponibilidade de heap,
+     * mas isso era pre-PSRAM (heap era ~11-26KB); agora sobra ~4MB, entao
+     * o custo do heap nao se aplica mais. Custo real: mais consumo de
+     * energia (irrelevante, fonte externa). */
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
     logger_log(ESP_LOG_INFO, TAG, "Conectando ao Wi-Fi \"%s\"...", ssid);
 
@@ -135,6 +149,54 @@ bool wifi_manager_is_connected(void)
 bool wifi_manager_network_available(void)
 {
     return s_connected || s_ap_mode;
+}
+
+size_t wifi_manager_scan(wifi_manager_scan_result_t *out, size_t max_results)
+{
+    if (out == NULL || max_results == 0) {
+        return 0;
+    }
+
+    wifi_scan_config_t scan_cfg = {0};
+    if (esp_wifi_scan_start(&scan_cfg, true) != ESP_OK) {
+        return 0;
+    }
+
+    uint16_t found = 0;
+    esp_wifi_scan_get_ap_num(&found);
+    if (found == 0) {
+        return 0;
+    }
+
+    wifi_ap_record_t *records = calloc(found, sizeof(wifi_ap_record_t));
+    if (records == NULL) {
+        return 0;
+    }
+    esp_wifi_scan_get_ap_records(&found, records);
+
+    size_t count = 0;
+    for (uint16_t i = 0; i < found && count < max_results; i++) {
+        if (records[i].ssid[0] == '\0') {
+            continue; /* rede oculta, sem SSID pra mostrar/preencher */
+        }
+        bool dup = false;
+        for (size_t j = 0; j < count; j++) {
+            if (strcmp(out[j].ssid, (const char *)records[i].ssid) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue; /* mesmo SSID visto em outro canal/AP — a lista ja vem ordenada por sinal */
+        }
+        strlcpy(out[count].ssid, (const char *)records[i].ssid, sizeof(out[count].ssid));
+        out[count].rssi = records[i].rssi;
+        out[count].secure = (records[i].authmode != WIFI_AUTH_OPEN);
+        count++;
+    }
+
+    free(records);
+    return count;
 }
 
 void wifi_manager_get_ip_str(char *out, size_t max_len)

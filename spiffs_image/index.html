@@ -17,10 +17,20 @@
             <span class="label">Bluetooth</span>
             <span class="badge off" id="bt-badge">desconectado</span>
         </div>
+        <div class="row" id="bt-device-row" style="display:none">
+            <span class="label">Dispositivo</span>
+            <span id="bt-device-name">—</span>
+        </div>
         <div class="row">
             <span class="label">Amplificador</span>
             <span class="badge off" id="amp-badge">desligado</span>
         </div>
+        <div class="row" id="media-controls" style="display:none; gap:0.5rem; margin-top:0.75rem">
+            <button type="button" id="media-prev" style="margin-top:0">⏮</button>
+            <button type="button" id="media-playpause" style="margin-top:0">⏯</button>
+            <button type="button" id="media-next" style="margin-top:0">⏭</button>
+        </div>
+        <button type="button" id="disconnect-btn" style="display:none; margin-top:0.75rem">Desconectar</button>
     </div>
 
     <div class="card">
@@ -61,6 +71,22 @@ async function refresh() {
         btBadge.textContent = s.bt_connected ? (s.playing ? "tocando" : "conectado") : "desconectado";
         btBadge.className = "badge " + (s.bt_connected ? "on" : "off");
 
+        const deviceRow = document.getElementById("bt-device-row");
+        const disconnectBtn = document.getElementById("disconnect-btn");
+        const mediaControls = document.getElementById("media-controls");
+        if (s.bt_connected) {
+            document.getElementById("bt-device-name").textContent =
+                s.bt_remote_name || s.bt_remote_mac || "—";
+            deviceRow.style.display = "flex";
+            disconnectBtn.style.display = "block";
+            disconnectBtn.dataset.mac = s.bt_remote_mac;
+            mediaControls.style.display = "flex";
+        } else {
+            deviceRow.style.display = "none";
+            disconnectBtn.style.display = "none";
+            mediaControls.style.display = "none";
+        }
+
         const ampBadge = document.getElementById("amp-badge");
         ampBadge.textContent = s.amplifier ? "ligado" : "desligado";
         ampBadge.className = "badge " + (s.amplifier ? "on" : "off");
@@ -76,8 +102,19 @@ async function refresh() {
     }
 }
 
+document.getElementById("disconnect-btn").addEventListener("click", async (e) => {
+    const mac = e.target.dataset.mac;
+    if (mac) {
+        await apiPost("/api/pair", { mac, action: "disconnect" });
+    }
+});
+
+document.getElementById("media-prev").addEventListener("click", () => apiPost("/api/media", { cmd: "previous" }));
+document.getElementById("media-playpause").addEventListener("click", () => apiPost("/api/media", { cmd: "playpause" }));
+document.getElementById("media-next").addEventListener("click", () => apiPost("/api/media", { cmd: "next" }));
+
 refresh();
-setInterval(refresh, 3000);
+setInterval(refresh, 5000);
 </script>
 </body>
 </html>

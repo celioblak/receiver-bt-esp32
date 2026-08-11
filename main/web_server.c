@@ -19,7 +19,10 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "esp_system.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "web_server";
 
@@ -82,10 +85,29 @@ static esp_err_t api_status_get(httpd_req_t *req)
     char ip[16];
     wifi_manager_get_ip_str(ip, sizeof(ip));
 
+    /* Nome do dispositivo Bluetooth conectado: procurado no histórico de
+     * pareamento pelo MAC (a pilha não guarda o nome remoto em lugar
+     * nenhum acessível fora do evento de pareamento em si). */
+    char bt_remote_name[32] = "";
+    if (bt.connected && bt.remote_mac[0] != '\0') {
+        pairing_device_t history[PAIRING_HISTORY_MAX];
+        size_t n = pairing_get_history(history, PAIRING_HISTORY_MAX);
+        for (size_t i = 0; i < n; i++) {
+            char mac_str[18];
+            pairing_format_mac(history[i].mac, mac_str, sizeof(mac_str));
+            if (strcmp(mac_str, bt.remote_mac) == 0) {
+                strlcpy(bt_remote_name, history[i].name, sizeof(bt_remote_name));
+                break;
+            }
+        }
+    }
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "bt_connected", bt.connected);
     cJSON_AddStringToObject(root, "device_name", device_name);
     cJSON_AddStringToObject(root, "device_mac", own_mac);
+    cJSON_AddStringToObject(root, "bt_remote_mac", bt.remote_mac);
+    cJSON_AddStringToObject(root, "bt_remote_name", bt_remote_name);
     cJSON_AddStringToObject(root, "track", bt.title);
     cJSON_AddStringToObject(root, "artist", bt.artist);
     cJSON_AddStringToObject(root, "album", bt.album);
@@ -98,6 +120,10 @@ static esp_err_t api_status_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "agc_mode", audio_agc_get_mode());
     cJSON_AddStringToObject(root, "wifi_ip", ip);
     cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
+    cJSON_AddBoolToObject(root, "bt_discoverable", bt_audio_get_discoverable());
+    cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
+    cJSON_AddStringToObject(root, "pending_pin_mac", bt.pending_pin_mac);
+    cJSON_AddStringToObject(root, "pending_pin_code", bt.pending_pin_code);
 
     return send_json(req, root);
 }
@@ -134,6 +160,8 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "mqtt_host", mqtt_host);
     cJSON_AddNumberToObject(root, "mqtt_port", mqtt_port);
     cJSON_AddStringToObject(root, "mqtt_user", mqtt_user);
+    cJSON_AddBoolToObject(root, "bt_discoverable", bt_audio_get_discoverable());
+    cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
 
     return send_json(req, root);
 }
@@ -179,6 +207,12 @@ static esp_err_t api_config_post(httpd_req_t *req)
         storage_set_str(NVS_KEY_MQTT_PASS, item->valuestring);
         reboot_needed = true;
     }
+    if ((item = cJSON_GetObjectItem(root, "bt_discoverable")) && cJSON_IsBool(item)) {
+        bt_audio_set_discoverable(cJSON_IsTrue(item));
+    }
+    if ((item = cJSON_GetObjectItem(root, "bt_require_pin")) && cJSON_IsBool(item)) {
+        bt_audio_set_require_pin(cJSON_IsTrue(item));
+    }
     cJSON_Delete(root);
 
     logger_log(ESP_LOG_INFO, TAG, "Configuracao atualizada via API");
@@ -189,6 +223,18 @@ static esp_err_t api_config_post(httpd_req_t *req)
                              reboot_needed ? "Salvo. Reinicie o dispositivo para aplicar as mudancas de Wi-Fi/MQTT."
                                            : "Salvo.");
     return send_json(req, resp);
+}
+
+static esp_err_t api_system_restart_post(httpd_req_t *req)
+{
+    logger_log(ESP_LOG_INFO, TAG, "Reinicio solicitado via API");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"message\":\"Reiniciando...\"}");
+
+    /* da tempo da resposta HTTP sair antes de reiniciar (mesmo padrao do OTA) */
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK; /* nunca chega aqui */
 }
 
 static esp_err_t api_volume_post(httpd_req_t *req)
@@ -215,6 +261,28 @@ static esp_err_t api_volume_post(httpd_req_t *req)
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", true);
     cJSON_AddNumberToObject(resp, "volume", audio_codec_get_volume());
+    return send_json(req, resp);
+}
+
+static esp_err_t api_media_post(httpd_req_t *req)
+{
+    char buf[64];
+    cJSON *root = recv_json_body(req, buf, sizeof(buf));
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+
+    cJSON *item = cJSON_GetObjectItem(root, "cmd");
+    if (!cJSON_IsString(item) || bt_audio_media_control(item->valuestring) != ESP_OK) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                             "\"cmd\" deve ser play, pause, playpause, stop, next ou previous");
+        return ESP_FAIL;
+    }
+    cJSON_Delete(root);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
     return send_json(req, resp);
 }
 
@@ -284,6 +352,23 @@ static esp_err_t api_devices_get(httpd_req_t *req)
     return send_json(req, arr);
 }
 
+static esp_err_t api_wifi_scan_get(httpd_req_t *req)
+{
+    wifi_manager_scan_result_t results[WIFI_MANAGER_SCAN_MAX];
+    size_t n = wifi_manager_scan(results, WIFI_MANAGER_SCAN_MAX);
+
+    cJSON *arr = cJSON_CreateArray();
+    for (size_t i = 0; i < n; i++) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "ssid", results[i].ssid);
+        cJSON_AddNumberToObject(item, "rssi", results[i].rssi);
+        cJSON_AddBoolToObject(item, "secure", results[i].secure);
+        cJSON_AddItemToArray(arr, item);
+    }
+
+    return send_json(req, arr);
+}
+
 static esp_err_t api_pair_post(httpd_req_t *req)
 {
     char buf[256];
@@ -310,9 +395,18 @@ static esp_err_t api_pair_post(httpd_req_t *req)
         pairing_set_allowed(mac, false);
     } else if (strcmp(action, "remove") == 0) {
         pairing_remove_from_history(mac);
+    } else if (strcmp(action, "forget") == 0) {
+        /* Diferente de "remove": tira o bond no controlador BT e
+         * desconecta agora, nao so limpa o historico -- sem isso o
+         * celular reconectava sozinho de novo (link key salva). */
+        bt_audio_forget_device(mac);
+    } else if (strcmp(action, "disconnect") == 0) {
+        /* Diferente de "forget": so derruba a conexao, mantem o
+         * pareamento -- o dispositivo pode reconectar depois normalmente. */
+        bt_audio_disconnect_device(mac);
     } else {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "action deve ser allow, block ou remove");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "action deve ser allow, block, remove, forget ou disconnect");
         return ESP_FAIL;
     }
     cJSON_Delete(root);
@@ -400,7 +494,7 @@ void web_server_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 16;
     config.stack_size = 8192; /* /ota escreve na flash — folga extra de pilha */
     config.recv_wait_timeout = 10;
 
@@ -415,10 +509,13 @@ void web_server_start(void)
         {.uri = "/api/config", .method = HTTP_GET, .handler = api_config_get},
         {.uri = "/api/config", .method = HTTP_POST, .handler = api_config_post},
         {.uri = "/api/volume", .method = HTTP_POST, .handler = api_volume_post},
+        {.uri = "/api/media", .method = HTTP_POST, .handler = api_media_post},
         {.uri = "/api/agc", .method = HTTP_POST, .handler = api_agc_post},
         {.uri = "/api/logs", .method = HTTP_GET, .handler = api_logs_get},
         {.uri = "/api/devices", .method = HTTP_GET, .handler = api_devices_get},
         {.uri = "/api/pair", .method = HTTP_POST, .handler = api_pair_post},
+        {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = api_wifi_scan_get},
+        {.uri = "/api/system/restart", .method = HTTP_POST, .handler = api_system_restart_post},
         {.uri = "/ota", .method = HTTP_POST, .handler = ota_manager_upload_handler},
         {.uri = "/*", .method = HTTP_GET, .handler = static_file_get},
     };
