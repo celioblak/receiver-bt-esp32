@@ -4,5 +4,5 @@ idf_component_register(
          "ota_manager.c"
     INCLUDE_DIRS "."
     REQUIRES nvs_flash esp_timer driver bt esp_wifi esp_netif esp_event mdns
-             esp_http_server spiffs json mqtt app_update
+             esp_http_server spiffs cjson mqtt app_update
 )

@@ -12,17 +12,41 @@ CONFIG_BT_CLASSIC_ENABLED=y
 CONFIG_BT_A2DP_ENABLE=y
 CONFIG_BT_SPP_ENABLED=n
 
+# O controlador Bluetooth (radio) tem 3 modos: BLE Only, BR/EDR Only ou Dual
+# Mode. Sem essa escolha explícita, o Kconfig cai no primeiro item da lista
+# (BLE Only) por padrão — o que quebraria o A2DP/AVRCP (Bluetooth Classic),
+# já que o projeto não usa BLE em nenhum lugar. Fixar em BR/EDR Only também
+# libera bastante IRAM (stack BLE inteira fica de fora do build).
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
+CONFIG_BT_BLE_ENABLED=n
+
+# --- Bootloader ---
+# O bootloader.bin (29312 bytes) passa dos 28KB reservados entre 0x1000 e o
+# offset padrão da tabela de partições (0x8000), colidindo com ela
+# ("Detected overlap at address: 0x8000"). Baixar o log não resolveu (WARN
+# e NONE dão o mesmo tamanho — as poucas mensagens do bootloader já eram
+# INFO). Solução oficial do ESP-IDF: mover a tabela de partições pra depois
+# (ver partitions.csv, NVS encolhido de 20KB pra 16KB pra compensar).
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_PARTITION_TABLE_OFFSET=0x9000
+
 # --- Partições ---
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # --- Memória ---
-# ESP32-A1S do Audio Kit V2.2 não possui PSRAM
-CONFIG_ESP32_SPIRAM_SUPPORT=n
+# Confirmado por log: essa placa TEM PSRAM (8MB, "esp_psram: Found 8MB
+# PSRAM device", ~4MB mapeados/usáveis — limite do próprio chip ESP32
+# clássico). Isso muda o heap livre de ~11-26KB pra ~4MB. Sem PSRAM real,
+# SPIRAM_IGNORE_NOTFOUND evita panic no boot (só desativa e segue sem ela).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+# Wi-Fi/LWIP alocam da PSRAM em vez de brigar com o Bluetooth pela DRAM
+# interna — era exatamente a causa dos crashes por heap fragmentado/exaurido
+# durante o A2DP com MQTT ativo, antes de descobrirmos a PSRAM.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 # Sem essas duas, IRAM estoura com BT (Bluedroid) + Wi-Fi + mDNS juntos.
-# O default dessas opções só vira "n" automaticamente com BT_ENABLED=y
-# quando há PSRAM — não é o nosso caso, então precisa ser explícito.
 # Custo: leve aumento no consumo de energia em modo power-save do Wi-Fi
 # (irrelevante aqui, o dispositivo é alimentado via fonte externa).
 CONFIG_ESP_WIFI_IRAM_OPT=n

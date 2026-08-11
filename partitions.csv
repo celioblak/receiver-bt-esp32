@@ -1,5 +1,9 @@
 # Name,     Type, SubType, Offset,   Size,     Flags
-nvs,         data, nvs,     0x9000,   0x5000,
+# NVS comeca em 0xA000 (nao 0x9000): a tabela de particoes foi movida para
+# 0x9000 (CONFIG_PARTITION_TABLE_OFFSET) para dar mais espaco ao bootloader.
+# NVS encolhido de 20KB para 16KB para absorver o deslocamento sem mexer em
+# otadata/app0/app1/spiffs (que continuam contiguos a partir daqui).
+nvs,         data, nvs,     0xA000,   0x4000,
 otadata,     data, ota,     0xe000,   0x2000,
 app0,        app,  ota_0,   0x10000,  0x1D0000,
 app1,        app,  ota_1,   0x1E0000, 0x1D0000,
