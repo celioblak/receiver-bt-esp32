@@ -1,5 +1,6 @@
 #include "audio_codec.h"
 
+#include "bt_audio.h"
 #include "config.h"
 #include "es8388.h"
 #include "esp_log.h"
@@ -15,6 +16,15 @@ static int s_current_volume = DEFAULT_VOLUME_USER;
 static esp_err_t i2s_init(uint32_t sample_rate_hz)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    /* Sem novo audio a tempo, o driver por padrao REPETE o ultimo conteudo
+     * transmitido em vez de silencio -- candidato direto pro ruido tipo
+     * "tique" repetitivo que persiste em idle. auto_clear_after_cb faz o
+     * driver zerar (silencio de verdade) automaticamente nesse caso. */
+    chan_cfg.auto_clear_after_cb = true;
+    /* Mais descritores de DMA = mais folga contra qualquer engasgo breve do
+     * escalonador de coexistencia WiFi/BT (que pode preemptar outros
+     * perifericos por instantes durante eventos de radio). */
+    chan_cfg.dma_desc_num = 12;
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_handle, NULL);
     if (err != ESP_OK) {
         return err;
@@ -36,6 +46,11 @@ static esp_err_t i2s_init(uint32_t sample_rate_hz)
             },
         },
     };
+    /* APLL foi tentado aqui (clock dedicado de audio) e revertido: com
+     * MCLK no GPIO0 nesta placa, causou o I2S travar silenciosamente
+     * (ring buffer enchia, nenhum audio saia) -- provavel problema de
+     * roteamento do APLL nesse pino especifico via este driver. Mantendo
+     * o clock padrao (PLL_F160M via I2S_CLK_SRC_DEFAULT). */
 
     err = i2s_channel_init_std_mode(s_tx_handle, &std_cfg);
     if (err != ESP_OK) {
@@ -68,10 +83,17 @@ esp_err_t audio_codec_init(void)
     return ESP_OK;
 }
 
-/* Curva perceptual quadrática: o ouvido é logarítmico e a atenuação do DAC
- * é linear em dB, então um mapeamento 1:1 faz os primeiros passos do slider
- * parecerem não fazer nada e os últimos dispararem o volume. x² comprime a
- * ponta baixa e expande a ponta alta, aproximando a percepção sonora. */
+/* Curva linear EM dB, não quadrática sobre a fração do slider: dB já É uma
+ * escala perceptual (é assim que potenciômetros de áudio "de verdade" são
+ * calibrados — tantos dB por grau de rotação), então aplicar x² por cima
+ * dobra a compressão. Isso causava um bug real: es8388_set_volume(0-100)
+ * atenua linearmente até -96dB, e x² jogava a metade do slider pra -72dB
+ * (já inaudível na prática) — só os últimos ~20% do curso faziam
+ * diferença perceptível. Restringimos a faixa útil a só os últimos
+ * VOLUME_MAX_ATTEN_DB dB (abaixo disso já é imperceptível/mascarado por
+ * ruído ambiente de qualquer forma; mudo de verdade é audio_codec_set_mute). */
+#define VOLUME_MAX_ATTEN_DB 50.0f
+
 static esp_err_t apply_curve_and_write(int volume_0_to_steps)
 {
     if (volume_0_to_steps < 0) {
@@ -80,8 +102,11 @@ static esp_err_t apply_curve_and_write(int volume_0_to_steps)
         volume_0_to_steps = VOLUME_STEPS;
     }
     float normalized = (float)volume_0_to_steps / VOLUME_STEPS; /* 0.0-1.0 */
-    float curved = normalized * normalized;                     /* x² */
-    uint8_t es_vol = (uint8_t)(curved * 100.0f);                 /* 0-100 p/ o ES8388 */
+    /* es8388_set_volume(0-100) mapeia 0->0dB e 100->-96dB linearmente;
+     * escolhemos es_vol pra restringir isso aos últimos VOLUME_MAX_ATTEN_DB
+     * dB desse range em vez do range inteiro. */
+    float es_vol_f = 100.0f - (VOLUME_MAX_ATTEN_DB / 0.96f) * (1.0f - normalized);
+    uint8_t es_vol = (uint8_t)(es_vol_f < 0.0f ? 0.0f : es_vol_f);
     return es8388_set_volume(es_vol);
 }
 
@@ -96,6 +121,7 @@ esp_err_t audio_codec_set_volume(int volume)
         }
         s_current_volume = volume;
         storage_set_i32(NVS_KEY_VOLUME_USER, volume);
+        bt_audio_notify_volume_changed(volume);
     }
     return err;
 }
@@ -122,6 +148,19 @@ esp_err_t audio_codec_write(const uint8_t *data, size_t len, size_t *bytes_writt
 
 esp_err_t audio_codec_reconfigure_clock(uint32_t sample_rate_hz)
 {
+    /* i2s_channel_reconfig_std_clock() exige o canal desabilitado, senão
+     * retorna ESP_ERR_INVALID_STATE e não muda nada — silenciosamente deixa
+     * tocando na taxa antiga (distorcido/acelerado) para qualquer faixa que
+     * não seja 44100Hz, o default usado em audio_codec_init(). */
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate_hz);
-    return i2s_channel_reconfig_std_clock(s_tx_handle, &clk_cfg);
+    esp_err_t err = i2s_channel_disable(s_tx_handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = i2s_channel_reconfig_std_clock(s_tx_handle, &clk_cfg);
+    if (err != ESP_OK) {
+        i2s_channel_enable(s_tx_handle);
+        return err;
+    }
+    return i2s_channel_enable(s_tx_handle);
 }

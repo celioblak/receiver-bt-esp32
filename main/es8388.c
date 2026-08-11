@@ -8,11 +8,11 @@
 
 static const char *TAG = "es8388";
 
-/* 0x20 conforme o driver oficial da Espressif (ESP-ADF audio_hal/es8388,
- * MIT). Algumas fontes da comunidade (ex.: squeezelite-esp32) citam 0x10 —
- * se a comunicação I2C falhar no bring-up, tente 0x10 antes de investigar
- * outra causa. */
-#define ES8388_I2C_ADDR 0x20
+/* 0x10 (7 bits) — confirmado no bring-up real: 0x20 (a forma de 8 bits,
+ * já deslocada, usada em exemplos com o driver I2C legado) falhava toda
+ * escrita de registrador com o driver i2c_master novo do IDF, que espera
+ * o endereço de 7 bits e faz o shift internamente. */
+#define ES8388_I2C_ADDR 0x10
 
 /* Registradores usados (subconjunto — só o necessário para DAC/line-out). */
 #define ES8388_CONTROL1   0x00
@@ -100,10 +100,16 @@ esp_err_t es8388_init(void)
     res |= es8388_write_reg(ES8388_DACCONTROL20, 0x90);
     res |= es8388_write_reg(ES8388_DACCONTROL21, 0x80);
     res |= es8388_write_reg(ES8388_DACCONTROL23, 0x00);
+    /* No ESP32-A1S (Audio Kit V2.2), LOUT1/ROUT1 vao para o amplificador de
+     * alto-falante (SPOLN/SPORN) e LOUT2/ROUT2 vao para o jack EARPHONES
+     * (HPOUTL/HPOUTR) — invertido em relacao ao mapeamento generico de
+     * outras placas com ES8388. Zerar DACCONTROL26/27 (LOUT2/ROUT2) deixava
+     * o EARPHONES praticamente mudo. Os quatro em 0dB para os dois caminhos
+     * funcionarem, independente de qual esteja fisicamente conectado. */
     res |= es8388_write_reg(ES8388_DACCONTROL24, 0x1E); /* 0dB */
     res |= es8388_write_reg(ES8388_DACCONTROL25, 0x1E);
-    res |= es8388_write_reg(ES8388_DACCONTROL26, 0x00);
-    res |= es8388_write_reg(ES8388_DACCONTROL27, 0x00);
+    res |= es8388_write_reg(ES8388_DACCONTROL26, 0x1E);
+    res |= es8388_write_reg(ES8388_DACCONTROL27, 0x1E);
     res |= es8388_write_reg(ES8388_DACPOWER, DAC_OUTPUT_ALL); /* liga DAC + Lout1/2 + Rout1/2 */
 
     /* ADC/microfone permanece desligado nesta fase do projeto. */
@@ -114,7 +120,12 @@ esp_err_t es8388_init(void)
         return ESP_FAIL;
     }
 
-    ESP_ERROR_CHECK(es8388_set_mute(false));
+    /* Permanece mudo (ja mudo desde o "mute durante a configuracao" acima):
+     * desmutar aqui deixava uma janela audivel entre o fim deste init e o
+     * audio_codec_set_mute(true) em main.c, bem quando o I2S esta sendo
+     * criado/habilitado (start do clock) -- causa classica de estalo no
+     * boot. Quem desmuda de verdade e o bt_audio.c quando o audio A2DP
+     * realmente comeca a tocar. */
 
     ESP_LOGI(TAG, "ES8388 inicializado (DAC/line-out, I2C SDA=%d SCL=%d)", PIN_I2C_SDA, PIN_I2C_SCL);
     return ESP_OK;
@@ -151,7 +162,7 @@ esp_err_t es8388_set_volume(int volume)
 esp_err_t es8388_get_volume(int *volume)
 {
     /* Volume não é lido de volta do hardware nesta versão — quem chama deve
-     * manter o último valor definido (ver storage.c / NVS_KEY_VOLUME). */
+     * manter o último valor definido (ver storage.c / NVS_KEY_VOLUME_USER). */
     if (volume == NULL) {
         return ESP_ERR_INVALID_ARG;
     }

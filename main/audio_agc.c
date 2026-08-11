@@ -14,20 +14,32 @@
 
 static const char *TAG = "audio_agc";
 
-#define AGC_WINDOW_SAMPLES 256
+#define AGC_WINDOW_SAMPLES 1024 /* ~23ms a 44100Hz -- 256 (~6ms) reagia a cada
+                                  * transiente/silabra isolada, causando o
+                                  * ganho "bombear" (pumping) audivel */
 #define AGC_TASK_PERIOD_MS 50 /* 20Hz */
 #define AGC_GAIN_MIN 0.2f
-#define AGC_GAIN_MAX 4.0f
+#define AGC_GAIN_MAX 2.0f /* era 4.0 (+12dB) -- limita o pico de "estouro"
+                            * quando o sinal cai muito por um instante */
+/* Abaixo disso (silencio/quase-silencio -- ex.: notificacao do celular
+ * tocando sozinha, ou o gap entre faixas) NAO ajusta o ganho: segurar em
+ * vez de tentar "compensar" silencio evita o ganho cravar no maximo e
+ * estourar quando o audio real volta. */
+#define AGC_SILENCE_RMS_LINEAR 0.003f /* ~ -50dBFS */
 
 typedef struct {
     float attack;
     float release;
 } agc_coeffs_t;
 
+/* Coeficientes reduzidos a ~40% dos originais: o AGC estava reagindo rapido
+ * demais (constante de tempo de ~1s no modo "agressivo"), fazendo o volume
+ * "subir e descer o tempo todo" de forma audivel. Nivelamento de loudness
+ * de audio de verdade usa constantes de tempo de varios segundos, nao ~1s. */
 static const agc_coeffs_t s_mode_coeffs[3] = {
-    {0.005f, 0.0005f}, /* 0 = suave */
-    {0.02f, 0.002f},   /* 1 = medio */
-    {0.05f, 0.01f},    /* 2 = agressivo */
+    {0.002f, 0.0002f}, /* 0 = suave */
+    {0.008f, 0.0008f}, /* 1 = medio */
+    {0.02f,  0.004f},  /* 2 = agressivo */
 };
 
 /* Último bloco PCM entregue por bt_audio.c, protegido por s_window_mux
@@ -86,19 +98,26 @@ static void agc_task(void *arg)
             }
             float rms = sqrtf(sum_sq / (float)len);
 
-            float target_linear = powf(10.0f, s_target_dbfs / 20.0f);
-            float gain_needed = (rms > 0.0001f) ? (target_linear / rms) : 1.0f;
+            if (rms >= AGC_SILENCE_RMS_LINEAR) {
+                float target_linear = powf(10.0f, s_target_dbfs / 20.0f);
+                float gain_needed = target_linear / rms;
 
-            const agc_coeffs_t *coeffs = &s_mode_coeffs[s_mode];
+                const agc_coeffs_t *coeffs = &s_mode_coeffs[s_mode];
+
+                portENTER_CRITICAL(&s_gain_mux);
+                float coeff = (gain_needed < s_current_gain) ? coeffs->attack : coeffs->release;
+                s_current_gain += coeff * (gain_needed - s_current_gain);
+                if (s_current_gain < AGC_GAIN_MIN) {
+                    s_current_gain = AGC_GAIN_MIN;
+                } else if (s_current_gain > AGC_GAIN_MAX) {
+                    s_current_gain = AGC_GAIN_MAX;
+                }
+                portEXIT_CRITICAL(&s_gain_mux);
+            }
+            /* Abaixo do limiar de silencio: nao mexe em s_current_gain
+             * (segura o ultimo ganho valido) -- ver AGC_SILENCE_RMS_LINEAR. */
 
             portENTER_CRITICAL(&s_gain_mux);
-            float coeff = (gain_needed < s_current_gain) ? coeffs->attack : coeffs->release;
-            s_current_gain += coeff * (gain_needed - s_current_gain);
-            if (s_current_gain < AGC_GAIN_MIN) {
-                s_current_gain = AGC_GAIN_MIN;
-            } else if (s_current_gain > AGC_GAIN_MAX) {
-                s_current_gain = AGC_GAIN_MAX;
-            }
             float gain = s_current_gain;
             portEXIT_CRITICAL(&s_gain_mux);
 
@@ -130,8 +149,10 @@ void audio_agc_init(void)
 
     /* Prioridade baixa: não deve competir com a task de I2S (que roda em
      * configMAX_PRIORITIES - 3, ver bt_audio.c). Se desligada, a task se
-     * auto-suspende no primeiro loop. */
-    xTaskCreate(agc_task, "agc_task", 2048, NULL, 3, &s_task_handle);
+     * auto-suspende no primeiro loop. Pilha 4096 (era 2048): o buffer
+     * "local" sozinho já usa 2048 bytes (AGC_WINDOW_SAMPLES=1024 *
+     * sizeof(int16_t)) — com 2048 de pilha estouraria. */
+    xTaskCreate(agc_task, "agc_task", 4096, NULL, 3, &s_task_handle);
 
     logger_log(ESP_LOG_INFO, TAG, "AGC inicializado (enabled=%d target=%ddBFS mode=%d)",
                s_enabled, s_target_dbfs, s_mode);

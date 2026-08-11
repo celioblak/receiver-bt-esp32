@@ -11,8 +11,8 @@
 
 esp_err_t audio_codec_init(void);
 
-/* Volume 0-VOLUME_STEPS (escala perceptual, ver config.h). Aplica curva
- * quadrática internamente antes de escrever no ES8388 (0-100) e persiste em
+/* Volume 0-VOLUME_STEPS (escala perceptual, ver config.h). Mapeia
+ * linearmente em dB (não quadrático) para o ES8388 (0-100) e persiste em
  * NVS (NVS_KEY_VOLUME_USER). */
 esp_err_t audio_codec_set_volume(int volume);
 int audio_codec_get_volume(void);
