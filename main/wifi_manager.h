@@ -37,6 +37,12 @@ bool wifi_manager_network_available(void);
 /* Formato "xxx.xxx.xxx.xxx", ou string vazia se não conectado. */
 void wifi_manager_get_ip_str(char *out, size_t max_len);
 
+/* IP do gateway (roteador), em network byte order (pronto pra usar em
+ * struct sockaddr_in.sin_addr.s_addr) -- usado pelo watchdog de rede (ver
+ * main.c) pra checar conectividade de verdade, não só o último evento de
+ * conexão/desconexão do driver. false se não conectado. */
+bool wifi_manager_get_gateway_ip(uint32_t *out_addr);
+
 /* Atualiza o hostname mDNS (<sanitizado>.local) a partir do nome do
  * dispositivo -- chamar sempre que device_name mudar via /api/config, sem
  * isso o hostname mDNS fica preso no valor de quando o Wi-Fi conectou.

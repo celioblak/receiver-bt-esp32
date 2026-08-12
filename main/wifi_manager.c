@@ -93,7 +93,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
-        s_ip_info.ip = event->ip_info.ip;
+        s_ip_info = event->ip_info;
         s_connected = true;
         logger_log(ESP_LOG_INFO, TAG, "Wi-Fi conectado, IP: " IPSTR, IP2STR(&event->ip_info.ip));
         start_mdns();
@@ -256,4 +256,13 @@ void wifi_manager_get_ip_str(char *out, size_t max_len)
         return;
     }
     snprintf(out, max_len, IPSTR, IP2STR(&s_ip_info.ip));
+}
+
+bool wifi_manager_get_gateway_ip(uint32_t *out_addr)
+{
+    if (out_addr == NULL || !s_connected) {
+        return false;
+    }
+    *out_addr = s_ip_info.gw.addr;
+    return true;
 }
