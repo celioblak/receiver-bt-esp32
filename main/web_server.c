@@ -254,6 +254,33 @@ static esp_err_t api_system_restart_post(httpd_req_t *req)
     return ESP_OK; /* nunca chega aqui */
 }
 
+static esp_err_t api_system_beep_post(httpd_req_t *req)
+{
+    /* Confirmado na pratica (2x): disparar o bipe enquanto o Slimproto (ou
+     * BT) esta tocando de verdade trava o dispositivo -- ainda nao temos
+     * certeza total do mecanismo exato (mutex do I2S deveria bastar, mas o
+     * travamento se repetiu mesmo depois dele), entao a defesa mais segura
+     * agora e simplesmente recusar o bipe nesse cenario em vez de arriscar
+     * outro travamento. O bipe e uma ferramenta de diagnostico de hardware,
+     * nao precisa funcionar durante playback real. */
+    bt_audio_status_t bt;
+    bt_audio_get_status(&bt);
+    slimproto_status_t slim;
+    slimproto_get_status(&slim);
+    if (bt.connected || slim.playing) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"audio ja em uso (BT ou Slimproto tocando)\"}");
+        return ESP_OK;
+    }
+
+    logger_log(ESP_LOG_INFO, TAG, "Bipe de teste solicitado via API");
+    audio_codec_play_test_tone(); /* bloqueia ~300ms -- inofensivo, so atrasa a resposta HTTP um pouco */
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 static esp_err_t api_volume_post(httpd_req_t *req)
 {
     char buf[64];
@@ -533,6 +560,11 @@ void web_server_start(void)
         {.uri = "/api/pair", .method = HTTP_POST, .handler = api_pair_post},
         {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = api_wifi_scan_get},
         {.uri = "/api/system/restart", .method = HTTP_POST, .handler = api_system_restart_post},
+        {.uri = "/api/system/beep", .method = HTTP_POST, .handler = api_system_beep_post},
+        /* GET tambem, de proposito -- diagnostico pra acionar direto da
+         * barra de enderecos do navegador (util remotamente, sem precisar
+         * de curl/Postman a mao). */
+        {.uri = "/api/system/beep", .method = HTTP_GET, .handler = api_system_beep_post},
         {.uri = "/ota", .method = HTTP_POST, .handler = ota_manager_upload_handler},
         {.uri = "/*", .method = HTTP_GET, .handler = static_file_get},
     };

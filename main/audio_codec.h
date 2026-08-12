@@ -31,3 +31,14 @@ esp_err_t audio_codec_write(const uint8_t *data, size_t len, size_t *bytes_writt
 /* A2DP pode informar sample rate diferente de faixa pra faixa (ex.: 44100 ou
  * 48000 Hz). Reconfigura o clock do I2S sem reinicializar o codec. */
 esp_err_t audio_codec_reconfigure_clock(uint32_t sample_rate_hz);
+
+/* Toca um tom curto (440Hz, ~0.6s) direto no codec, ligando o rele do
+ * amplificador sozinho -- nao depende de Bluetooth, WiFi ou nenhum
+ * protocolo de rede. Serve pra confirmar que o caminho fisico inteiro
+ * (codec -> rele -> amplificador -> caixa) emite som de verdade,
+ * independente de qualquer fonte de audio estar alcançando o dispositivo.
+ * Disponivel sob demanda via /api/system/beep (ver web_server.c) -- NAO
+ * chamado automaticamente no boot (ligar rele + I2S tao cedo, antes do
+ * WiFi/BT estabilizarem, e suspeito de causar falha de boot standalone sem
+ * USB/serial, ver main.c). Bloqueia pela duracao do tom. */
+void audio_codec_play_test_tone(void);
