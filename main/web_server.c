@@ -11,6 +11,7 @@
 #include "ota_manager.h"
 #include "pairing.h"
 #include "relay_control.h"
+#include "slimproto.h"
 #include "storage.h"
 #include "wifi_manager.h"
 
@@ -70,6 +71,9 @@ static esp_err_t api_status_get(httpd_req_t *req)
     bt_audio_status_t bt;
     bt_audio_get_status(&bt);
 
+    slimproto_status_t slim;
+    slimproto_get_status(&slim);
+
     char device_name[32];
     if (storage_get_str(NVS_KEY_DEVICE_NAME, device_name, sizeof(device_name)) != ESP_OK) {
         strlcpy(device_name, FW_DEVICE_NAME_DEFAULT, sizeof(device_name));
@@ -124,6 +128,9 @@ static esp_err_t api_status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
     cJSON_AddStringToObject(root, "pending_pin_mac", bt.pending_pin_mac);
     cJSON_AddStringToObject(root, "pending_pin_code", bt.pending_pin_code);
+    cJSON_AddBoolToObject(root, "slim_enabled", slim.enabled);
+    cJSON_AddBoolToObject(root, "slim_connected", slim.connected);
+    cJSON_AddBoolToObject(root, "slim_playing", slim.playing);
 
     return send_json(req, root);
 }
@@ -134,6 +141,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
     char wifi_ssid[33];
     char mqtt_host[64];
     char mqtt_user[32];
+    char slim_host[64];
     int32_t relay_timeout = DEFAULT_RELAY_TIMEOUT_S;
     int32_t mqtt_port = 1883;
 
@@ -149,6 +157,9 @@ static esp_err_t api_config_get(httpd_req_t *req)
     if (storage_get_str(NVS_KEY_MQTT_USER, mqtt_user, sizeof(mqtt_user)) != ESP_OK) {
         mqtt_user[0] = '\0';
     }
+    if (storage_get_str(NVS_KEY_SLIM_HOST, slim_host, sizeof(slim_host)) != ESP_OK) {
+        slim_host[0] = '\0';
+    }
     storage_get_i32(NVS_KEY_RELAY_TIMEOUT, &relay_timeout, DEFAULT_RELAY_TIMEOUT_S);
     storage_get_i32(NVS_KEY_MQTT_PORT, &mqtt_port, 1883);
 
@@ -160,6 +171,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "mqtt_host", mqtt_host);
     cJSON_AddNumberToObject(root, "mqtt_port", mqtt_port);
     cJSON_AddStringToObject(root, "mqtt_user", mqtt_user);
+    cJSON_AddStringToObject(root, "slim_host", slim_host);
     cJSON_AddBoolToObject(root, "bt_discoverable", bt_audio_get_discoverable());
     cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
 
@@ -179,6 +191,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     if ((item = cJSON_GetObjectItem(root, "device_name")) && cJSON_IsString(item)) {
         storage_set_str(NVS_KEY_DEVICE_NAME, item->valuestring);
+        wifi_manager_set_mdns_hostname(item->valuestring);
     }
     if ((item = cJSON_GetObjectItem(root, "wifi_ssid")) && cJSON_IsString(item)) {
         storage_set_str(NVS_KEY_WIFI_SSID, item->valuestring);
@@ -205,6 +218,10 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
     if ((item = cJSON_GetObjectItem(root, "mqtt_pass")) && cJSON_IsString(item)) {
         storage_set_str(NVS_KEY_MQTT_PASS, item->valuestring);
+        reboot_needed = true;
+    }
+    if ((item = cJSON_GetObjectItem(root, "slim_host")) && cJSON_IsString(item)) {
+        storage_set_str(NVS_KEY_SLIM_HOST, item->valuestring);
         reboot_needed = true;
     }
     if ((item = cJSON_GetObjectItem(root, "bt_discoverable")) && cJSON_IsBool(item)) {

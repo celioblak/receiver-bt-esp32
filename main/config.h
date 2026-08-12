@@ -55,6 +55,7 @@
 #define NVS_KEY_STAT_BT_CONNS   "stat_btconn"
 #define NVS_KEY_BT_DISCOVERABLE "bt_discover"
 #define NVS_KEY_BT_REQUIRE_PIN  "bt_req_pin"
+#define NVS_KEY_SLIM_HOST       "slim_host"
 
 /* -------------------------------------------------------------------------
  * Valores padrão
@@ -88,6 +89,15 @@
 #define DEFAULT_AGC_ENABLED     0
 #define DEFAULT_AGC_TARGET_DBFS (-18)  /* -30 a -6 */
 #define DEFAULT_AGC_MODE        1      /* 0=suave 1=medio 2=agressivo */
+
+/* -------------------------------------------------------------------------
+ * Slimproto (protocolo do Squeezebox/LMS) — ver slimproto.c
+ * ------------------------------------------------------------------------- */
+
+/* Porta fixa do protocolo (nao configuravel, faz parte do padrao Slimproto/
+ * LMS -- e a mesma porta que o Music Assistant usa no seu servidor LMS-
+ * compativel embutido). So o host/IP do servidor e configuravel. */
+#define SLIMPROTO_SERVER_PORT 3483
 
 /* -------------------------------------------------------------------------
  * Logger (ring buffer em memória)

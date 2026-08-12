@@ -21,6 +21,10 @@
             <span class="label">Dispositivo</span>
             <span id="bt-device-name">—</span>
         </div>
+        <div class="row" id="slim-row" style="display:none">
+            <span class="label">Music Assistant / LMS</span>
+            <span class="badge off" id="slim-badge">desconectado</span>
+        </div>
         <div class="row">
             <span class="label">Amplificador</span>
             <span class="badge off" id="amp-badge">desligado</span>
@@ -85,6 +89,16 @@ async function refresh() {
             deviceRow.style.display = "none";
             disconnectBtn.style.display = "none";
             mediaControls.style.display = "none";
+        }
+
+        const slimRow = document.getElementById("slim-row");
+        if (s.slim_enabled) {
+            slimRow.style.display = "flex";
+            const slimBadge = document.getElementById("slim-badge");
+            slimBadge.textContent = s.slim_playing ? "tocando" : (s.slim_connected ? "conectado" : "desconectado");
+            slimBadge.className = "badge " + (s.slim_playing || s.slim_connected ? "on" : "off");
+        } else {
+            slimRow.style.display = "none";
         }
 
         const ampBadge = document.getElementById("amp-badge");

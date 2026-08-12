@@ -194,6 +194,15 @@ static void bt_i2s_task_start(void)
     if (s_ringbuf_i2s == NULL || s_i2s_write_sem == NULL) {
         return; /* bt_audio_prealloc_ring_buffer() falhou no boot */
     }
+    if (s_i2s_task_handle != NULL) {
+        /* Ja tem uma rodando (ex.: evento de desconexao anterior nao
+         * processado a tempo numa troca rapida de dispositivo) -- criar
+         * outra faria duas tasks brigarem pelo mesmo ring buffer/semaforo.
+         * bt_i2s_task_stop() sempre roda antes de uma nova conexao ser
+         * aceita, entao isso so deveria disparar em cenario de corrida. */
+        ESP_LOGW(TAG, "task de I2S ja estava rodando, nao criando outra");
+        return;
+    }
     s_ringbuf_mode = RINGBUF_MODE_PREFETCHING;
     if (xTaskCreate(bt_i2s_task_handler, "bt_i2s_task", 2560, NULL, configMAX_PRIORITIES - 3, &s_i2s_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "falha ao criar task de I2S (heap insuficiente) — sem audio nesta sessao");
@@ -351,7 +360,26 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
 
             xSemaphoreTake(s_status_mutex, portMAX_DELAY);
             s_status.playing = playing;
+            bool was_connected = s_status.connected;
+            if (playing && !was_connected) {
+                /* Rede de seguranca: se o audio esta tocando de verdade, o
+                 * dispositivo esta obviamente conectado, mesmo que o
+                 * ESP_A2D_CONNECTION_STATE_EVT correspondente tenha sido
+                 * perdido/atrasado (fila cheia numa troca rapida de
+                 * dispositivo, por exemplo) -- sem isso a interface web
+                 * ficava mostrando "desconectado" com audio realmente
+                 * tocando, e a task de I2S nunca chegava a iniciar. */
+                uint8_t *bda = a2d->audio_stat.remote_bda;
+                s_status.connected = true;
+                snprintf(s_status.remote_mac, sizeof(s_status.remote_mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                         bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+            }
             xSemaphoreGive(s_status_mutex);
+
+            if (playing && !was_connected) {
+                logger_log(ESP_LOG_WARN, TAG, "Estado de conexao corrigido (evento de conexao perdido)");
+                bt_i2s_task_start();
+            }
 
             /* Mudo fora do estado "tocando": evita que ruido digital/RF
              * (WiFi, handshake do proprio Bluetooth) vaze pelo fone entre
@@ -609,6 +637,9 @@ void bt_audio_forget_device(const uint8_t mac[6])
      * inofensivo -- mais simples que checar s_status.remote_mac antes. */
     esp_a2d_sink_disconnect((uint8_t *)mac);
     esp_bt_gap_remove_bond_device((uint8_t *)mac);
+    /* Acao deliberada do usuario -- nao faz sentido esperar o timeout
+     * normal do rele (que existe pra nao "piscar" entre faixas). */
+    relay_control_force_off();
 }
 
 void bt_audio_disconnect_device(const uint8_t mac[6])
@@ -619,6 +650,7 @@ void bt_audio_disconnect_device(const uint8_t mac[6])
     logger_log(ESP_LOG_INFO, TAG, "Desconectando [%02x:%02x:%02x:%02x:%02x:%02x]",
                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     esp_a2d_sink_disconnect((uint8_t *)mac);
+    relay_control_force_off();
 }
 
 esp_err_t bt_audio_media_control(const char *cmd)
@@ -768,7 +800,12 @@ void bt_audio_init(void)
     };
     esp_timer_create(&metadata_timer_args, &s_metadata_delay_timer);
 
-    s_bt_app_task_queue = xQueueCreate(10, sizeof(bt_app_msg_t));
+    /* 20 (era 10): rajadas de eventos numa troca rapida de dispositivo
+     * (desconexao + pareamento + conexao + AVRCP + audio config, tudo em
+     * poucos segundos) podem encher a fila; bt_app_work_dispatch() so
+     * espera 10ms antes de descartar silenciosamente (so loga erro) se
+     * a fila estiver cheia -- mais folga aqui custa bem pouco heap. */
+    s_bt_app_task_queue = xQueueCreate(20, sizeof(bt_app_msg_t));
     xTaskCreate(bt_app_task_handler, "bt_app_task", 3072, NULL, 10, &s_bt_app_task_handle);
 
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
@@ -776,6 +813,15 @@ void bt_audio_init(void)
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
+
+    /* Potencia de TX do BR/EDR no maximo (+9dBm, era +3dBm o padrao) --
+     * tentativa de reduzir perda de pacote (BT_APPL: Sequence numbers
+     * error) mesmo a curta distancia do celular. So ajuda de forma
+     * indireta (ACKs/controle de fluxo mais fortes), a causa mais provavel
+     * continua sendo disputa WiFi/BT pelo radio unico do ESP32 (ver
+     * README). Precisa ser chamado aqui: depois do controller habilitado,
+     * antes de qualquer transmissao (inquiry, pareamento, conexao). */
+    esp_bredr_tx_power_set(ESP_PWR_LVL_N0, ESP_PWR_LVL_P9);
 
     esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bluedroid_init_with_cfg(&bluedroid_cfg));

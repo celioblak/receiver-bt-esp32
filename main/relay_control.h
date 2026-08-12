@@ -13,4 +13,11 @@ void relay_control_init(void);
 /* Chamar a cada mudança de estado do A2DP (tocando/pausado/desconectado). */
 void relay_control_notify_playing(bool playing);
 
+/* Desliga AGORA, sem esperar o timeout -- diferente de
+ * relay_control_notify_playing(false), que só arma o timer (debounce pra
+ * pausas curtas entre faixas). Usar só em ações explícitas e deliberadas
+ * do usuário (ex.: botão "Desconectar"/"Esquecer" na interface web), onde
+ * esperar o timeout não faz sentido. */
+void relay_control_force_off(void);
+
 bool relay_control_is_on(void);

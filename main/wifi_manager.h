@@ -36,3 +36,9 @@ bool wifi_manager_network_available(void);
 
 /* Formato "xxx.xxx.xxx.xxx", ou string vazia se não conectado. */
 void wifi_manager_get_ip_str(char *out, size_t max_len);
+
+/* Atualiza o hostname mDNS (<sanitizado>.local) a partir do nome do
+ * dispositivo -- chamar sempre que device_name mudar via /api/config, sem
+ * isso o hostname mDNS fica preso no valor de quando o Wi-Fi conectou.
+ * Sem efeito se o mDNS ainda não tiver iniciado (aplica no próximo boot). */
+void wifi_manager_set_mdns_hostname(const char *device_name);

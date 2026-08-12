@@ -54,6 +54,10 @@
             <label for="mqtt_pass">Senha MQTT</label>
             <input type="password" id="mqtt_pass" maxlength="63" placeholder="deixe em branco para manter">
 
+            <label for="slim_host">Servidor Music Assistant / LMS (Slimproto) — endereço IP</label>
+            <input type="text" id="slim_host" maxlength="63" placeholder="deixe em branco para desativar">
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Conecta direto no servidor (porta 3483), sem depender de descoberta automática. Use o IP do Music Assistant.</div>
+
             <button type="submit">Salvar</button>
             <div id="save-msg"></div>
         </form>
@@ -159,6 +163,7 @@ async function load() {
     document.getElementById("mqtt_host").value = c.mqtt_host;
     document.getElementById("mqtt_port").value = c.mqtt_port;
     document.getElementById("mqtt_user").value = c.mqtt_user;
+    document.getElementById("slim_host").value = c.slim_host;
     document.getElementById("bt_discoverable").checked = c.bt_discoverable;
     document.getElementById("bt_require_pin").checked = c.bt_require_pin;
 }
@@ -221,6 +226,7 @@ document.getElementById("config-form").addEventListener("submit", async (e) => {
         mqtt_host: document.getElementById("mqtt_host").value,
         mqtt_port: parseInt(document.getElementById("mqtt_port").value, 10) || 1883,
         mqtt_user: document.getElementById("mqtt_user").value,
+        slim_host: document.getElementById("slim_host").value,
         bt_discoverable: document.getElementById("bt_discoverable").checked,
         bt_require_pin: document.getElementById("bt_require_pin").checked,
     };

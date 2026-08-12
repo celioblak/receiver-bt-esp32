@@ -74,6 +74,18 @@ void relay_control_notify_playing(bool playing)
     xSemaphoreGive(s_mutex);
 }
 
+void relay_control_force_off(void)
+{
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    esp_timer_stop(s_off_timer); /* ESP_ERR_INVALID_STATE se já parado — inofensivo */
+    if (s_relay_on) {
+        relay_set(false);
+    }
+    xSemaphoreGive(s_mutex);
+}
+
 bool relay_control_is_on(void)
 {
     return s_relay_on;

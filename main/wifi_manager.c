@@ -24,15 +24,62 @@ static bool s_connected = false;
 static bool s_ap_mode = false;
 static esp_netif_ip_info_t s_ip_info;
 
+/* Hostname mDNS precisa ser um nome DNS valido (so letras/digitos/hifen) --
+ * o nome do dispositivo (Bluetooth) aceita qualquer coisa (espacos, acentos,
+ * emoji), entao sanitiza em vez de usar direto. */
+static void sanitize_hostname(const char *device_name, char *out, size_t out_size)
+{
+    size_t j = 0;
+    for (size_t i = 0; device_name[i] != '\0' && j < out_size - 1; i++) {
+        char c = device_name[i];
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            out[j++] = c;
+        } else if (c >= 'A' && c <= 'Z') {
+            out[j++] = (char)(c - 'A' + 'a');
+        } else if (j > 0 && out[j - 1] != '-') {
+            out[j++] = '-';
+        }
+    }
+    while (j > 0 && out[j - 1] == '-') {
+        j--; /* sem hifen sobrando no final (ex.: nome so com espacos/acentos) */
+    }
+    out[j] = '\0';
+    if (j == 0) {
+        strlcpy(out, MDNS_HOSTNAME, out_size);
+    }
+}
+
+static bool s_mdns_started = false;
+
+void wifi_manager_set_mdns_hostname(const char *device_name)
+{
+    if (!s_mdns_started) {
+        return; /* aplicado quando o mDNS realmente iniciar (ver start_mdns) */
+    }
+    char hostname[40];
+    sanitize_hostname(device_name, hostname, sizeof(hostname));
+    mdns_hostname_set(hostname);
+    logger_log(ESP_LOG_INFO, TAG, "mDNS atualizado: %s.local", hostname);
+}
+
 static void start_mdns(void)
 {
     if (mdns_init() != ESP_OK) {
         ESP_LOGE(TAG, "falha ao iniciar mDNS");
         return;
     }
-    mdns_hostname_set(MDNS_HOSTNAME);
+    s_mdns_started = true;
+
+    char device_name[32];
+    if (storage_get_str(NVS_KEY_DEVICE_NAME, device_name, sizeof(device_name)) != ESP_OK) {
+        strlcpy(device_name, FW_DEVICE_NAME_DEFAULT, sizeof(device_name));
+    }
+    char hostname[40];
+    sanitize_hostname(device_name, hostname, sizeof(hostname));
+
+    mdns_hostname_set(hostname);
     mdns_instance_name_set("Receiver Bluetooth DIY");
-    logger_log(ESP_LOG_INFO, TAG, "mDNS ativo: %s.local", MDNS_HOSTNAME);
+    logger_log(ESP_LOG_INFO, TAG, "mDNS ativo: %s.local", hostname);
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)

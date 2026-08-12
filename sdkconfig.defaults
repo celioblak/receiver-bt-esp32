@@ -78,3 +78,13 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # --- SPIFFS ---
 CONFIG_SPIFFS_USE_MAGIC_LENGTH=y
+
+# --- LWIP ---
+# Padrao e 10 sockets pro sistema INTEIRO. Com dois servidores HTTP
+# completos rodando ao mesmo tempo (web_server.c na porta 80 + o
+# dlna_renderer.c na porta 8200) mais mDNS, MQTT e o socket UDP do SSDP,
+# 10 estoura fácil (visto em log: "httpd_accept_conn: error in accept
+# (23)" = ENFILE, sem socket livre pra aceitar conexao nova) assim que
+# algum control point DLNA abre varias conexoes seguidas buscando os XMLs
+# de descricao/SCPD.
+CONFIG_LWIP_MAX_SOCKETS=16
