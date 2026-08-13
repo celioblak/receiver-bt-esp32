@@ -963,6 +963,32 @@ static void handle_setd(int sock, const uint8_t *payload, size_t len)
     send_message(sock, "setd", resp, 1 + name_len + 1);
 }
 
+/* Ajuste de volume vindo do servidor (ex.: controle deslizante do Music
+ * Assistant, ou o botao de mudo dele) -- confirmado: sem tratar esse
+ * opcode, o volume/mudo do MA nao tinha NENHUM efeito no dispositivo,
+ * porque handle_ctrl_message() descartava "audg" junto com todo opcode que
+ * nao fosse strm/setd. Payload (18 bytes, ver squeezelite/slimproto real):
+ * old_gainL(4) old_gainR(4) adjust(1) preamp(1) gainL(4) gainR(4), gains em
+ * ponto fixo 16.16 (65536 = 0dB/ganho unitario). Usamos so o canal
+ * esquerdo -- nosso volume e um unico valor pros dois canais. */
+static void handle_audg(const uint8_t *payload, size_t len)
+{
+    if (len < 18) {
+        return;
+    }
+    uint32_t gain_l = get_u32(payload + 10);
+    float linear = (float)gain_l / 65536.0f;
+    if (linear > 1.0f) {
+        linear = 1.0f;
+    } else if (linear < 0.0f) {
+        linear = 0.0f;
+    }
+    int volume = (int)(linear * VOLUME_STEPS + 0.5f);
+    audio_codec_set_volume(volume);
+    logger_log(ESP_LOG_INFO, TAG, "Slimproto: audg recebido (ganho=%.3f) -> volume %d/%d",
+               linear, volume, VOLUME_STEPS);
+}
+
 /* -------------------------------------------------------------------------
  * Task de controle: conecta, manda HELO, processa comandos e manda
  * heartbeat (STAT/STMt) periodico. Reconecta sozinha se cair.
@@ -1088,10 +1114,14 @@ static void slimproto_control_task(void *arg)
                     handle_strm(sock, msg + 4, plen);
                 } else if (memcmp(msg, "setd", 4) == 0) {
                     handle_setd(sock, msg + 4, plen);
+                } else if (memcmp(msg, "audg", 4) == 0) {
+                    handle_audg(msg + 4, plen);
                 }
-                /* qualquer outro opcode (aude/audg/vers/...) so e descartado
-                 * -- ja consumimos exatamente `total_len` bytes acima, entao
-                 * o framing da conexao continua sincronizado. */
+                /* qualquer outro opcode (aude/vers/... -- aude controla
+                 * canais de saida individuais de hardware multi-saida, nao
+                 * se aplica aqui) so e descartado -- ja consumimos
+                 * exatamente `total_len` bytes acima, entao o framing da
+                 * conexao continua sincronizado. */
             }
 
             int64_t now = esp_timer_get_time();

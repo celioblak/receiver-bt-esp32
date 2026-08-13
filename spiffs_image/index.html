@@ -10,6 +10,11 @@
 <main>
     <h1 id="device-name">Receiver Bluetooth DIY</h1>
 
+    <div class="warning-banner" id="ma-token-banner" style="display:none">
+        Token do Music Assistant inválido ou expirado — título/artista/álbum não aparecem para faixas
+        tocadas por lá. Gere um novo token e atualize em <a href="/settings.html">Configurações</a>.
+    </div>
+
     <div class="card">
         <div class="track" id="track">—</div>
         <div class="track-sub" id="artist-album">—</div>
@@ -84,12 +89,14 @@ async function refresh() {
             deviceRow.style.display = "flex";
             disconnectBtn.style.display = "block";
             disconnectBtn.dataset.mac = s.bt_remote_mac;
-            mediaControls.style.display = "flex";
         } else {
             deviceRow.style.display = "none";
             disconnectBtn.style.display = "none";
-            mediaControls.style.display = "none";
         }
+        /* Controles funcionam tanto por AVRCP (BT) quanto pela API do LMS
+         * (Music Assistant, ver lms_cli.h) -- mostra sempre que alguma das
+         * duas fontes estiver conectada. */
+        mediaControls.style.display = (s.bt_connected || s.slim_connected) ? "flex" : "none";
 
         const slimRow = document.getElementById("slim-row");
         if (s.slim_enabled) {
@@ -100,6 +107,9 @@ async function refresh() {
         } else {
             slimRow.style.display = "none";
         }
+
+        document.getElementById("ma-token-banner").style.display =
+            (s.ma_configured && !s.ma_token_valid) ? "block" : "none";
 
         const ampBadge = document.getElementById("amp-badge");
         ampBadge.textContent = s.amplifier ? "ligado" : "desligado";

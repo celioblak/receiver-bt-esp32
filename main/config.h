@@ -100,6 +100,20 @@
 #define SLIMPROTO_SERVER_PORT 3483
 
 /* -------------------------------------------------------------------------
+ * Metadados via API propria do Music Assistant (WebSocket) -- ver lms_metadata.c
+ * ------------------------------------------------------------------------- */
+
+/* Titulo/artista/album NAO vem pelo protocolo Slimproto/LMS classico (porta
+ * 9090) -- testado ao vivo, o Music Assistant nao preenche playlist_tracks
+ * por ali. So vem pela API WebSocket propria do MA (porta 8095, path /ws),
+ * que exige autenticacao via token JWT de longa duracao (gerado no perfil
+ * do usuario no MA -- nao ha token fixo/estatico configuravel do lado do
+ * servidor). Guardado aqui, nunca devolvido por GET /api/config (mesmo
+ * tratamento de wifi_pass/mqtt_pass). Feature fica desativada em silencio
+ * se vazio, mesmo padrao do MQTT sem broker configurado. */
+#define NVS_KEY_MA_TOKEN "ma_token"
+
+/* -------------------------------------------------------------------------
  * Logger (ring buffer em memória)
  * ------------------------------------------------------------------------- */
 

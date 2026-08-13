@@ -58,6 +58,10 @@
             <input type="text" id="slim_host" maxlength="63" placeholder="deixe em branco para desativar">
             <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Conecta direto no servidor (porta 3483), sem depender de descoberta automática. Use o IP do Music Assistant.</div>
 
+            <label for="ma_token">Token da API do Music Assistant (título/artista/álbum)</label>
+            <input type="password" id="ma_token" maxlength="400" placeholder="deixe em branco para manter">
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem" id="ma-token-warning">Gere em Music Assistant → seu usuário → tokens de API (duração longa). Sem isso, título/artista/álbum não aparecem para faixas tocadas via Music Assistant — só o controle (play/pause/próxima) continua funcionando. O token expira depois de um tempo (geralmente 1 ano); se parar de atualizar, gere outro e cole aqui de novo.</div>
+
             <button type="submit">Salvar</button>
             <div id="save-msg"></div>
         </form>
@@ -209,6 +213,17 @@ async function refreshVolumeAgc() {
         document.getElementById("agc-mode").value = s.agc_mode;
         document.getElementById("agc-gain").textContent = s.agc_gain.toFixed(2) + "x";
         setAgcDetailsVisible(s.agc_enabled);
+
+        const tokenWarning = document.getElementById("ma-token-warning");
+        if (s.ma_configured && !s.ma_token_valid) {
+            tokenWarning.textContent = "Token rejeitado pelo Music Assistant (inválido ou expirado) — gere outro e cole aqui de novo.";
+            tokenWarning.classList.add("warning-banner");
+            tokenWarning.style.margin = "0 0 0.6rem";
+        } else {
+            tokenWarning.textContent = "Gere em Music Assistant → seu usuário → tokens de API (duração longa). Sem isso, título/artista/álbum não aparecem para faixas tocadas via Music Assistant — só o controle (play/pause/próxima) continua funcionando. O token expira depois de um tempo (geralmente 1 ano); se parar de atualizar, gere outro e cole aqui de novo.";
+            tokenWarning.classList.remove("warning-banner");
+            tokenWarning.style.margin = "-0.4rem 0 0.6rem";
+        }
     } catch (e) {
         console.error(e);
     }
@@ -234,6 +249,8 @@ document.getElementById("config-form").addEventListener("submit", async (e) => {
     if (wifiPass) body.wifi_pass = wifiPass;
     const mqttPass = document.getElementById("mqtt_pass").value;
     if (mqttPass) body.mqtt_pass = mqttPass;
+    const maToken = document.getElementById("ma_token").value;
+    if (maToken) body.ma_token = maToken;
 
     const resp = await apiPost("/api/config", body);
     document.getElementById("save-msg").textContent = resp.message || "Salvo.";

@@ -67,6 +67,55 @@ Até isso ser feito, **depois de qualquer atualização/recriação do container
 reaplicar o patch acima antes de testar o Slimproto** — se o áudio parar de chegar sem motivo
 aparente, este é o primeiro lugar a checar.
 
+## Status ("o que está tocando") e controle (play/pause/próxima/anterior)
+
+O protocolo Slimproto em si só transporta áudio — não título/artista/álbum nem volume/mute
+vindos do MA. Isso é resolvido por três peças separadas:
+
+- **Volume/mute do MA (`main/slimproto.c`, `handle_audg`)**: o servidor manda isso pelo opcode
+  `audg` na própria conexão Slimproto (payload de 18 bytes, ganho em ponto fixo 16.16 — 65536 =
+  0dB/ganho unitário). Até essa correção, `audg` era descartado junto com qualquer opcode que não
+  fosse `strm`/`setd` — por isso mudar o volume ou mutar pelo Music Assistant não tinha nenhum
+  efeito no dispositivo. Agora `handle_audg()` converte o ganho pra escala 0-`VOLUME_STEPS` e
+  chama `audio_codec_set_volume()`, a mesma função usada pelo volume manual.
+- **Controle (play/pause/próxima/anterior) — `main/lms_cli.c`**: usa o protocolo clássico de
+  controle do LMS (porta 9090, texto simples), que o Music Assistant também implementa por
+  compatibilidade. Cada comando abre uma conexão TCP curta, manda uma linha
+  (`<player_id> play`/`pause 1`/`playlist index +1`/etc.) e fecha — sem estado persistente. O
+  `player_id` é o MAC WiFi STA formatado com `:` como `%3A` (confirmado ao vivo). Roteado por
+  `POST /api/media` (mesmo endpoint que já existia pro Bluetooth/AVRCP): usa BT se conectado,
+  senão Slimproto/MA se conectado.
+- **Título/artista/álbum — `main/lms_metadata.c`**: **não** vem pela porta 9090 (testado ao vivo:
+  `player_queues` sempre reporta 0 faixas por ali, mesmo tocando) — só pela API própria do MA
+  (WebSocket, porta 8095, path `/ws`), consultando `player_queues/get` com `queue_id` = `"up" +
+  MAC sem ':'` (o ID que o "Universal Player" do MA usa internamente pro nosso dispositivo,
+  confirmado ao vivo). Os campos relevantes ficam em
+  `result.current_item.media_item.{name,artists[0].name,album.name}`. Consultado por polling a
+  cada 3s (não assina eventos push — mais simples, suficiente pra exibição de status).
+
+### Token de API do Music Assistant (obrigatório só pra metadados, não pro controle)
+
+A API WebSocket exige autenticação. Esta versão do MA (2.9.x) **não tem um token de API fixo
+gerável nas configurações** — só login usuário/senha (que devolve um JWT de sessão) ou, no perfil
+do usuário, a opção de gerar um **token de longa duração** (JWT com `is_long_lived: true`, válido
+por ~1 ano a partir da geração). É esse token de longa duração que o firmware usa — cole em
+**Configurações → Token da API do Music Assistant**. Guardado em NVS (`NVS_KEY_MA_TOKEN`), nunca
+devolvido por `GET /api/config` (mesmo tratamento das senhas de WiFi/MQTT).
+
+**Sem token configurado**: o recurso fica desativado em silêncio — controle continua funcionando
+normalmente (não depende do token), só título/artista/álbum não aparecem.
+
+**Token expirado/inválido (depois de ~1 ano, ou se for revogado no MA)**: diferente de "não
+configurado", isso é tratado como um problema visível de propósito (senão vira um mistério — o
+metadado simplesmente some e ninguém entende por quê):
+- Banner de aviso na tela inicial e em Configurações (`ma_configured && !ma_token_valid` em
+  `GET /api/status`).
+- Entidade `binary_sensor` (`device_class: problem`) "Receiver BT Token Music Assistant" na Home
+  Assistant, via MQTT Discovery — acende quando o token foi rejeitado.
+
+Quando isso acontecer: gerar um novo token de longa duração no perfil do usuário do MA e colar de
+novo em Configurações.
+
 ## Diagnóstico sem precisar de serial
 
 O firmware expõe `GET /api/logs` (últimas 100 entradas do log interno) — inclui, para cada troca

@@ -7,6 +7,7 @@
     --accent: #4f8cff;
     --ok: #3ecf8e;
     --off: #6a6f78;
+    --warn: #e8a13e;
 }
 
 * {
@@ -66,6 +67,16 @@ h1 {
 .badge.off {
     background: rgba(106, 111, 120, 0.15);
     color: var(--off);
+}
+
+.warning-banner {
+    background: rgba(232, 161, 62, 0.12);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 8px;
+    padding: 0.6rem 0.85rem;
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
 }
 
 .track {

@@ -7,8 +7,10 @@
 #include "audio_codec.h"
 #include "bt_audio.h"
 #include "config.h"
+#include "lms_metadata.h"
 #include "logger.h"
 #include "relay_control.h"
+#include "slimproto.h"
 #include "storage.h"
 #include "wifi_manager.h"
 
@@ -134,9 +136,38 @@ static void publish_button_discovery(const char *object_id, const char *name, co
     cJSON_Delete(root);
 }
 
+static void publish_binary_sensor_discovery(const char *object_id, const char *name,
+                                             const char *device_class, const char *value_template)
+{
+    char config_topic[80];
+    snprintf(config_topic, sizeof(config_topic), "homeassistant/binary_sensor/%s/config", object_id);
+
+    cJSON *root = cJSON_CreateObject();
+    add_common_device_fields(root, object_id, name);
+    cJSON_AddStringToObject(root, "device_class", device_class);
+    cJSON_AddStringToObject(root, "state_topic", TOPIC_STATE);
+    cJSON_AddStringToObject(root, "value_template", value_template);
+    cJSON_AddStringToObject(root, "payload_on", "1");
+    cJSON_AddStringToObject(root, "payload_off", "0");
+
+    char *payload = cJSON_PrintUnformatted(root);
+    esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
+    free(payload);
+    cJSON_Delete(root);
+}
+
 static void publish_all_discovery_configs(void)
 {
     publish_sensor_discovery();
+
+    /* "problem" fica visivel na HA como badge de alerta no card do
+     * dispositivo -- token JWT do Music Assistant expira (normalmente 1
+     * ano) e, sem isso, titulo/artista/album somem em silencio sem
+     * nenhum aviso obvio de por que (ver lms_metadata.h). So acende se um
+     * token FOI configurado e foi rejeitado -- "nao configurado" nao e
+     * problema, e so um recurso opcional desligado. */
+    publish_binary_sensor_discovery("receiver_bt_ma_token", "Receiver BT Token Music Assistant",
+                                     "problem", "{{ '1' if value_json.ma_token_problem else '0' }}");
 
     publish_number_discovery("receiver_bt_volume", "Receiver BT Volume", TOPIC_CMD_VOLUME,
                               "{{ value_json.volume }}", 0, VOLUME_STEPS);
@@ -263,6 +294,9 @@ void mqtt_ha_publish_state(void)
     bt_audio_status_t bt;
     bt_audio_get_status(&bt);
 
+    slimproto_status_t slim;
+    slimproto_get_status(&slim);
+
     char device_name[32];
     if (storage_get_str(NVS_KEY_DEVICE_NAME, device_name, sizeof(device_name)) != ESP_OK) {
         strlcpy(device_name, FW_DEVICE_NAME_DEFAULT, sizeof(device_name));
@@ -271,15 +305,37 @@ void mqtt_ha_publish_state(void)
     char ip[16];
     wifi_manager_get_ip_str(ip, sizeof(ip));
 
-    const char *status_str = bt.connected ? (bt.playing ? "playing" : "connected") : "disconnected";
+    /* BT tem prioridade (mesma regra do audio em si) -- so usa
+     * titulo/artista/album do Music Assistant (via lms_metadata, API
+     * propria do MA) quando nao ha celular conectado. */
+    const char *track = bt.title;
+    const char *artist = bt.artist;
+    const char *album = bt.album;
+    bool connected = bt.connected;
+    bool playing = bt.playing;
+    lms_metadata_t lms_meta = {0};
+    if (!bt.connected && slim.connected) {
+        lms_metadata_get(&lms_meta);
+        track = lms_meta.title;
+        artist = lms_meta.artist;
+        album = lms_meta.album;
+        connected = true;
+        playing = lms_meta.valid ? lms_meta.playing : slim.playing;
+    }
+    const char *status_str = connected ? (playing ? "playing" : "connected") : "disconnected";
+
+    bool ma_configured = lms_metadata_is_configured();
+    bool ma_token_problem = ma_configured && lms_metadata_auth_failed();
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "playing_status", status_str);
-    cJSON_AddBoolToObject(root, "connected", bt.connected);
+    cJSON_AddBoolToObject(root, "connected", connected);
     cJSON_AddStringToObject(root, "device", device_name);
-    cJSON_AddStringToObject(root, "track", bt.title);
-    cJSON_AddStringToObject(root, "artist", bt.artist);
-    cJSON_AddStringToObject(root, "album", bt.album);
+    cJSON_AddStringToObject(root, "track", track);
+    cJSON_AddStringToObject(root, "artist", artist);
+    cJSON_AddStringToObject(root, "album", album);
+    cJSON_AddBoolToObject(root, "ma_configured", ma_configured);
+    cJSON_AddBoolToObject(root, "ma_token_problem", ma_token_problem);
     cJSON_AddNumberToObject(root, "volume", audio_codec_get_volume());
     cJSON_AddBoolToObject(root, "amplifier", relay_control_is_on());
     cJSON_AddStringToObject(root, "ip", ip);

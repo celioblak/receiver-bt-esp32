@@ -7,6 +7,8 @@
 #include "audio_codec.h"
 #include "bt_audio.h"
 #include "config.h"
+#include "lms_cli.h"
+#include "lms_metadata.h"
 #include "logger.h"
 #include "ota_manager.h"
 #include "pairing.h"
@@ -106,16 +108,33 @@ static esp_err_t api_status_get(httpd_req_t *req)
         }
     }
 
+    /* Metadados: BT (AVRCP) tem prioridade, mesma regra do audio em si (ver
+     * slimproto.h) -- so usa o que vem do Music Assistant (via API propria,
+     * ver lms_metadata.h; o protocolo Slimproto/LMS classico nao traz
+     * titulo/artista/album) quando nao ha celular conectado. */
+    const char *track = bt.title;
+    const char *artist = bt.artist;
+    const char *album = bt.album;
+    bool playing = bt.playing;
+    lms_metadata_t lms_meta = {0};
+    if (!bt.connected && slim.connected) {
+        lms_metadata_get(&lms_meta);
+        track = lms_meta.title;
+        artist = lms_meta.artist;
+        album = lms_meta.album;
+        playing = lms_meta.valid ? lms_meta.playing : slim.playing;
+    }
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "bt_connected", bt.connected);
     cJSON_AddStringToObject(root, "device_name", device_name);
     cJSON_AddStringToObject(root, "device_mac", own_mac);
     cJSON_AddStringToObject(root, "bt_remote_mac", bt.remote_mac);
     cJSON_AddStringToObject(root, "bt_remote_name", bt_remote_name);
-    cJSON_AddStringToObject(root, "track", bt.title);
-    cJSON_AddStringToObject(root, "artist", bt.artist);
-    cJSON_AddStringToObject(root, "album", bt.album);
-    cJSON_AddBoolToObject(root, "playing", bt.playing);
+    cJSON_AddStringToObject(root, "track", track);
+    cJSON_AddStringToObject(root, "artist", artist);
+    cJSON_AddStringToObject(root, "album", album);
+    cJSON_AddBoolToObject(root, "playing", playing);
     cJSON_AddBoolToObject(root, "amplifier", relay_control_is_on());
     cJSON_AddNumberToObject(root, "volume", audio_codec_get_volume());
     cJSON_AddBoolToObject(root, "agc_enabled", audio_agc_is_enabled());
@@ -131,6 +150,8 @@ static esp_err_t api_status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "slim_enabled", slim.enabled);
     cJSON_AddBoolToObject(root, "slim_connected", slim.connected);
     cJSON_AddBoolToObject(root, "slim_playing", slim.playing);
+    cJSON_AddBoolToObject(root, "ma_configured", lms_metadata_is_configured());
+    cJSON_AddBoolToObject(root, "ma_token_valid", !lms_metadata_auth_failed());
 
     return send_json(req, root);
 }
@@ -180,7 +201,11 @@ static esp_err_t api_config_get(httpd_req_t *req)
 
 static esp_err_t api_config_post(httpd_req_t *req)
 {
-    char buf[512];
+    /* 1024 (nao 512): o token JWT de longa duracao do Music Assistant
+     * (ma_token) sozinho ja passa de 300 bytes -- precisa de folga extra
+     * pra caber junto com os outros campos quando a tela de config manda
+     * tudo de uma vez. */
+    char buf[1024];
     cJSON *root = recv_json_body(req, buf, sizeof(buf));
     if (root == NULL) {
         return ESP_FAIL;
@@ -222,6 +247,10 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
     if ((item = cJSON_GetObjectItem(root, "slim_host")) && cJSON_IsString(item)) {
         storage_set_str(NVS_KEY_SLIM_HOST, item->valuestring);
+        reboot_needed = true;
+    }
+    if ((item = cJSON_GetObjectItem(root, "ma_token")) && cJSON_IsString(item)) {
+        storage_set_str(NVS_KEY_MA_TOKEN, item->valuestring);
         reboot_needed = true;
     }
     if ((item = cJSON_GetObjectItem(root, "bt_discoverable")) && cJSON_IsBool(item)) {
@@ -317,10 +346,30 @@ static esp_err_t api_media_post(httpd_req_t *req)
     }
 
     cJSON *item = cJSON_GetObjectItem(root, "cmd");
-    if (!cJSON_IsString(item) || bt_audio_media_control(item->valuestring) != ESP_OK) {
+    if (!cJSON_IsString(item)) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                              "\"cmd\" deve ser play, pause, playpause, stop, next ou previous");
+        return ESP_FAIL;
+    }
+
+    /* BT sempre tem prioridade (mesma regra do audio em si, ver
+     * slimproto.h) -- só cai pro Slimproto/Music Assistant (via LMS CLI,
+     * porta 9090) se não houver celular conectado por Bluetooth agora. */
+    bt_audio_status_t bt;
+    bt_audio_get_status(&bt);
+    bool ok;
+    if (bt.connected) {
+        ok = (bt_audio_media_control(item->valuestring) == ESP_OK);
+    } else {
+        slimproto_status_t slim;
+        slimproto_get_status(&slim);
+        ok = slim.connected && lms_cli_send_transport(item->valuestring);
+    }
+    if (!ok) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                             "comando invalido ou nenhuma fonte de audio ativa (BT ou Music Assistant)");
         return ESP_FAIL;
     }
     cJSON_Delete(root);

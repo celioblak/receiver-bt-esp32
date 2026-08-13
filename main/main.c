@@ -3,6 +3,7 @@
 #include "bt_audio.h"
 #include "config.h"
 #include "dlna_renderer.h"
+#include "lms_metadata.h"
 #include "logger.h"
 #include "mqtt_ha.h"
 #include "pairing.h"
@@ -120,6 +121,7 @@ void app_main(void)
         web_server_start();
         dlna_renderer_init();
         slimproto_init();
+        lms_metadata_init();
     }
     mqtt_ha_init();
 
