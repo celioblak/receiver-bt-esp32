@@ -79,7 +79,23 @@ static void start_mdns(void)
 
     mdns_hostname_set(hostname);
     mdns_instance_name_set("Receiver Bluetooth DIY");
-    logger_log(ESP_LOG_INFO, TAG, "mDNS ativo: %s.local", hostname);
+
+    /* Ate aqui so resolvia o hostname (<nome>.local) -- nunca anunciava um
+     * SERVICO mDNS de verdade, entao nenhum control point/integracao que
+     * dependa de descoberta automatica via zeroconf (ex.: config_flow do
+     * componente customizado da Home Assistant, ver
+     * docs/home_assistant_custom_component_prompt.md) conseguia achar o
+     * dispositivo sozinho -- so digitando o IP/host na mao. "_receiverbt"
+     * e o nome de servico que esse componente espera encontrar; "_http"
+     * tambem e anunciado por ser generico/util (qualquer navegador/
+     * ferramenta de descoberta mDNS padrao ja reconhece). */
+    mdns_txt_item_t txt[] = {
+        {"fw_version", FW_VERSION},
+    };
+    mdns_service_add(NULL, "_receiverbt", "_tcp", 80, txt, 1);
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+
+    logger_log(ESP_LOG_INFO, TAG, "mDNS ativo: %s.local (servico _receiverbt._tcp anunciado)", hostname);
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
