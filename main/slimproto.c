@@ -70,6 +70,29 @@ static SemaphoreHandle_t s_slim_i2s_sem = NULL;
  * sempre. */
 static slim_ringbuf_mode_t s_slim_ringbuf_mode = SLIM_RINGBUF_MODE_PREFETCHING;
 
+/* Quadros (amostras estereo) de verdade escritos no codec desde o inicio da
+ * faixa atual -- usado pra calcular elapsed_seconds/elapsed_milliseconds
+ * nos STAT que mandamos pro servidor. Confirmado no source real do
+ * aioslimproto (client.py, _process_stat_stmt): eles esperam esses campos
+ * de verdade pra atualizar a barra de progresso -- mandavamos sempre 0,
+ * entao a barra do Music Assistant nunca avançava. So incrementado pela
+ * task escritora de I2S (slim_i2s_task_handler), que e quem sabe quanto
+ * audio de fato ja saiu pro DAC -- baseado em audio REALMENTE tocado, nao
+ * em relogio de parede, entao naturalmente correto mesmo com
+ * engasgos/pausas (nada e escrito, o contador nao avança). Zerado no
+ * inicio de cada faixa nova (slim_ringbuf_flush()). */
+static volatile uint64_t s_slim_frames_played = 0;
+static volatile uint32_t s_slim_sample_rate = 44100;
+
+static uint32_t slim_get_elapsed_ms(void)
+{
+    uint32_t rate = s_slim_sample_rate;
+    if (rate == 0) {
+        return 0;
+    }
+    return (uint32_t)((s_slim_frames_played * 1000ULL) / rate);
+}
+
 /* Incrementado a cada stop_stream_session() (troca/pulo de faixa OU stop
  * puro). Existe porque fechar o socket de dados NAO interrompe uma task
  * antiga que esteja bloqueada dentro de slim_write_ringbuf() esperando
@@ -163,6 +186,7 @@ static void slim_ringbuf_flush(void)
         vRingbufferReturnItem(s_slim_ringbuf, data);
     }
     s_slim_ringbuf_mode = SLIM_RINGBUF_MODE_PREFETCHING;
+    s_slim_frames_played = 0;
 }
 
 static void slim_i2s_task_handler(void *arg)
@@ -181,6 +205,7 @@ static void slim_i2s_task_handler(void *arg)
                 }
                 size_t written = 0;
                 audio_codec_write(data, item_size, &written);
+                s_slim_frames_played += written / 4; /* 4 bytes/quadro (16-bit estereo) */
                 vRingbufferReturnItem(s_slim_ringbuf, data);
             }
         }
@@ -355,9 +380,17 @@ static bool send_helo(int sock)
 /* server_timestamp: só é relevante em resposta a um 'strm t' (ecoa de volta
  * o campo replay_gain recebido) -- 0 nos demais eventos. Os campos de
  * buffer/posição são só informativos pro servidor/UI; não rastreamos com
- * precisão nesta primeira versão (não afeta a reprodução em si). */
+ * precisão. elapsed_seconds/elapsed_milliseconds ANTES eram sempre 0 --
+ * confirmado no source real do aioslimproto (client.py,
+ * _process_stat_stmt) que eles usam esses dois campos pra atualizar a
+ * barra de progresso da faixa no Music Assistant; mandar sempre 0 e o
+ * motivo dela nunca avançar. Agora usa slim_get_elapsed_ms() (contador
+ * real de quadros escritos no codec desde o inicio da faixa, ver
+ * s_slim_frames_played). */
 static bool send_stat(int sock, const char *event_code, uint32_t server_timestamp)
 {
+    uint32_t elapsed_ms = slim_get_elapsed_ms();
+
     uint8_t payload[53];
     uint8_t *p = payload;
     memcpy(p, event_code, 4);
@@ -372,9 +405,9 @@ static bool send_stat(int sock, const char *event_code, uint32_t server_timestam
     put_u32(&p, (uint32_t)(esp_timer_get_time() / 1000)); /* jiffies (ms desde boot) */
     put_u32(&p, 8192); /* output_buffer_size */
     put_u32(&p, 0);    /* output_buffer_fullness */
-    put_u32(&p, 0);    /* elapsed_seconds */
+    put_u32(&p, elapsed_ms / 1000); /* elapsed_seconds */
     put_u16(&p, 0);    /* voltage */
-    put_u32(&p, 0);    /* elapsed_milliseconds */
+    put_u32(&p, elapsed_ms); /* elapsed_milliseconds */
     put_u32(&p, server_timestamp);
     put_u16(&p, 0); /* error_code */
 
@@ -805,6 +838,7 @@ static void slimproto_data_task(void *arg)
         size_t frame_size_in = bytes_per_sample_in * channels_in;
 
         audio_codec_reconfigure_clock((uint32_t)sample_rate);
+        s_slim_sample_rate = (uint32_t)sample_rate;
         logger_log(ESP_LOG_INFO, TAG, "Slimproto: stream iniciado (%d Hz, %u bits, %s, %s-endian)",
                    sample_rate, (unsigned)(bytes_per_sample_in * 8), mono ? "mono" : "estereo",
                    big_endian ? "big" : "little");
@@ -844,19 +878,18 @@ static void slimproto_data_task(void *arg)
             }
             if (n == 0) {
                 /* EOF limpo (servidor fechou de proposito, fim da faixa) --
-                 * sem avisar o servidor disso, o Music Assistant nunca
-                 * avanca sozinho pra proxima faixa da fila: ele fica preso
-                 * mandando so 'strm t' (heartbeat) pra sempre, mesmo ja
-                 * tendo pre-carregado a proxima faixa. Confirmado no
-                 * source do aioslimproto (client.py, _process_STMu):
-                 * "Buffer underrun: Normal end of playback" -- exatamente
-                 * esse evento. (STMd e outra coisa -- "decoder ready" pra
-                 * uma faixa NOVA que ainda vai comecar, nao fim da atual;
-                 * mandar isso aqui bagunçaria a logica deles de ignorar
-                 * heartbeats "presos" da faixa antiga ate a STMs da nova.) */
-                bool sent_u = send_stat_safe("STMu", 0);
-                logger_log(ESP_LOG_INFO, TAG, "Slimproto: fim natural da faixa, avisando servidor (STMu=%d)",
-                           (int)sent_u);
+                 * CORRECAO (visto o corpo real de _process_stat_stmd/stmu no
+                 * client.py do aioslimproto, nao so o docstring): quem
+                 * dispara a proxima faixa pre-carregada (enqueue_next_media)
+                 * e o handler do STMd -- "if self._next_media: play_url(...)".
+                 * STMu faz o OPOSTO do que precisamos aqui: joga
+                 * self._next_media pra None (junto com state=STOPPED),
+                 * cancelando exatamente a faixa que MA ja tinha preparado.
+                 * Mandar STMu no EOF (como o commit anterior fazia) travava
+                 * o avanco automatico em vez de destravar. */
+                bool sent_d = send_stat_safe("STMd", 0);
+                logger_log(ESP_LOG_INFO, TAG, "Slimproto: fim natural da faixa, avisando servidor (STMd=%d)",
+                           (int)sent_d);
                 break;
             }
 
