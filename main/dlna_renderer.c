@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strncasecmp */
 
 #include "audio_codec.h"
 #include "config.h"
@@ -417,13 +418,39 @@ static void ssdp_send_notify_alive(int sock, const struct sockaddr_in *mcast_des
     }
 }
 
+/* Acha o VALOR de um cabecalho HTTP/SSDP pelo nome, exigindo que o nome
+ * comece no inicio de uma linha (nao em qualquer lugar do texto). BUG REAL
+ * caçado com tcpdump de verdade (Music Assistant nunca buscava o
+ * description.xml, mesmo o M-SEARCH e nossa resposta chegando certinhos
+ * pela rede -- nao era problema de multicast/Docker como se suspeitava):
+ * strstr(req, "ST:") solto encontra a substring "ST:" ESCONDIDA DENTRO de
+ * "HOST:" (HO-ST:), que sempre vem ANTES do cabeçalho "ST:" de verdade
+ * numa requisicao M-SEARCH real -- entao a resposta saia com o endereco do
+ * HOST (ex.: "239.255.255.250:1900") no lugar do tipo de dispositivo
+ * pedido, e qualquer control point UPnP descartava a resposta por nao
+ * reconhecer esse "ST" sem sentido. */
+static const char *find_header_value(const char *req, const char *name)
+{
+    size_t name_len = strlen(name);
+    const char *p = req;
+    while (p != NULL && *p != '\0') {
+        if (strncasecmp(p, name, name_len) == 0) {
+            return p + name_len;
+        }
+        p = strchr(p, '\n');
+        if (p != NULL) {
+            p++; /* pula o '\n', aponta pro comeco da proxima linha */
+        }
+    }
+    return NULL;
+}
+
 static void ssdp_handle_msearch(int sock, const char *req, const struct sockaddr_in *from_addr,
                                  socklen_t from_len, const char *ip_str)
 {
     char st[128] = "upnp:rootdevice";
-    const char *st_line = strstr(req, "ST:");
+    const char *st_line = find_header_value(req, "ST:");
     if (st_line) {
-        st_line += 3;
         while (*st_line == ' ') {
             st_line++;
         }
