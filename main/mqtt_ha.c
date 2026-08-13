@@ -7,8 +7,10 @@
 #include "audio_codec.h"
 #include "bt_audio.h"
 #include "config.h"
+#include "lms_cli.h"
 #include "lms_metadata.h"
 #include "logger.h"
+#include "pairing.h"
 #include "relay_control.h"
 #include "slimproto.h"
 #include "storage.h"
@@ -31,14 +33,31 @@ static const char *TAG = "mqtt_ha";
 #define TOPIC_CMD_AGC_ENABLED   "homeassistant/receiver_bt/cmd/agc_enabled"
 #define TOPIC_CMD_DISCOVERABLE  "homeassistant/receiver_bt/cmd/bt_discoverable"
 #define TOPIC_CMD_REQUIRE_PIN   "homeassistant/receiver_bt/cmd/bt_require_pin"
+#define TOPIC_CMD_DISCONNECT    "homeassistant/receiver_bt/cmd/disconnect"
+#define TOPIC_CMD_RELAY_TIMEOUT "homeassistant/receiver_bt/cmd/relay_timeout"
 
 static esp_mqtt_client_handle_t s_client = NULL;
 static bool s_connected = false;
 
+/* O nome do dispositivo na Home Assistant ficava travado no literal
+ * "Receiver Bluetooth DIY", ignorando o nome configurado via
+ * /api/config (device_name) -- confirmado pelo usuario, o dispositivo MQTT
+ * criado na HA nao refletia o nome real. Le da NVS toda vez (nao troca com
+ * frequencia, custo de flash irrelevante aqui). */
+static void get_configured_device_name(char *out, size_t out_len)
+{
+    if (storage_get_str(NVS_KEY_DEVICE_NAME, out, out_len) != ESP_OK || out[0] == '\0') {
+        strlcpy(out, FW_DEVICE_NAME_DEFAULT, out_len);
+    }
+}
+
 static void publish_sensor_discovery(void)
 {
+    char device_name[32];
+    get_configured_device_name(device_name, sizeof(device_name));
+
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "name", "Receiver Bluetooth DIY");
+    cJSON_AddStringToObject(root, "name", device_name);
     cJSON_AddStringToObject(root, "state_topic", TOPIC_STATE);
     cJSON_AddStringToObject(root, "unique_id", "receiver_bt_status");
     cJSON_AddStringToObject(root, "value_template", "{{ value_json.playing_status }}");
@@ -48,7 +67,7 @@ static void publish_sensor_discovery(void)
     cJSON *ids = cJSON_CreateArray();
     cJSON_AddItemToArray(ids, cJSON_CreateString("receiver_bt"));
     cJSON_AddItemToObject(device, "identifiers", ids);
-    cJSON_AddStringToObject(device, "name", "Receiver Bluetooth DIY");
+    cJSON_AddStringToObject(device, "name", device_name);
     cJSON_AddStringToObject(device, "manufacturer", "DIY");
     cJSON_AddStringToObject(device, "model", "ESP32 Audio Kit V2.2");
     cJSON_AddItemToObject(root, "device", device);
@@ -69,10 +88,14 @@ static void add_common_device_fields(cJSON *root, const char *unique_id, const c
     cJSON_AddStringToObject(root, "availability_topic", TOPIC_STATE);
     cJSON_AddStringToObject(root, "availability_template", "{{ 'online' }}");
 
+    char device_name[32];
+    get_configured_device_name(device_name, sizeof(device_name));
+
     cJSON *device = cJSON_CreateObject();
     cJSON *ids = cJSON_CreateArray();
     cJSON_AddItemToArray(ids, cJSON_CreateString("receiver_bt"));
     cJSON_AddItemToObject(device, "identifiers", ids);
+    cJSON_AddStringToObject(device, "name", device_name);
     cJSON_AddItemToObject(root, "device", device);
 }
 
@@ -156,9 +179,45 @@ static void publish_binary_sensor_discovery(const char *object_id, const char *n
     cJSON_Delete(root);
 }
 
+static void publish_generic_sensor_discovery(const char *object_id, const char *name,
+                                              const char *value_template)
+{
+    char config_topic[80];
+    snprintf(config_topic, sizeof(config_topic), "homeassistant/sensor/%s/config", object_id);
+
+    cJSON *root = cJSON_CreateObject();
+    add_common_device_fields(root, object_id, name);
+    cJSON_AddStringToObject(root, "state_topic", TOPIC_STATE);
+    cJSON_AddStringToObject(root, "value_template", value_template);
+    cJSON_AddStringToObject(root, "json_attributes_topic", TOPIC_STATE);
+
+    char *payload = cJSON_PrintUnformatted(root);
+    esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
+    free(payload);
+    cJSON_Delete(root);
+}
+
 static void publish_all_discovery_configs(void)
 {
     publish_sensor_discovery();
+
+    /* Pedido explicito do usuario: o "dispositivo conectado" e a lista de
+     * "dispositivos pareados" so apareciam como atributos json enterrados
+     * no sensor de diagnostico -- viram entidades proprias aqui, mais
+     * visiveis/usaveis em automacoes e no card do dispositivo na HA. */
+    publish_generic_sensor_discovery("receiver_bt_connected_device", "Receiver BT Dispositivo Conectado",
+                                      "{{ value_json.connected_device }}");
+    publish_generic_sensor_discovery("receiver_bt_paired_count", "Receiver BT Dispositivos Pareados",
+                                      "{{ value_json.paired_count }}");
+    publish_button_discovery("receiver_bt_disconnect", "Receiver BT Desconectar", TOPIC_CMD_DISCONNECT, "disconnect");
+
+    /* "Configuracoes": timeout do rele e o unico ajuste de config que faz
+     * sentido expor como entidade MQTT com seguranca -- WiFi/MQTT
+     * reconfigurados PELO PROPRIO MQTT seria circular (se o host/senha
+     * mudar errado, o dispositivo perde a conexao MQTT e fica sem como
+     * corrigir por ali). Esses continuam so na interface web/API REST. */
+    publish_number_discovery("receiver_bt_relay_timeout", "Receiver BT Timeout do Amplificador",
+                              TOPIC_CMD_RELAY_TIMEOUT, "{{ value_json.relay_timeout_s }}", 5, 600);
 
     /* "problem" fica visivel na HA como badge de alerta no card do
      * dispositivo -- token JWT do Music Assistant expira (normalmente 1
@@ -191,6 +250,8 @@ static void subscribe_commands(void)
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_AGC_ENABLED, 0);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCOVERABLE, 0);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_REQUIRE_PIN, 0);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCONNECT, 0);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_RELAY_TIMEOUT, 0);
 }
 
 /* payload de MQTT_EVENT_DATA nao vem terminado em '\0' -- copia pra um
@@ -214,7 +275,21 @@ static void handle_command(esp_mqtt_event_handle_t event)
     copy_payload(event, payload, sizeof(payload));
 
     if (topic_is(event, TOPIC_CMD_MEDIA)) {
-        bt_audio_media_control(payload);
+        /* Mesma regra do POST /api/media (web_server.c): BT tem
+         * prioridade, senao tenta Slimproto/Music Assistant -- antes disso
+         * os botoes de midia da Home Assistant so funcionavam via AVRCP,
+         * nunca controlavam o Music Assistant. */
+        bt_audio_status_t bt;
+        bt_audio_get_status(&bt);
+        if (bt.connected) {
+            bt_audio_media_control(payload);
+        } else {
+            slimproto_status_t slim;
+            slimproto_get_status(&slim);
+            if (slim.connected) {
+                lms_cli_send_transport(payload);
+            }
+        }
     } else if (topic_is(event, TOPIC_CMD_VOLUME)) {
         audio_codec_set_volume(atoi(payload));
     } else if (topic_is(event, TOPIC_CMD_AGC_ENABLED)) {
@@ -223,6 +298,15 @@ static void handle_command(esp_mqtt_event_handle_t event)
         bt_audio_set_discoverable(strcmp(payload, "1") == 0);
     } else if (topic_is(event, TOPIC_CMD_REQUIRE_PIN)) {
         bt_audio_set_require_pin(strcmp(payload, "1") == 0);
+    } else if (topic_is(event, TOPIC_CMD_DISCONNECT)) {
+        bt_audio_status_t bt;
+        bt_audio_get_status(&bt);
+        uint8_t mac[6];
+        if (bt.connected && pairing_parse_mac(bt.remote_mac, mac)) {
+            bt_audio_disconnect_device(mac);
+        }
+    } else if (topic_is(event, TOPIC_CMD_RELAY_TIMEOUT)) {
+        storage_set_i32(NVS_KEY_RELAY_TIMEOUT, atoi(payload));
     } else {
         return;
     }
@@ -298,9 +382,7 @@ void mqtt_ha_publish_state(void)
     slimproto_get_status(&slim);
 
     char device_name[32];
-    if (storage_get_str(NVS_KEY_DEVICE_NAME, device_name, sizeof(device_name)) != ESP_OK) {
-        strlcpy(device_name, FW_DEVICE_NAME_DEFAULT, sizeof(device_name));
-    }
+    get_configured_device_name(device_name, sizeof(device_name));
 
     char ip[16];
     wifi_manager_get_ip_str(ip, sizeof(ip));
@@ -327,6 +409,39 @@ void mqtt_ha_publish_state(void)
     bool ma_configured = lms_metadata_is_configured();
     bool ma_token_problem = ma_configured && lms_metadata_auth_failed();
 
+    /* "Dispositivo conectado" e "dispositivos pareados" pedidos como
+     * entidades proprias (ver publish_all_discovery_configs) -- calculados
+     * aqui, no mesmo payload de estado que elas leem via value_template. */
+    char connected_device[64] = "Nenhum";
+    if (bt.connected) {
+        pairing_device_t history[PAIRING_HISTORY_MAX];
+        size_t n = pairing_get_history(history, PAIRING_HISTORY_MAX);
+        strlcpy(connected_device, bt.remote_mac, sizeof(connected_device));
+        for (size_t i = 0; i < n; i++) {
+            char mac_str[18];
+            pairing_format_mac(history[i].mac, mac_str, sizeof(mac_str));
+            if (strcmp(mac_str, bt.remote_mac) == 0 && history[i].name[0] != '\0') {
+                strlcpy(connected_device, history[i].name, sizeof(connected_device));
+                break;
+            }
+        }
+    } else if (connected) {
+        strlcpy(connected_device, "Music Assistant", sizeof(connected_device));
+    }
+
+    pairing_device_t paired_history[PAIRING_HISTORY_MAX];
+    size_t paired_count = pairing_get_history(paired_history, PAIRING_HISTORY_MAX);
+    char paired_names[PAIRING_HISTORY_MAX * 34] = "";
+    for (size_t i = 0; i < paired_count; i++) {
+        if (i > 0) {
+            strlcat(paired_names, ", ", sizeof(paired_names));
+        }
+        strlcat(paired_names, paired_history[i].name[0] ? paired_history[i].name : "?", sizeof(paired_names));
+    }
+
+    int32_t relay_timeout = DEFAULT_RELAY_TIMEOUT_S;
+    storage_get_i32(NVS_KEY_RELAY_TIMEOUT, &relay_timeout, DEFAULT_RELAY_TIMEOUT_S);
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "playing_status", status_str);
     cJSON_AddBoolToObject(root, "connected", connected);
@@ -344,6 +459,10 @@ void mqtt_ha_publish_state(void)
     cJSON_AddNumberToObject(root, "agc_mode", audio_agc_get_mode());
     cJSON_AddBoolToObject(root, "bt_discoverable", bt_audio_get_discoverable());
     cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
+    cJSON_AddStringToObject(root, "connected_device", connected_device);
+    cJSON_AddNumberToObject(root, "paired_count", (double)paired_count);
+    cJSON_AddStringToObject(root, "paired_names", paired_names);
+    cJSON_AddNumberToObject(root, "relay_timeout_s", relay_timeout);
     if (bt.pending_pin_code[0] != '\0') {
         cJSON_AddStringToObject(root, "pending_pin_mac", bt.pending_pin_mac);
         cJSON_AddStringToObject(root, "pending_pin_code", bt.pending_pin_code);
