@@ -124,15 +124,22 @@ Todos os endpoints retornam/aceitam JSON (exceto `/ota`, que recebe o `.bin` bru
 
 Opcional — sem broker configurado (`mqtt_host` vazio), a integração fica desativada silenciosamente. Publica discovery automático (`homeassistant/.../config`, retido) pra cada entidade, então aparecem sozinhas na Home Assistant depois de configurar o broker.
 
+O nome do dispositivo na HA (device registry, não o nome de cada entidade) segue o `device_name` configurado — não fica mais travado em "Receiver Bluetooth DIY".
+
 - **Sensor de diagnóstico** (`homeassistant/sensor/receiver_bt/config`): estado geral + todos os atributos de `/api/status` como `json_attributes` — inclui faixa/artista/álbum tanto do Bluetooth quanto do Music Assistant (via Slimproto, BT tem prioridade).
 - **`binary_sensor` "Token Music Assistant"** (`device_class: problem`): acende quando um token de API foi configurado mas foi rejeitado (inválido/expirado — ver [`docs/music_assistant_integration.md`](docs/music_assistant_integration.md)). Fica apagado se nunca foi configurado (recurso opcional desligado não é "problema").
+- **`sensor` "Dispositivo Conectado"**, **`sensor` "Dispositivos Pareados"** (contagem, nomes como atributo) e **`sensor` "Servidor Music Assistant"** (o `slim_host` configurado).
+- **`switch` por dispositivo já pareado** (`homeassistant/switch/receiver_bt_pair_<mac sem ':'>/config`, criado/atualizado a cada publicação de estado — até 30s de atraso pra um dispositivo recém-pareado aparecer): liga = autorizado, desliga = bloqueado. Todos compartilham o tópico de comando `cmd/pair` (payload `{"mac": "...", "action": "allow"|"block"}`, montado automaticamente pelo `command_template` de cada entidade — não precisa montar isso manualmente).
+- **`button` "Desconectar"** (`cmd/disconnect`): derruba o dispositivo Bluetooth conectado agora, sem mexer no pareamento.
 - **Entidades de controle** (bidirecionais, tópicos de comando próprios sob `homeassistant/receiver_bt/cmd/`, documentados aqui por não existir um schema oficial de `media_player` da HA que cubra bem `next`/`previous`):
   - `number` Volume (`cmd/volume`, 0-200)
+  - `number` Timeout do Amplificador (`cmd/relay_timeout`, 5-600s)
   - `switch` AGC (`cmd/agc_enabled`)
   - `switch` Visibilidade Bluetooth (`cmd/bt_discoverable`)
   - `switch` Exigir PIN (`cmd/bt_require_pin`)
-  - `button` Play / Pause / Próxima / Anterior (`cmd/media`, payloads `play`/`pause`/`next`/`previous`)
+  - `button` Play / Pause / Próxima / Anterior (`cmd/media`, payloads `play`/`pause`/`next`/`previous` — usa Bluetooth/AVRCP se conectado, senão Music Assistant via Slimproto)
 - Qualquer mudança via MQTT publica o estado atualizado de volta em `homeassistant/sensor/receiver_bt/state` na hora (não espera o heartbeat de 30s).
+- WiFi e MQTT em si ficam de fora das entidades configuráveis por MQTT de propósito — reconfigurar o próprio canal MQTT por ele mesmo é arriscado (um host/senha errado corta o único jeito de corrigir por ali); use a interface web pra isso.
 
 ## Notas
 

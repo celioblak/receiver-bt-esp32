@@ -35,6 +35,7 @@ static const char *TAG = "mqtt_ha";
 #define TOPIC_CMD_REQUIRE_PIN   "homeassistant/receiver_bt/cmd/bt_require_pin"
 #define TOPIC_CMD_DISCONNECT    "homeassistant/receiver_bt/cmd/disconnect"
 #define TOPIC_CMD_RELAY_TIMEOUT "homeassistant/receiver_bt/cmd/relay_timeout"
+#define TOPIC_CMD_PAIR          "homeassistant/receiver_bt/cmd/pair"
 
 static esp_mqtt_client_handle_t s_client = NULL;
 static bool s_connected = false;
@@ -197,6 +198,64 @@ static void publish_generic_sensor_discovery(const char *object_id, const char *
     cJSON_Delete(root);
 }
 
+/* Converte "aa:bb:cc:dd:ee:ff" -> "aabbccddeeff" (sem separador), usado pra
+ * montar um object_id/unique_id valido pra HA (nao aceita ':') a partir do
+ * MAC de cada dispositivo pareado. */
+static void mac_to_object_id_suffix(const char *mac_str, char *out, size_t out_len)
+{
+    size_t j = 0;
+    for (size_t i = 0; mac_str[i] != '\0' && j + 1 < out_len; i++) {
+        if (mac_str[i] != ':') {
+            out[j++] = mac_str[i];
+        }
+    }
+    out[j] = '\0';
+}
+
+/* Um switch por dispositivo ja pareado (liga=autorizado, desliga=bloqueado)
+ * -- pedido explicito do usuario, pra bloquear/autorizar sem precisar abrir
+ * a interface web. Republicado toda vez que mqtt_ha_publish_state() roda
+ * (nao so uma vez na conexao), porque novos dispositivos podem parear a
+ * qualquer momento -- discovery e retido, entao republicar o mesmo
+ * unique_id e barato/idempotente pro broker/HA. Estado e comando
+ * compartilham topicos unicos (TOPIC_STATE/TOPIC_CMD_PAIR); o mac de cada
+ * dispositivo fica embutido no proprio template (value_template usa
+ * selectattr pra achar a entrada certa no array "paired_devices"). */
+static void publish_pair_switch_discovery(const char *mac_str, const char *name)
+{
+    char suffix[13];
+    mac_to_object_id_suffix(mac_str, suffix, sizeof(suffix));
+
+    char object_id[40];
+    snprintf(object_id, sizeof(object_id), "receiver_bt_pair_%s", suffix);
+    char config_topic[80];
+    snprintf(config_topic, sizeof(config_topic), "homeassistant/switch/%s/config", object_id);
+
+    char value_template[220];
+    snprintf(value_template, sizeof(value_template),
+             "{{ '1' if (value_json.paired_devices | selectattr('mac','equalto','%s') | list | first).allowed else '0' }}",
+             mac_str);
+    char command_template[96];
+    snprintf(command_template, sizeof(command_template),
+             "{\"mac\":\"%s\",\"action\":\"{{ 'allow' if value == '1' else 'block' }}\"}", mac_str);
+
+    cJSON *root = cJSON_CreateObject();
+    add_common_device_fields(root, object_id, name);
+    cJSON_AddStringToObject(root, "command_topic", TOPIC_CMD_PAIR);
+    cJSON_AddStringToObject(root, "command_template", command_template);
+    cJSON_AddStringToObject(root, "state_topic", TOPIC_STATE);
+    cJSON_AddStringToObject(root, "value_template", value_template);
+    cJSON_AddStringToObject(root, "payload_on", "1");
+    cJSON_AddStringToObject(root, "payload_off", "0");
+    cJSON_AddStringToObject(root, "state_on", "1");
+    cJSON_AddStringToObject(root, "state_off", "0");
+
+    char *payload = cJSON_PrintUnformatted(root);
+    esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
+    free(payload);
+    cJSON_Delete(root);
+}
+
 static void publish_all_discovery_configs(void)
 {
     publish_sensor_discovery();
@@ -209,7 +268,13 @@ static void publish_all_discovery_configs(void)
                                       "{{ value_json.connected_device }}");
     publish_generic_sensor_discovery("receiver_bt_paired_count", "Receiver BT Dispositivos Pareados",
                                       "{{ value_json.paired_count }}");
+    publish_generic_sensor_discovery("receiver_bt_ma_host", "Receiver BT Servidor Music Assistant",
+                                      "{{ value_json.ma_host }}");
     publish_button_discovery("receiver_bt_disconnect", "Receiver BT Desconectar", TOPIC_CMD_DISCONNECT, "disconnect");
+    /* Os switches de cada dispositivo pareado (publish_pair_switch_discovery)
+     * NAO sao publicados aqui -- ver mqtt_ha_publish_state(), que roda logo
+     * em seguida e a cada 30s dali pra frente, cobrindo tanto o boot quanto
+     * dispositivos pareados depois. */
 
     /* "Configuracoes": timeout do rele e o unico ajuste de config que faz
      * sentido expor como entidade MQTT com seguranca -- WiFi/MQTT
@@ -252,6 +317,7 @@ static void subscribe_commands(void)
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_REQUIRE_PIN, 0);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCONNECT, 0);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_RELAY_TIMEOUT, 0);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_PAIR, 0);
 }
 
 /* payload de MQTT_EVENT_DATA nao vem terminado em '\0' -- copia pra um
@@ -271,7 +337,10 @@ static bool topic_is(const esp_mqtt_event_handle_t event, const char *topic)
 
 static void handle_command(esp_mqtt_event_handle_t event)
 {
-    char payload[16];
+    /* 128 (nao 16): TOPIC_CMD_PAIR manda um JSON pequeno
+     * ({"mac":"aa:bb:cc:dd:ee:ff","action":"allow"}, ~45 bytes) -- os
+     * outros comandos continuam curtos, sobra folga de qualquer forma. */
+    char payload[128];
     copy_payload(event, payload, sizeof(payload));
 
     if (topic_is(event, TOPIC_CMD_MEDIA)) {
@@ -307,6 +376,18 @@ static void handle_command(esp_mqtt_event_handle_t event)
         }
     } else if (topic_is(event, TOPIC_CMD_RELAY_TIMEOUT)) {
         storage_set_i32(NVS_KEY_RELAY_TIMEOUT, atoi(payload));
+    } else if (topic_is(event, TOPIC_CMD_PAIR)) {
+        cJSON *cmd = cJSON_Parse(payload);
+        if (cmd != NULL) {
+            cJSON *mac_item = cJSON_GetObjectItem(cmd, "mac");
+            cJSON *action_item = cJSON_GetObjectItem(cmd, "action");
+            uint8_t mac[6];
+            if (cJSON_IsString(mac_item) && cJSON_IsString(action_item) &&
+                pairing_parse_mac(mac_item->valuestring, mac)) {
+                pairing_set_allowed(mac, strcmp(action_item->valuestring, "allow") == 0);
+            }
+            cJSON_Delete(cmd);
+        }
     } else {
         return;
     }
@@ -442,6 +523,9 @@ void mqtt_ha_publish_state(void)
     int32_t relay_timeout = DEFAULT_RELAY_TIMEOUT_S;
     storage_get_i32(NVS_KEY_RELAY_TIMEOUT, &relay_timeout, DEFAULT_RELAY_TIMEOUT_S);
 
+    char ma_host[64] = "";
+    storage_get_str(NVS_KEY_SLIM_HOST, ma_host, sizeof(ma_host));
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "playing_status", status_str);
     cJSON_AddBoolToObject(root, "connected", connected);
@@ -463,13 +547,37 @@ void mqtt_ha_publish_state(void)
     cJSON_AddNumberToObject(root, "paired_count", (double)paired_count);
     cJSON_AddStringToObject(root, "paired_names", paired_names);
     cJSON_AddNumberToObject(root, "relay_timeout_s", relay_timeout);
+    cJSON_AddStringToObject(root, "ma_host", ma_host);
     if (bt.pending_pin_code[0] != '\0') {
         cJSON_AddStringToObject(root, "pending_pin_mac", bt.pending_pin_mac);
         cJSON_AddStringToObject(root, "pending_pin_code", bt.pending_pin_code);
     }
 
+    /* "paired_devices": array com mac/nome/autorizado -- e o que os
+     * switches por dispositivo (publish_pair_switch_discovery) leem via
+     * value_template (selectattr por mac). Republicamos os proprios
+     * switches logo abaixo, nao so uma vez na conexao, porque um dispositivo
+     * pode parear a qualquer momento depois. */
+    cJSON *paired_arr = cJSON_CreateArray();
+    for (size_t i = 0; i < paired_count; i++) {
+        char mac_str[18];
+        pairing_format_mac(paired_history[i].mac, mac_str, sizeof(mac_str));
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddStringToObject(entry, "mac", mac_str);
+        cJSON_AddStringToObject(entry, "name", paired_history[i].name[0] ? paired_history[i].name : mac_str);
+        cJSON_AddBoolToObject(entry, "allowed", pairing_is_allowed(paired_history[i].mac));
+        cJSON_AddItemToArray(paired_arr, entry);
+    }
+    cJSON_AddItemToObject(root, "paired_devices", paired_arr);
+
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, TOPIC_STATE, payload, 0, 0, false);
     free(payload);
+
+    for (size_t i = 0; i < paired_count; i++) {
+        char mac_str[18];
+        pairing_format_mac(paired_history[i].mac, mac_str, sizeof(mac_str));
+        publish_pair_switch_discovery(mac_str, paired_history[i].name[0] ? paired_history[i].name : mac_str);
+    }
     cJSON_Delete(root);
 }
