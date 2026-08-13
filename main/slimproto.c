@@ -208,6 +208,16 @@ static SemaphoreHandle_t s_data_mutex;
 static int s_data_sock = -1;
 static volatile bool s_data_paused = false;
 
+/* Socket da conexao de CONTROLE (a mesma que slimproto_control_task usa
+ * pros proprios STMt periodicos) -- exposto aqui pra a task de DADOS
+ * conseguir mandar um STAT quando a faixa termina naturalmente (EOF limpo
+ * do socket de dados), sem precisar de outra conexao. Protegido por mutex
+ * proprio: sem isso, duas tasks diferentes escrevendo na mesma conexao TCP
+ * ao mesmo tempo (o heartbeat periodico da propria control task vs esse
+ * aviso vindo da data task) arrisca uma escrita entrelacada/corrompida. */
+static SemaphoreHandle_t s_ctrl_mutex;
+static int s_ctrl_sock = -1;
+
 typedef struct {
     uint32_t server_ip;   /* network order */
     uint16_t server_port;
@@ -369,6 +379,20 @@ static bool send_stat(int sock, const char *event_code, uint32_t server_timestam
     put_u16(&p, 0); /* error_code */
 
     return send_message(sock, "STAT", payload, (size_t)(p - payload));
+}
+
+/* Versao thread-safe de send_stat() usando o socket de controle compartilhado
+ * (s_ctrl_sock) -- pra qualquer chamada que NAO seja de dentro da propria
+ * slimproto_control_task (que ja tem acesso direto e exclusivo ao seu
+ * socket local). Usado pela task de DADOS pra avisar o servidor quando uma
+ * faixa termina naturalmente (ver handle_track_ended_naturally()). */
+static bool send_stat_safe(const char *event_code, uint32_t server_timestamp)
+{
+    xSemaphoreTake(s_ctrl_mutex, portMAX_DELAY);
+    int sock = s_ctrl_sock;
+    bool ok = (sock >= 0) && send_stat(sock, event_code, server_timestamp);
+    xSemaphoreGive(s_ctrl_mutex);
+    return ok;
 }
 
 /* -------------------------------------------------------------------------
@@ -811,7 +835,26 @@ static void slimproto_data_task(void *arg)
                 break; /* erro de verdade (ex.: stop_stream_session fechou o socket) */
             }
             if (n == 0) {
-                break; /* EOF limpo -- servidor fechou de proposito (fim da faixa) */
+                /* EOF limpo (servidor fechou de proposito, fim da faixa) --
+                 * sem avisar o servidor disso, o Music Assistant nunca
+                 * avanca sozinho pra proxima faixa da fila: ele fica preso
+                 * mandando so 'strm t' (heartbeat) pra sempre, mesmo ja
+                 * tendo pre-carregado a proxima faixa (visto ao vivo no log
+                 * do MA -- "enqueue_next_media"/"Preloaded next item"
+                 * acontecem, mas nenhum novo 'strm s' de verdade chega
+                 * depois disso). Clientes Slimproto de verdade mandam um
+                 * STAT nessa hora pro servidor saber que pode avancar; qual
+                 * codigo exato o aioslimproto do MA espera nao foi
+                 * confirmado ao vivo (sem acesso ao source nesta sessao) --
+                 * manda os dois candidatos mais prováveis (STMd=decoder
+                 * pronto/terminou, STMu=underrun/sem mais dado), um codigo
+                 * que o servidor nao trata e so ignorado, entao nao ha risco
+                 * em mandar os dois. */
+                bool sent_d = send_stat_safe("STMd", 0);
+                bool sent_u = send_stat_safe("STMu", 0);
+                logger_log(ESP_LOG_INFO, TAG, "Slimproto: fim natural da faixa, avisando servidor (STMd=%d STMu=%d)",
+                           (int)sent_d, (int)sent_u);
+                break;
             }
 
             /* BT sempre tem prioridade sobre o Slimproto: se estiver
@@ -1071,6 +1114,10 @@ static void slimproto_control_task(void *arg)
         s_status.connected = true;
         xSemaphoreGive(s_status_mutex);
 
+        xSemaphoreTake(s_ctrl_mutex, portMAX_DELAY);
+        s_ctrl_sock = sock;
+        xSemaphoreGive(s_ctrl_mutex);
+
         send_stat(sock, "STMt", 0);
         int64_t last_heartbeat = esp_timer_get_time();
 
@@ -1135,6 +1182,9 @@ static void slimproto_control_task(void *arg)
 
         logger_log(ESP_LOG_WARN, TAG, "Slimproto: conexao perdida, tentando de novo");
         stop_stream_session();
+        xSemaphoreTake(s_ctrl_mutex, portMAX_DELAY);
+        s_ctrl_sock = -1;
+        xSemaphoreGive(s_ctrl_mutex);
         close(sock);
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);
         s_status.connected = false;
@@ -1172,6 +1222,8 @@ void slimproto_init(void)
     s_status_mutex = xSemaphoreCreateMutex();
     s_data_mutex = xSemaphoreCreateMutex();
     s_data_sock = -1;
+    s_ctrl_mutex = xSemaphoreCreateMutex();
+    s_ctrl_sock = -1;
 
     /* Pre-alocado uma unica vez, aqui no boot, junto com a task dedicada de
      * I2S -- mesmo motivo do bt_audio.c: evita competir por heap contra
