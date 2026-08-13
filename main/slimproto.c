@@ -814,6 +814,14 @@ static void slimproto_data_task(void *arg)
         xSemaphoreGive(s_status_mutex);
         relay_control_notify_playing(true);
         audio_codec_set_mute(false);
+        /* Confirmado no source do aioslimproto (client.py, _process_STMs):
+         * "Playback of new track has started" -- usado por eles pra saber
+         * a hora certa de parar de confiar no tempo decorrido da faixa
+         * ANTERIOR (que ainda pode mandar STMt "presos" chegando atrasados)
+         * e passar a confiar na faixa atual. Sem mandar isso, o tempo
+         * decorrido mostrado no MA pode ficar errado/atrasado na troca de
+         * faixa mesmo com o audio certo tocando. */
+        send_stat_safe("STMs", 0);
 
         for (;;) {
             if (s_data_paused) {
@@ -839,21 +847,16 @@ static void slimproto_data_task(void *arg)
                  * sem avisar o servidor disso, o Music Assistant nunca
                  * avanca sozinho pra proxima faixa da fila: ele fica preso
                  * mandando so 'strm t' (heartbeat) pra sempre, mesmo ja
-                 * tendo pre-carregado a proxima faixa (visto ao vivo no log
-                 * do MA -- "enqueue_next_media"/"Preloaded next item"
-                 * acontecem, mas nenhum novo 'strm s' de verdade chega
-                 * depois disso). Clientes Slimproto de verdade mandam um
-                 * STAT nessa hora pro servidor saber que pode avancar; qual
-                 * codigo exato o aioslimproto do MA espera nao foi
-                 * confirmado ao vivo (sem acesso ao source nesta sessao) --
-                 * manda os dois candidatos mais prováveis (STMd=decoder
-                 * pronto/terminou, STMu=underrun/sem mais dado), um codigo
-                 * que o servidor nao trata e so ignorado, entao nao ha risco
-                 * em mandar os dois. */
-                bool sent_d = send_stat_safe("STMd", 0);
+                 * tendo pre-carregado a proxima faixa. Confirmado no
+                 * source do aioslimproto (client.py, _process_STMu):
+                 * "Buffer underrun: Normal end of playback" -- exatamente
+                 * esse evento. (STMd e outra coisa -- "decoder ready" pra
+                 * uma faixa NOVA que ainda vai comecar, nao fim da atual;
+                 * mandar isso aqui bagunçaria a logica deles de ignorar
+                 * heartbeats "presos" da faixa antiga ate a STMs da nova.) */
                 bool sent_u = send_stat_safe("STMu", 0);
-                logger_log(ESP_LOG_INFO, TAG, "Slimproto: fim natural da faixa, avisando servidor (STMd=%d STMu=%d)",
-                           (int)sent_d, (int)sent_u);
+                logger_log(ESP_LOG_INFO, TAG, "Slimproto: fim natural da faixa, avisando servidor (STMu=%d)",
+                           (int)sent_u);
                 break;
             }
 
