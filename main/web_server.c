@@ -7,13 +7,10 @@
 #include "audio_codec.h"
 #include "bt_audio.h"
 #include "config.h"
-#include "lms_cli.h"
-#include "lms_metadata.h"
 #include "logger.h"
 #include "ota_manager.h"
 #include "pairing.h"
 #include "relay_control.h"
-#include "slimproto.h"
 #include "storage.h"
 #include "wifi_manager.h"
 
@@ -73,9 +70,6 @@ static esp_err_t api_status_get(httpd_req_t *req)
     bt_audio_status_t bt;
     bt_audio_get_status(&bt);
 
-    slimproto_status_t slim;
-    slimproto_get_status(&slim);
-
     char device_name[32];
     if (storage_get_str(NVS_KEY_DEVICE_NAME, device_name, sizeof(device_name)) != ESP_OK) {
         strlcpy(device_name, FW_DEVICE_NAME_DEFAULT, sizeof(device_name));
@@ -108,22 +102,10 @@ static esp_err_t api_status_get(httpd_req_t *req)
         }
     }
 
-    /* Metadados: BT (AVRCP) tem prioridade, mesma regra do audio em si (ver
-     * slimproto.h) -- so usa o que vem do Music Assistant (via API propria,
-     * ver lms_metadata.h; o protocolo Slimproto/LMS classico nao traz
-     * titulo/artista/album) quando nao ha celular conectado. */
     const char *track = bt.title;
     const char *artist = bt.artist;
     const char *album = bt.album;
     bool playing = bt.playing;
-    lms_metadata_t lms_meta = {0};
-    if (!bt.connected && slim.connected) {
-        lms_metadata_get(&lms_meta);
-        track = lms_meta.title;
-        artist = lms_meta.artist;
-        album = lms_meta.album;
-        playing = lms_meta.valid ? lms_meta.playing : slim.playing;
-    }
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "bt_connected", bt.connected);
@@ -151,11 +133,6 @@ static esp_err_t api_status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
     cJSON_AddStringToObject(root, "pending_pin_mac", bt.pending_pin_mac);
     cJSON_AddStringToObject(root, "pending_pin_code", bt.pending_pin_code);
-    cJSON_AddBoolToObject(root, "slim_enabled", slim.enabled);
-    cJSON_AddBoolToObject(root, "slim_connected", slim.connected);
-    cJSON_AddBoolToObject(root, "slim_playing", slim.playing);
-    cJSON_AddBoolToObject(root, "ma_configured", lms_metadata_is_configured());
-    cJSON_AddBoolToObject(root, "ma_token_valid", !lms_metadata_auth_failed());
 
     return send_json(req, root);
 }
@@ -166,7 +143,6 @@ static esp_err_t api_config_get(httpd_req_t *req)
     char wifi_ssid[33];
     char mqtt_host[64];
     char mqtt_user[32];
-    char slim_host[64];
     int32_t relay_timeout = DEFAULT_RELAY_TIMEOUT_S;
     int32_t mqtt_port = 1883;
 
@@ -182,9 +158,6 @@ static esp_err_t api_config_get(httpd_req_t *req)
     if (storage_get_str(NVS_KEY_MQTT_USER, mqtt_user, sizeof(mqtt_user)) != ESP_OK) {
         mqtt_user[0] = '\0';
     }
-    if (storage_get_str(NVS_KEY_SLIM_HOST, slim_host, sizeof(slim_host)) != ESP_OK) {
-        slim_host[0] = '\0';
-    }
     storage_get_i32(NVS_KEY_RELAY_TIMEOUT, &relay_timeout, DEFAULT_RELAY_TIMEOUT_S);
     storage_get_i32(NVS_KEY_MQTT_PORT, &mqtt_port, 1883);
 
@@ -196,7 +169,6 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "mqtt_host", mqtt_host);
     cJSON_AddNumberToObject(root, "mqtt_port", mqtt_port);
     cJSON_AddStringToObject(root, "mqtt_user", mqtt_user);
-    cJSON_AddStringToObject(root, "slim_host", slim_host);
     cJSON_AddBoolToObject(root, "bt_discoverable", bt_audio_get_discoverable());
     cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
 
@@ -249,14 +221,6 @@ static esp_err_t api_config_post(httpd_req_t *req)
         storage_set_str(NVS_KEY_MQTT_PASS, item->valuestring);
         reboot_needed = true;
     }
-    if ((item = cJSON_GetObjectItem(root, "slim_host")) && cJSON_IsString(item)) {
-        storage_set_str(NVS_KEY_SLIM_HOST, item->valuestring);
-        reboot_needed = true;
-    }
-    if ((item = cJSON_GetObjectItem(root, "ma_token")) && cJSON_IsString(item)) {
-        storage_set_str(NVS_KEY_MA_TOKEN, item->valuestring);
-        reboot_needed = true;
-    }
     if ((item = cJSON_GetObjectItem(root, "bt_discoverable")) && cJSON_IsBool(item)) {
         bt_audio_set_discoverable(cJSON_IsTrue(item));
     }
@@ -289,21 +253,19 @@ static esp_err_t api_system_restart_post(httpd_req_t *req)
 
 static esp_err_t api_system_beep_post(httpd_req_t *req)
 {
-    /* Confirmado na pratica (2x): disparar o bipe enquanto o Slimproto (ou
-     * BT) esta tocando de verdade trava o dispositivo -- ainda nao temos
-     * certeza total do mecanismo exato (mutex do I2S deveria bastar, mas o
-     * travamento se repetiu mesmo depois dele), entao a defesa mais segura
-     * agora e simplesmente recusar o bipe nesse cenario em vez de arriscar
-     * outro travamento. O bipe e uma ferramenta de diagnostico de hardware,
-     * nao precisa funcionar durante playback real. */
+    /* Confirmado na pratica (2x): disparar o bipe enquanto o BT esta tocando
+     * de verdade trava o dispositivo -- ainda nao temos certeza total do
+     * mecanismo exato (mutex do I2S deveria bastar, mas o travamento se
+     * repetiu mesmo depois dele), entao a defesa mais segura agora e
+     * simplesmente recusar o bipe nesse cenario em vez de arriscar outro
+     * travamento. O bipe e uma ferramenta de diagnostico de hardware, nao
+     * precisa funcionar durante playback real. */
     bt_audio_status_t bt;
     bt_audio_get_status(&bt);
-    slimproto_status_t slim;
-    slimproto_get_status(&slim);
-    if (bt.connected || slim.playing) {
+    if (bt.connected) {
         httpd_resp_set_status(req, "409 Conflict");
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"audio ja em uso (BT ou Slimproto tocando)\"}");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"audio ja em uso (BT tocando)\"}");
         return ESP_OK;
     }
 
@@ -359,29 +321,11 @@ static esp_err_t api_media_post(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    /* BT sempre tem prioridade (mesma regra do audio em si, ver
-     * slimproto.h) -- só cai pro Slimproto/Music Assistant (via LMS CLI,
-     * porta 9090) se não houver celular conectado por Bluetooth agora. */
-    bt_audio_status_t bt;
-    bt_audio_get_status(&bt);
-    bool ok;
-    if (bt.connected) {
-        ok = (bt_audio_media_control(item->valuestring) == ESP_OK);
-    } else {
-        /* NAO exige slim.connected aqui -- lms_cli_send_transport() abre a
-         * PROPRIA conexao nova (porta 9090) a cada comando, independente da
-         * conexao de controle do Slimproto (porta 3483, s_status.connected)
-         * estar em dia. Confirmado ao vivo (2026-08-14): a conexao de
-         * controle reconecta com frequencia (mesmo depois do keepalive),
-         * e exigir slim.connected==true no instante exato do clique fazia
-         * o botao "nao funcionar" de forma intermitente mesmo com audio
-         * tocando normalmente pela conexao de dados (separada). */
-        ok = lms_cli_send_transport(item->valuestring);
-    }
+    bool ok = (bt_audio_media_control(item->valuestring) == ESP_OK);
     if (!ok) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                             "comando invalido ou nenhuma fonte de audio ativa (BT ou Music Assistant)");
+                             "comando invalido ou nenhuma fonte de audio ativa (BT)");
         return ESP_FAIL;
     }
     cJSON_Delete(root);

@@ -7,12 +7,9 @@
 #include "audio_codec.h"
 #include "bt_audio.h"
 #include "config.h"
-#include "lms_cli.h"
-#include "lms_metadata.h"
 #include "logger.h"
 #include "pairing.h"
 #include "relay_control.h"
-#include "slimproto.h"
 #include "storage.h"
 #include "wifi_manager.h"
 
@@ -278,8 +275,6 @@ static void publish_all_discovery_configs(void)
                                       "{{ value_json.connected_device }}");
     publish_generic_sensor_discovery("receiver_bt_paired_count", "Receiver BT Dispositivos Pareados",
                                       "{{ value_json.paired_count }}");
-    publish_generic_sensor_discovery("receiver_bt_ma_host", "Receiver BT Servidor Music Assistant",
-                                      "{{ value_json.ma_host }}");
     publish_button_discovery("receiver_bt_disconnect", "Receiver BT Desconectar", TOPIC_CMD_DISCONNECT, "disconnect");
     /* Os switches de cada dispositivo pareado (publish_pair_switch_discovery)
      * NAO sao publicados aqui -- ver mqtt_ha_publish_state(), que roda logo
@@ -293,15 +288,6 @@ static void publish_all_discovery_configs(void)
      * corrigir por ali). Esses continuam so na interface web/API REST. */
     publish_number_discovery("receiver_bt_relay_timeout", "Receiver BT Timeout do Amplificador",
                               TOPIC_CMD_RELAY_TIMEOUT, "{{ value_json.relay_timeout_s }}", 5, 600);
-
-    /* "problem" fica visivel na HA como badge de alerta no card do
-     * dispositivo -- token JWT do Music Assistant expira (normalmente 1
-     * ano) e, sem isso, titulo/artista/album somem em silencio sem
-     * nenhum aviso obvio de por que (ver lms_metadata.h). So acende se um
-     * token FOI configurado e foi rejeitado -- "nao configurado" nao e
-     * problema, e so um recurso opcional desligado. */
-    publish_binary_sensor_discovery("receiver_bt_ma_token", "Receiver BT Token Music Assistant",
-                                     "problem", "{{ '1' if value_json.ma_token_problem else '0' }}");
 
     /* Escala 0-100 pro usuario (Home Assistant), nao 0-VOLUME_STEPS (200) --
      * mesma logica do web_server.c: a granularidade fina de 200 e so um
@@ -364,19 +350,7 @@ static void handle_command(esp_mqtt_event_handle_t event)
     copy_payload(event, payload, sizeof(payload));
 
     if (topic_is(event, TOPIC_CMD_MEDIA)) {
-        /* Mesma regra do POST /api/media (web_server.c): BT tem
-         * prioridade, senao tenta Slimproto/Music Assistant -- antes disso
-         * os botoes de midia da Home Assistant so funcionavam via AVRCP,
-         * nunca controlavam o Music Assistant. */
-        bt_audio_status_t bt;
-        bt_audio_get_status(&bt);
-        if (bt.connected) {
-            bt_audio_media_control(payload);
-        } else {
-            /* NAO exige slim.connected -- ver mesmo comentario em
-             * web_server.c/api_media_post(). */
-            lms_cli_send_transport(payload);
-        }
+        bt_audio_media_control(payload);
     } else if (topic_is(event, TOPIC_CMD_VOLUME)) {
         /* payload chega em 0-100 (ver publish_number_discovery acima) */
         audio_codec_set_volume((atoi(payload) * VOLUME_STEPS) / 100);
@@ -478,36 +452,18 @@ void mqtt_ha_publish_state(void)
     bt_audio_status_t bt;
     bt_audio_get_status(&bt);
 
-    slimproto_status_t slim;
-    slimproto_get_status(&slim);
-
     char device_name[32];
     get_configured_device_name(device_name, sizeof(device_name));
 
     char ip[16];
     wifi_manager_get_ip_str(ip, sizeof(ip));
 
-    /* BT tem prioridade (mesma regra do audio em si) -- so usa
-     * titulo/artista/album do Music Assistant (via lms_metadata, API
-     * propria do MA) quando nao ha celular conectado. */
     const char *track = bt.title;
     const char *artist = bt.artist;
     const char *album = bt.album;
     bool connected = bt.connected;
     bool playing = bt.playing;
-    lms_metadata_t lms_meta = {0};
-    if (!bt.connected && slim.connected) {
-        lms_metadata_get(&lms_meta);
-        track = lms_meta.title;
-        artist = lms_meta.artist;
-        album = lms_meta.album;
-        connected = true;
-        playing = lms_meta.valid ? lms_meta.playing : slim.playing;
-    }
     const char *status_str = connected ? (playing ? "playing" : "connected") : "disconnected";
-
-    bool ma_configured = lms_metadata_is_configured();
-    bool ma_token_problem = ma_configured && lms_metadata_auth_failed();
 
     /* "Dispositivo conectado" e "dispositivos pareados" pedidos como
      * entidades proprias (ver publish_all_discovery_configs) -- calculados
@@ -525,8 +481,6 @@ void mqtt_ha_publish_state(void)
                 break;
             }
         }
-    } else if (connected) {
-        strlcpy(connected_device, "Music Assistant", sizeof(connected_device));
     }
 
     pairing_device_t paired_history[PAIRING_HISTORY_MAX];
@@ -542,9 +496,6 @@ void mqtt_ha_publish_state(void)
     int32_t relay_timeout = DEFAULT_RELAY_TIMEOUT_S;
     storage_get_i32(NVS_KEY_RELAY_TIMEOUT, &relay_timeout, DEFAULT_RELAY_TIMEOUT_S);
 
-    char ma_host[64] = "";
-    storage_get_str(NVS_KEY_SLIM_HOST, ma_host, sizeof(ma_host));
-
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "playing_status", status_str);
     cJSON_AddBoolToObject(root, "connected", connected);
@@ -552,8 +503,6 @@ void mqtt_ha_publish_state(void)
     cJSON_AddStringToObject(root, "track", track);
     cJSON_AddStringToObject(root, "artist", artist);
     cJSON_AddStringToObject(root, "album", album);
-    cJSON_AddBoolToObject(root, "ma_configured", ma_configured);
-    cJSON_AddBoolToObject(root, "ma_token_problem", ma_token_problem);
     cJSON_AddNumberToObject(root, "volume", (audio_codec_get_volume() * 100 + VOLUME_STEPS / 2) / VOLUME_STEPS);
     cJSON_AddBoolToObject(root, "amplifier", relay_control_is_on());
     cJSON_AddStringToObject(root, "ip", ip);
@@ -566,7 +515,6 @@ void mqtt_ha_publish_state(void)
     cJSON_AddNumberToObject(root, "paired_count", (double)paired_count);
     cJSON_AddStringToObject(root, "paired_names", paired_names);
     cJSON_AddNumberToObject(root, "relay_timeout_s", relay_timeout);
-    cJSON_AddStringToObject(root, "ma_host", ma_host);
     if (bt.pending_pin_code[0] != '\0') {
         cJSON_AddStringToObject(root, "pending_pin_mac", bt.pending_pin_mac);
         cJSON_AddStringToObject(root, "pending_pin_code", bt.pending_pin_code);

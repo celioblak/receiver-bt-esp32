@@ -10,11 +10,6 @@
 <main>
     <h1 id="device-name">Receiver Bluetooth DIY</h1>
 
-    <div class="warning-banner" id="ma-token-banner" style="display:none">
-        Token do Music Assistant inválido ou expirado — título/artista/álbum não aparecem para faixas
-        tocadas por lá. Gere um novo token e atualize em <a href="/settings.html">Configurações</a>.
-    </div>
-
     <div class="card">
         <div class="track" id="track">—</div>
         <div class="track-sub" id="artist-album">—</div>
@@ -25,10 +20,6 @@
         <div class="row" id="bt-device-row" style="display:none">
             <span class="label">Dispositivo</span>
             <span id="bt-device-name">—</span>
-        </div>
-        <div class="row" id="slim-row" style="display:none">
-            <span class="label">Music Assistant / LMS</span>
-            <span class="badge off" id="slim-badge">desconectado</span>
         </div>
         <div class="row">
             <span class="label">Amplificador</span>
@@ -99,23 +90,7 @@ async function refresh() {
             deviceRow.style.display = "none";
             disconnectBtn.style.display = "none";
         }
-        /* Controles funcionam tanto por AVRCP (BT) quanto pela API do LMS
-         * (Music Assistant, ver lms_cli.h) -- mostra sempre que alguma das
-         * duas fontes estiver conectada. */
-        mediaControls.style.display = (s.bt_connected || s.slim_connected) ? "flex" : "none";
-
-        const slimRow = document.getElementById("slim-row");
-        if (s.slim_enabled) {
-            slimRow.style.display = "flex";
-            const slimBadge = document.getElementById("slim-badge");
-            slimBadge.textContent = s.slim_playing ? "tocando" : (s.slim_connected ? "conectado" : "desconectado");
-            slimBadge.className = "badge " + (s.slim_playing || s.slim_connected ? "on" : "off");
-        } else {
-            slimRow.style.display = "none";
-        }
-
-        document.getElementById("ma-token-banner").style.display =
-            (s.ma_configured && !s.ma_token_valid) ? "block" : "none";
+        mediaControls.style.display = s.bt_connected ? "flex" : "none";
 
         const ampBadge = document.getElementById("amp-badge");
         ampBadge.textContent = s.amplifier ? "ligado" : "desligado";

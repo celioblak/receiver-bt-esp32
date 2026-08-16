@@ -17,20 +17,20 @@ static const char *TAG = "audio_codec";
 static i2s_chan_handle_t s_tx_handle = NULL;
 static int s_current_volume = DEFAULT_VOLUME_USER;
 /* Nada protegia o canal I2S contra chamadas concorrentes de tasks
- * diferentes -- bt_audio (task dedicada), slimproto (escreve direto do seu
- * loop de rede) e o beep sob demanda (/api/system/beep, roda na task do
- * httpd) podiam todos cair em audio_codec_write()/reconfigure_clock() ao
- * mesmo tempo. reconfigure_clock() em especial desabilita o canal no meio
- * do caminho -- se isso acontecer enquanto outra task esta bloqueada dentro
- * de um i2s_channel_write() em andamento, e um cenario real de trava.
- * Confirmado na pratica: beep disparado durante playback do Slimproto
- * travou o dispositivo (precisou reset). */
+ * diferentes -- bt_audio (task dedicada), a task de streaming de rede
+ * (escreve direto do seu loop) e o beep sob demanda (/api/system/beep, roda
+ * na task do httpd) podiam todos cair em audio_codec_write()/
+ * reconfigure_clock() ao mesmo tempo. reconfigure_clock() em especial
+ * desabilita o canal no meio do caminho -- se isso acontecer enquanto outra
+ * task esta bloqueada dentro de um i2s_channel_write() em andamento, e um
+ * cenario real de trava. Confirmado na pratica: beep disparado durante
+ * playback de rede travou o dispositivo (precisou reset). */
 static SemaphoreHandle_t s_i2s_mutex = NULL;
 /* Espelha a taxa configurada em i2s_init(44100). Usado por
  * audio_codec_reconfigure_clock() pra pular o disable/reenable do canal
- * quando a taxa nao muda -- toda troca de faixa do Slimproto chama essa
- * funcao, mesmo quando o formato e identico ao da faixa anterior (comum,
- * ja que a biblioteca inteira do usuario e 44.1kHz/24-bit), e cada
+ * quando a taxa nao muda -- toda troca de faixa via streaming de rede chama
+ * essa funcao, mesmo quando o formato e identico ao da faixa anterior
+ * (comum, ja que a biblioteca inteira do usuario e 44.1kHz/24-bit), e cada
  * disable/reenable desnecessario do canal I2S produz um "click" audivel
  * na troca -- o proprio engasgo residual reportado depois de ja corrigido
  * o vazamento de audio entre faixas. */
@@ -145,10 +145,10 @@ esp_err_t audio_codec_set_volume(int volume)
             volume = VOLUME_STEPS;
         }
         /* So grava na NVS se o valor de fato mudou -- achado ao vivo
-         * (2026-08-16): handle_audg() em slimproto.c chama esta funcao toda
-         * vez que o Music Assistant manda um "audg" (sincronizacao de
-         * volume, visto nos logs acontecendo perto de reconexoes/trocas de
-         * faixa), MESMO quando o volume nao mudou de verdade -- gravando na
+         * (2026-08-16, era do Slimproto, ja removido -- ver
+         * docs/slimproto_retrospective.md): um "audg" (sincronizacao de
+         * volume vinda do servidor) chamava esta funcao toda vez, MESMO
+         * quando o volume nao mudou de verdade -- gravando na
          * NVS sem necessidade a cada vez. Uma escrita na flash desliga o
          * cache por um instante; se isso coincidir com outra task tocando
          * PSRAM (nossos ring buffers de audio) ou no meio de uma operacao

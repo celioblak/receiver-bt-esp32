@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 /* Ponte C para o decoder micro-flac (API em C++) -- ver flac_stream_decoder.cpp.
- * slimproto.c e C puro; isolar o C++ aqui evita converter o arquivo inteiro. */
+ * Isola o C++ pra quem consome isso poder continuar em C puro. */
 
 #ifdef __cplusplus
 extern "C" {

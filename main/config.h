@@ -55,7 +55,6 @@
 #define NVS_KEY_STAT_BT_CONNS   "stat_btconn"
 #define NVS_KEY_BT_DISCOVERABLE "bt_discover"
 #define NVS_KEY_BT_REQUIRE_PIN  "bt_req_pin"
-#define NVS_KEY_SLIM_HOST       "slim_host"
 
 /* -------------------------------------------------------------------------
  * Valores padrão
@@ -89,29 +88,6 @@
 #define DEFAULT_AGC_ENABLED     0
 #define DEFAULT_AGC_TARGET_DBFS (-18)  /* -30 a -6 */
 #define DEFAULT_AGC_MODE        1      /* 0=suave 1=medio 2=agressivo */
-
-/* -------------------------------------------------------------------------
- * Slimproto (protocolo do Squeezebox/LMS) — ver slimproto.c
- * ------------------------------------------------------------------------- */
-
-/* Porta fixa do protocolo (nao configuravel, faz parte do padrao Slimproto/
- * LMS -- e a mesma porta que o Music Assistant usa no seu servidor LMS-
- * compativel embutido). So o host/IP do servidor e configuravel. */
-#define SLIMPROTO_SERVER_PORT 3483
-
-/* -------------------------------------------------------------------------
- * Metadados via API propria do Music Assistant (WebSocket) -- ver lms_metadata.c
- * ------------------------------------------------------------------------- */
-
-/* Titulo/artista/album NAO vem pelo protocolo Slimproto/LMS classico (porta
- * 9090) -- testado ao vivo, o Music Assistant nao preenche playlist_tracks
- * por ali. So vem pela API WebSocket propria do MA (porta 8095, path /ws),
- * que exige autenticacao via token JWT de longa duracao (gerado no perfil
- * do usuario no MA -- nao ha token fixo/estatico configuravel do lado do
- * servidor). Guardado aqui, nunca devolvido por GET /api/config (mesmo
- * tratamento de wifi_pass/mqtt_pass). Feature fica desativada em silencio
- * se vazio, mesmo padrao do MQTT sem broker configurado. */
-#define NVS_KEY_MA_TOKEN "ma_token"
 
 /* -------------------------------------------------------------------------
  * Logger (ring buffer em memória)
