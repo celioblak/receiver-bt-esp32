@@ -115,6 +115,7 @@ static void publish_switch_discovery(const char *object_id, const char *name, co
     cJSON_AddStringToObject(root, "payload_off", "0");
     cJSON_AddStringToObject(root, "state_on", "1");
     cJSON_AddStringToObject(root, "state_off", "0");
+    cJSON_AddNumberToObject(root, "qos", 1); /* ver comentario em publish_button_discovery */
 
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
@@ -136,6 +137,7 @@ static void publish_number_discovery(const char *object_id, const char *name, co
     cJSON_AddNumberToObject(root, "min", min);
     cJSON_AddNumberToObject(root, "max", max);
     cJSON_AddNumberToObject(root, "step", 1);
+    cJSON_AddNumberToObject(root, "qos", 1); /* ver comentario em publish_button_discovery */
 
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
@@ -153,6 +155,13 @@ static void publish_button_discovery(const char *object_id, const char *name, co
     add_common_device_fields(root, object_id, name);
     cJSON_AddStringToObject(root, "command_topic", cmd_topic);
     cJSON_AddStringToObject(root, "payload_press", payload_press);
+    /* qos=1 -- confirmado ao vivo em 2026-08-14 que publicacoes em QoS 0
+     * (padrao) as vezes simplesmente se perdiam (perda de pacote WiFi,
+     * sem retransmissao) entre a HA e o broker/dispositivo, fazendo os
+     * botoes de midia "nao funcionar" de forma intermitente mesmo com
+     * tudo (backend, protocolo LMS) confirmado correto. QoS 1 pede
+     * confirmacao de entrega (PUBACK) e retransmite se nao vier. */
+    cJSON_AddNumberToObject(root, "qos", 1);
 
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
@@ -249,6 +258,7 @@ static void publish_pair_switch_discovery(const char *mac_str, const char *name)
     cJSON_AddStringToObject(root, "payload_off", "0");
     cJSON_AddStringToObject(root, "state_on", "1");
     cJSON_AddStringToObject(root, "state_off", "0");
+    cJSON_AddNumberToObject(root, "qos", 1); /* ver comentario em publish_button_discovery */
 
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
@@ -293,8 +303,11 @@ static void publish_all_discovery_configs(void)
     publish_binary_sensor_discovery("receiver_bt_ma_token", "Receiver BT Token Music Assistant",
                                      "problem", "{{ '1' if value_json.ma_token_problem else '0' }}");
 
+    /* Escala 0-100 pro usuario (Home Assistant), nao 0-VOLUME_STEPS (200) --
+     * mesma logica do web_server.c: a granularidade fina de 200 e so um
+     * detalhe interno da curva de audio_codec.c. */
     publish_number_discovery("receiver_bt_volume", "Receiver BT Volume", TOPIC_CMD_VOLUME,
-                              "{{ value_json.volume }}", 0, VOLUME_STEPS);
+                              "{{ value_json.volume }}", 0, 100);
     publish_switch_discovery("receiver_bt_agc", "Receiver BT AGC", TOPIC_CMD_AGC_ENABLED,
                               "{{ '1' if value_json.agc_enabled else '0' }}");
     publish_switch_discovery("receiver_bt_discoverable", "Receiver BT Visivel", TOPIC_CMD_DISCOVERABLE,
@@ -310,14 +323,21 @@ static void publish_all_discovery_configs(void)
 
 static void subscribe_commands(void)
 {
-    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_MEDIA, 0);
-    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_VOLUME, 0);
-    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_AGC_ENABLED, 0);
-    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCOVERABLE, 0);
-    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_REQUIRE_PIN, 0);
-    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCONNECT, 0);
-    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_RELAY_TIMEOUT, 0);
-    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_PAIR, 0);
+    /* QoS 1 (nao mais 0) -- ver comentario em publish_button_discovery.
+     * O QoS efetivo de uma mensagem e o MENOR entre o QoS de quem publica
+     * e o QoS da assinatura -- entao isso so ajuda de verdade combinado
+     * com o publish_button_discovery tambem pedindo qos=1 pros botoes
+     * auto-descobertos da HA; uma publicacao manual em QoS 0 (ex.: MQTT
+     * Explorer) continua sem garantia mesmo assim, mas os botoes reais
+     * da HA (o uso normal) ficam protegidos. */
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_MEDIA, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_VOLUME, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_AGC_ENABLED, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCOVERABLE, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_REQUIRE_PIN, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCONNECT, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_RELAY_TIMEOUT, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_PAIR, 1);
 }
 
 /* payload de MQTT_EVENT_DATA nao vem terminado em '\0' -- copia pra um
@@ -353,14 +373,13 @@ static void handle_command(esp_mqtt_event_handle_t event)
         if (bt.connected) {
             bt_audio_media_control(payload);
         } else {
-            slimproto_status_t slim;
-            slimproto_get_status(&slim);
-            if (slim.connected) {
-                lms_cli_send_transport(payload);
-            }
+            /* NAO exige slim.connected -- ver mesmo comentario em
+             * web_server.c/api_media_post(). */
+            lms_cli_send_transport(payload);
         }
     } else if (topic_is(event, TOPIC_CMD_VOLUME)) {
-        audio_codec_set_volume(atoi(payload));
+        /* payload chega em 0-100 (ver publish_number_discovery acima) */
+        audio_codec_set_volume((atoi(payload) * VOLUME_STEPS) / 100);
     } else if (topic_is(event, TOPIC_CMD_AGC_ENABLED)) {
         audio_agc_enable(strcmp(payload, "1") == 0);
     } else if (topic_is(event, TOPIC_CMD_DISCOVERABLE)) {
@@ -535,7 +554,7 @@ void mqtt_ha_publish_state(void)
     cJSON_AddStringToObject(root, "album", album);
     cJSON_AddBoolToObject(root, "ma_configured", ma_configured);
     cJSON_AddBoolToObject(root, "ma_token_problem", ma_token_problem);
-    cJSON_AddNumberToObject(root, "volume", audio_codec_get_volume());
+    cJSON_AddNumberToObject(root, "volume", (audio_codec_get_volume() * 100 + VOLUME_STEPS / 2) / VOLUME_STEPS);
     cJSON_AddBoolToObject(root, "amplifier", relay_control_is_on());
     cJSON_AddStringToObject(root, "ip", ip);
     cJSON_AddBoolToObject(root, "agc_enabled", audio_agc_is_enabled());

@@ -13,6 +13,7 @@
 #include "web_server.h"
 #include "wifi_manager.h"
 
+#include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -91,12 +92,62 @@ static void network_watchdog_check(void)
     }
 }
 
+/* Nome legivel do motivo do ultimo reset -- esp_reset_reason() le de um
+ * registrador que sobrevive ao proprio reset (RTC), entao mesmo um
+ * crash/watchdog sem chance de logar nada antes de reiniciar ainda aparece
+ * aqui, no BOOT SEGUINTE. Unico jeito de saber a causa real de reinicios
+ * inesperados sem acesso a serial (que so mostra o "rst:0x.." bem no
+ * inicio, quase sempre perdido antes de alguem conseguir conectar). */
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON: return "POWERON (energia ligada)";
+        case ESP_RST_EXT: return "EXT (pino de reset externo)";
+        case ESP_RST_SW: return "SW (esp_restart() chamado pelo proprio firmware)";
+        case ESP_RST_PANIC: return "PANIC (crash -- exception/assert)";
+        case ESP_RST_INT_WDT: return "INT_WDT (watchdog de interrupcao)";
+        case ESP_RST_TASK_WDT: return "TASK_WDT (task travada sem dar yield)";
+        case ESP_RST_WDT: return "WDT (outro watchdog)";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT (queda de tensao)";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "desconhecido";
+    }
+}
+
+/* cJSON usa malloc()/free() puros por padrao (sem hooks configurados,
+ * confirmado: nenhum cJSON_InitHooks() existia em lugar nenhum do
+ * firmware) -- e malloc() puro, nesta configuracao (SPIRAM ligado mas sem
+ * CONFIG_SPIRAM_USE_MALLOC), fica restrito a RAM interna, igual
+ * xTaskCreate()/xRingbufferCreate() sem capabilities explicitas. Toda
+ * resposta JSON da API (web_server.c: /api/status, /api/logs, /api/config,
+ * /api/devices...) passa por cJSON -- /api/logs em particular monta ate
+ * ~100 entradas de uma vez, uma unica alocacao grande (~15-20KB) de RAM
+ * interna a cada chamada. Confirmado como suspeito real (2026-08-14): as
+ * checagens repetidas de /api/logs durante o dia inteiro de depuracao
+ * provavelmente contribuiram pros travamentos do servidor web observados.
+ * Redireciona cJSON pra PSRAM, mesmo padrao ja usado pro buffer de log e
+ * pelos ring buffers de audio. */
+static void *cjson_psram_malloc(size_t size)
+{
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+static void cjson_psram_free(void *ptr)
+{
+    heap_caps_free(ptr);
+}
+
 void app_main(void)
 {
+    cJSON_Hooks hooks = {.malloc_fn = cjson_psram_malloc, .free_fn = cjson_psram_free};
+    cJSON_InitHooks(&hooks);
+
     logger_init();
     ESP_ERROR_CHECK(storage_init());
 
     logger_log(ESP_LOG_INFO, TAG, "Receiver Bluetooth DIY - firmware %s", FW_VERSION);
+    logger_log(ESP_LOG_WARN, TAG, "Motivo do reset anterior: %s", reset_reason_name(esp_reset_reason()));
 
     ESP_ERROR_CHECK(audio_codec_init());
 
@@ -135,13 +186,21 @@ void app_main(void)
          * da RAM interna que o heap total nao revela. O "minimo historico"
          * pega quedas breves que o valor atual, medido só a cada 30s, pode
          * nao capturar. */
+        /* "maior bloco": diferente do total livre -- e o que realmente
+         * decide se uma alocacao grande e CONTIGUA (ex.: stack de uma task
+         * nova) vai conseguir ou nao. Confirmado ao vivo: total livre de
+         * ~18KB (RAM interna) ainda assim falhou ao pedir 10KB pra stack da
+         * task do decoder FLAC -- ou seja, o heap estava mais fragmentado
+         * do que o total livre sozinho deixava parecer. */
         logger_log(ESP_LOG_INFO, TAG,
-                   "heap livre: %u bytes (interna: %u, minima ja vista: %u)",
+                   "heap livre: %u bytes (interna: %u, minima ja vista: %u, maior bloco: %u)",
                    (unsigned)esp_get_free_heap_size(),
                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                   (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+                   (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         mqtt_ha_publish_state();
         network_watchdog_check();
+        bt_audio_check_discoverable_timeout();
         /* 30s (nao 10s): cada publicacao MQTT e uma transmissao WiFi, e
          * atividade de radio (WiFi ou BT) acopla ruido audivel no estagio
          * analogico do ES8388 nesta placa (ver README). Trade-off: esta e a

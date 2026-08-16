@@ -17,6 +17,7 @@
 #include "esp_bt_device.h"
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -35,6 +36,9 @@ static const char *TAG = "bt_audio";
 static SemaphoreHandle_t s_status_mutex = NULL;
 static bt_audio_status_t s_status = {0};
 static volatile bool s_discoverable = DEFAULT_BT_DISCOVERABLE;
+/* 0 = nenhuma janela temporaria de descobrivel ativa. Ver bt_audio_enable_
+ * discoverable_temporary()/bt_audio_check_discoverable_timeout(). */
+static volatile int64_t s_discoverable_temp_deadline_us = 0;
 static volatile bool s_require_pin = DEFAULT_BT_REQUIRE_PIN;
 
 /* -------------------------------------------------------------------------
@@ -107,6 +111,16 @@ typedef enum {
     RINGBUF_MODE_DROPPING,
 } ringbuf_mode_t;
 
+/* xRingbufferCreate() nao aceita capabilities -- o comentario antigo aqui
+ * dizia "vem da PSRAM" mas isso nunca foi garantido pelo codigo, so
+ * presumido (o alocador so cai pra PSRAM de qualquer jeito porque 64KB
+ * jamais caberia nos ~178KB de RAM interna do chip inteiro, entao "deu
+ * certo" por tamanho, nao por garantia). Trocado por xRingbufferCreateStatic
+ * com o buffer pedido explicitamente em MALLOC_CAP_SPIRAM -- mesma ideia
+ * de sempre: dados grandes em PSRAM de proposito, nao por acidente de
+ * fallback do alocador. */
+static uint8_t *s_ringbuf_i2s_storage = NULL;
+static StaticRingbuffer_t s_ringbuf_i2s_struct;
 static RingbufHandle_t s_ringbuf_i2s = NULL;
 static SemaphoreHandle_t s_i2s_write_sem = NULL;
 static TaskHandle_t s_i2s_task_handle = NULL;
@@ -183,7 +197,13 @@ static void bt_i2s_task_handler(void *arg)
 static void bt_audio_prealloc_ring_buffer(void)
 {
     s_i2s_write_sem = xSemaphoreCreateBinary();
-    s_ringbuf_i2s = xRingbufferCreate(RINGBUF_HIGHEST_WATER_LEVEL, RINGBUF_TYPE_BYTEBUF);
+    if (s_ringbuf_i2s_storage == NULL) {
+        s_ringbuf_i2s_storage = heap_caps_malloc(RINGBUF_HIGHEST_WATER_LEVEL, MALLOC_CAP_SPIRAM);
+    }
+    if (s_ringbuf_i2s_storage != NULL) {
+        s_ringbuf_i2s = xRingbufferCreateStatic(RINGBUF_HIGHEST_WATER_LEVEL, RINGBUF_TYPE_BYTEBUF,
+                                                 s_ringbuf_i2s_storage, &s_ringbuf_i2s_struct);
+    }
     if (s_i2s_write_sem == NULL || s_ringbuf_i2s == NULL) {
         ESP_LOGE(TAG, "falha ao pre-alocar buffer/semaforo de audio — sem audio em toda a sessao");
     }
@@ -686,6 +706,7 @@ esp_err_t bt_audio_media_control(const char *cmd)
 
 void bt_audio_set_discoverable(bool discoverable)
 {
+    s_discoverable_temp_deadline_us = 0; /* toggle manual/permanente cancela qualquer janela temporaria pendente */
     s_discoverable = discoverable;
     storage_set_i32(NVS_KEY_BT_DISCOVERABLE, discoverable ? 1 : 0);
     /* So aplica na hora se nao tiver ninguem conectado -- enquanto
@@ -703,6 +724,45 @@ void bt_audio_set_discoverable(bool discoverable)
 bool bt_audio_get_discoverable(void)
 {
     return s_discoverable;
+}
+
+void bt_audio_enable_discoverable_temporary(uint32_t duration_s)
+{
+    s_discoverable_temp_deadline_us = esp_timer_get_time() + (int64_t)duration_s * 1000000LL;
+    /* Igual a bt_audio_set_discoverable(true), mas SEM persistir no NVS --
+     * de proposito: se o dispositivo reiniciar no meio da janela, volta pro
+     * padrao persistido (normalmente false), nao fica preso "descobrivel"
+     * pra sempre por causa de uma janela temporaria que nunca expirou. */
+    s_discoverable = true;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    bool connected = s_status.connected;
+    xSemaphoreGive(s_status_mutex);
+    if (!connected) {
+        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    }
+    logger_log(ESP_LOG_INFO, TAG, "bt_audio: descobrivel temporario ligado por %u s", (unsigned)duration_s);
+}
+
+void bt_audio_check_discoverable_timeout(void)
+{
+    int64_t deadline = s_discoverable_temp_deadline_us;
+    if (deadline == 0 || !s_discoverable) {
+        return; /* nenhuma janela temporaria ativa, ou ja foi desligado por outro caminho */
+    }
+    if (esp_timer_get_time() < deadline) {
+        return; /* ainda dentro do prazo */
+    }
+    s_discoverable_temp_deadline_us = 0;
+    /* NVS ja reflete o padrao persistido (false, nunca foi escrito true por
+     * esta janela temporaria) -- so precisa desfazer o efeito em runtime. */
+    s_discoverable = false;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    bool connected = s_status.connected;
+    xSemaphoreGive(s_status_mutex);
+    if (!connected) {
+        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    }
+    logger_log(ESP_LOG_INFO, TAG, "bt_audio: janela de descobrivel temporario expirou, desligando");
 }
 
 void bt_audio_set_require_pin(bool require_pin)

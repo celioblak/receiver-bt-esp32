@@ -136,7 +136,11 @@ static esp_err_t api_status_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "album", album);
     cJSON_AddBoolToObject(root, "playing", playing);
     cJSON_AddBoolToObject(root, "amplifier", relay_control_is_on());
-    cJSON_AddNumberToObject(root, "volume", audio_codec_get_volume());
+    /* API/UI expoem 0-100 pro usuario -- a precisao fina de 0-VOLUME_STEPS
+     * (200, ver config.h) e so um detalhe interno da curva de audio_codec.c,
+     * nao precisa vazar pra fora (usuario pediu explicitamente: "nao
+     * importa nossa formula matematica interna"). */
+    cJSON_AddNumberToObject(root, "volume", (audio_codec_get_volume() * 100 + VOLUME_STEPS / 2) / VOLUME_STEPS);
     cJSON_AddBoolToObject(root, "agc_enabled", audio_agc_is_enabled());
     cJSON_AddNumberToObject(root, "agc_gain", audio_agc_get_current_gain());
     cJSON_AddNumberToObject(root, "agc_target", audio_agc_get_target());
@@ -325,15 +329,17 @@ static esp_err_t api_volume_post(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    /* Escala 0-VOLUME_STEPS (ver config.h). Se o AGC estiver ligado, a
-     * próxima iteração da agc_task já lê este novo valor via
-     * audio_codec_get_volume() — não precisa sincronizar nada aqui. */
-    audio_codec_set_volume(item->valueint);
+    /* API/UI usam 0-100; convertido aqui pra escala interna 0-VOLUME_STEPS
+     * (200, ver config.h) que audio_codec.c usa pra granularidade fina da
+     * curva. Se o AGC estiver ligado, a próxima iteração da agc_task já lê
+     * este novo valor via audio_codec_get_volume() — não precisa
+     * sincronizar nada aqui. */
+    audio_codec_set_volume((item->valueint * VOLUME_STEPS) / 100);
     cJSON_Delete(root);
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", true);
-    cJSON_AddNumberToObject(resp, "volume", audio_codec_get_volume());
+    cJSON_AddNumberToObject(resp, "volume", (audio_codec_get_volume() * 100 + VOLUME_STEPS / 2) / VOLUME_STEPS);
     return send_json(req, resp);
 }
 
@@ -362,9 +368,15 @@ static esp_err_t api_media_post(httpd_req_t *req)
     if (bt.connected) {
         ok = (bt_audio_media_control(item->valuestring) == ESP_OK);
     } else {
-        slimproto_status_t slim;
-        slimproto_get_status(&slim);
-        ok = slim.connected && lms_cli_send_transport(item->valuestring);
+        /* NAO exige slim.connected aqui -- lms_cli_send_transport() abre a
+         * PROPRIA conexao nova (porta 9090) a cada comando, independente da
+         * conexao de controle do Slimproto (porta 3483, s_status.connected)
+         * estar em dia. Confirmado ao vivo (2026-08-14): a conexao de
+         * controle reconecta com frequencia (mesmo depois do keepalive),
+         * e exigir slim.connected==true no instante exato do clique fazia
+         * o botao "nao funcionar" de forma intermitente mesmo com audio
+         * tocando normalmente pela conexao de dados (separada). */
+        ok = lms_cli_send_transport(item->valuestring);
     }
     if (!ok) {
         cJSON_Delete(root);
@@ -460,6 +472,35 @@ static esp_err_t api_wifi_scan_get(httpd_req_t *req)
     }
 
     return send_json(req, arr);
+}
+
+/* Liga o "descobrivel" do Bluetooth so por um tempo limitado (padrao 180s se
+ * "duration_s" nao vier no corpo) -- ver bt_audio_enable_discoverable_
+ * temporary(). Existe pra nao deixar a varredura periodica de radio do BT
+ * ligada o tempo todo (disputa CPU/radio com a decodificacao de audio),
+ * so durante o tempo real de parear um aparelho novo. */
+static esp_err_t api_bt_pairing_mode_post(httpd_req_t *req)
+{
+    /* recv_json_body ja manda a resposta de erro sozinha se o corpo vier
+     * vazio/invalido -- NAO mandar outra resposta nesse caso (corpo minimo
+     * esperado do chamador: "{}" pra usar so o padrao de 180s). */
+    char buf[128];
+    cJSON *root = recv_json_body(req, buf, sizeof(buf));
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+    uint32_t duration_s = 180;
+    cJSON *item = cJSON_GetObjectItem(root, "duration_s");
+    if (cJSON_IsNumber(item) && item->valueint > 0) {
+        duration_s = (uint32_t)item->valueint;
+    }
+    cJSON_Delete(root);
+    bt_audio_enable_discoverable_temporary(duration_s);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddNumberToObject(resp, "duration_s", duration_s);
+    return send_json(req, resp);
 }
 
 static esp_err_t api_pair_post(httpd_req_t *req)
@@ -587,7 +628,7 @@ void web_server_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20; /* 16 rotas hoje -- folga pra novas sem esbarrar no limite de novo */
     config.stack_size = 8192; /* /ota escreve na flash — folga extra de pilha */
     config.recv_wait_timeout = 10;
 
@@ -607,6 +648,7 @@ void web_server_start(void)
         {.uri = "/api/logs", .method = HTTP_GET, .handler = api_logs_get},
         {.uri = "/api/devices", .method = HTTP_GET, .handler = api_devices_get},
         {.uri = "/api/pair", .method = HTTP_POST, .handler = api_pair_post},
+        {.uri = "/api/bt/pairing_mode", .method = HTTP_POST, .handler = api_bt_pairing_mode_post},
         {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = api_wifi_scan_get},
         {.uri = "/api/system/restart", .method = HTTP_POST, .handler = api_system_restart_post},
         {.uri = "/api/system/beep", .method = HTTP_POST, .handler = api_system_beep_post},

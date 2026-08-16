@@ -8,11 +8,13 @@
 #include "audio_codec.h"
 #include "bt_audio.h"
 #include "config.h"
+#include "flac_stream_decoder.h"
 #include "logger.h"
 #include "relay_control.h"
 #include "storage.h"
 #include "wifi_manager.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -55,12 +57,33 @@ static const char *TAG = "slimproto";
  * perceptivel como "travado"). */
 #define SLIM_RINGBUF_HIGHEST_WATER_LEVEL  (128 * 1024)
 #define SLIM_RINGBUF_PREFETCH_WATER_LEVEL (80 * 1024)
+/* Limite MENOR, so pra RECUPERACAO no meio da faixa (nao pro inicio) --
+ * confirmado ao vivo em 2026-08-14 que gaps breves na entrega de rede
+ * (so alguns ms sem dado novo, algo normal em WiFi) derrubavam o buffer
+ * pro modo PREFETCHING, que ai exigia reencher os 80KB inteiros de novo
+ * antes de voltar a tocar -- um soluco de rede de alguns ms virava um
+ * engasgo audivel de centenas de ms, varias vezes por faixa (confirmado:
+ * 4 ocorrencias em ~30s de uma unica musica). 16KB (~90ms de audio a
+ * 44.1kHz/16-bit estereo) e suficiente pra absorver o mesmo tipo de gap
+ * que causou o esvaziamento, sem exagerar a resposta. O limite grande
+ * (80KB) continua valendo só pra primeira vez que uma faixa comeca (dá
+ * folga real contra a abertura de conexao/primeiro pacote), ver
+ * s_slim_ringbuf_first_fill. */
+#define SLIM_RINGBUF_RECOVERY_WATER_LEVEL (16 * 1024)
 
 typedef enum {
     SLIM_RINGBUF_MODE_PROCESSING,
     SLIM_RINGBUF_MODE_PREFETCHING,
 } slim_ringbuf_mode_t;
 
+/* xRingbufferCreate() nao aceita capabilities de memoria -- sempre foi
+ * uma aposta implicita que o alocador ia cair pra PSRAM so porque 128KB
+ * jamais caberia nos ~178KB de RAM interna do chip inteiro, nunca uma
+ * garantia de verdade do codigo (mesmo bug de suposicao do ring buffer do
+ * bt_audio.c). Buffer real pedido explicitamente em MALLOC_CAP_SPIRAM via
+ * xRingbufferCreateStatic. */
+static uint8_t *s_slim_ringbuf_storage = NULL;
+static StaticRingbuffer_t s_slim_ringbuf_struct;
 static RingbufHandle_t s_slim_ringbuf = NULL;
 static SemaphoreHandle_t s_slim_i2s_sem = NULL;
 /* Comeca em PREFETCHING (nao PROCESSING): a task escritora fica bloqueada no
@@ -69,6 +92,11 @@ static SemaphoreHandle_t s_slim_i2s_sem = NULL;
  * acontece na transicao PREFETCHING->PROCESSING) e a task dormiria pra
  * sempre. */
 static slim_ringbuf_mode_t s_slim_ringbuf_mode = SLIM_RINGBUF_MODE_PREFETCHING;
+/* true so na primeira vez que uma faixa enche o buffer (usa o limite grande,
+ * 80KB); qualquer reenchimento DEPOIS disso (recuperando de um esvaziamento
+ * no meio da musica) usa o limite pequeno, SLIM_RINGBUF_RECOVERY_WATER_LEVEL.
+ * Resetado pra true em slim_ringbuf_flush() (inicio de cada faixa nova). */
+static bool s_slim_ringbuf_first_fill = true;
 
 /* Quadros (amostras estereo) de verdade escritos no codec desde o inicio da
  * faixa atual -- usado pra calcular elapsed_seconds/elapsed_milliseconds
@@ -154,6 +182,19 @@ static size_t slim_write_ringbuf(uint32_t session_id, const uint8_t *data, size_
     }
 
     if (s_slim_ringbuf_mode == SLIM_RINGBUF_MODE_PREFETCHING) {
+        /* REVERTIDO (2026-08-14): o limite pequeno de recuperacao (16KB)
+         * pareceu uma boa ideia (gap curto = reenchimento rapido), mas ao
+         * testar ao vivo o engasgo ficou MUITO mais frequente (varias vezes
+         * por segundo em vez de a cada 5-9s) e o usuario confirmou de
+         * ouvido que ficou pior, nao melhor. Hipotese corrigida: o problema
+         * nao e um gap curto isolado -- e um trecho sustentado onde a
+         * chegada de dados (rede) mal acompanha o consumo (I2S), entao um
+         * buffer pequeno de recuperacao esvazia de novo quase imediatamente,
+         * virando um ciclo de esvaziar->reencher continuo (pior audivelmente
+         * que os poucos engasgos maiores, mas mais raros, do buffer grande).
+         * De volta ao limite unico de 80KB pros dois casos -- fica como
+         * pendente pra investigar de outro angulo (ex.: velocidade real do
+         * decode FLAC vs necessidade de I2S) numa sessao com mais folego. */
         size_t used = 0;
         vRingbufferGetInfo(s_slim_ringbuf, NULL, NULL, NULL, NULL, &used);
         if (used >= SLIM_RINGBUF_PREFETCH_WATER_LEVEL) {
@@ -186,6 +227,7 @@ static void slim_ringbuf_flush(void)
         vRingbufferReturnItem(s_slim_ringbuf, data);
     }
     s_slim_ringbuf_mode = SLIM_RINGBUF_MODE_PREFETCHING;
+    s_slim_ringbuf_first_fill = true;
     s_slim_frames_played = 0;
 }
 
@@ -200,8 +242,33 @@ static void slim_i2s_task_handler(void *arg)
                 uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(
                     s_slim_ringbuf, &item_size, pdMS_TO_TICKS(20), max_chunk);
                 if (item_size == 0) {
+                    /* Diagnostico temporario (2026-08-14): engasgos audiveis
+                     * relatados sem NENHUM erro correspondente em nenhum log
+                     * ate agora -- suspeita e que isso aqui e o mecanismo
+                     * real: um gap de so 20ms sem dado novo no ring buffer
+                     * ja derruba pro modo PREFETCHING de novo, que exige
+                     * reencher ate 80KB (SLIM_RINGBUF_PREFETCH_WATER_LEVEL)
+                     * antes de tocar mais alguma coisa -- um soluco breve
+                     * vira um engasgo bem mais longo, sem logar nada como
+                     * "erro" hoje. */
+                    logger_log(ESP_LOG_WARN, TAG,
+                               "slim_i2s: buffer esvaziou (20ms sem dado) -- voltando pra PREFETCHING (reenche ate %uKB)",
+                               (unsigned)(SLIM_RINGBUF_PREFETCH_WATER_LEVEL / 1024));
                     s_slim_ringbuf_mode = SLIM_RINGBUF_MODE_PREFETCHING;
                     break;
+                }
+                /* Diagnostico temporario (2026-08-14): log periodico do nivel
+                 * do buffer, pra saber se o esvaziamento e uma queda SUBITA
+                 * (rajada breve de contencao de CPU/rede) ou um DECLINIO
+                 * GRADUAL (decode+rede simplesmente nao sustentam o ritmo
+                 * medio de consumo do I2S por tempo suficiente). */
+                static int64_t s_last_fill_log_us = 0;
+                int64_t now_us = esp_timer_get_time();
+                if (now_us - s_last_fill_log_us > 500000) {
+                    size_t used = 0;
+                    vRingbufferGetInfo(s_slim_ringbuf, NULL, NULL, NULL, NULL, &used);
+                    logger_log(ESP_LOG_INFO, TAG, "slim_i2s: nivel do buffer: %uKB", (unsigned)(used / 1024));
+                    s_last_fill_log_us = now_us;
                 }
                 size_t written = 0;
                 audio_codec_write(data, item_size, &written);
@@ -233,6 +300,84 @@ static SemaphoreHandle_t s_data_mutex;
 static int s_data_sock = -1;
 static volatile bool s_data_paused = false;
 
+/* Instante (esp_timer_get_time(), us) da ultima transicao de sessao
+ * (stop_stream_session -- toda troca de faixa passa por ali, natural ou
+ * via comando). Exposto pra lms_cli.c poder dar uma folga antes de abrir
+ * sua propria conexao TCP nova (porta 9090) se uma transicao acabou de
+ * acontecer -- ver slimproto_get_last_transition_time_us() e o comentario
+ * em lms_cli.c. Reduz (nao elimina) a chance de duas operacoes de socket
+ * concorrentes (nossa e a do Slimproto) disputarem as mesmas estruturas
+ * internas do lwIP (tcpip_thread) ao mesmo tempo -- causa suspeita de
+ * pelo menos 3 crashes reais distintos vistos ao vivo em 2026-08-16. */
+static volatile int64_t s_last_session_transition_us = 0;
+
+/* Sinaliza quando a task de dados (slim_data) de fato terminou e chamou
+ * vTaskDelete -- ver start_stream_session() (onde e consumido) e o fim de
+ * slimproto_data_task() (onde e dado). Substitui um vTaskDelay(50) fixo que
+ * nao tinha garantia nenhuma contra o caso de pulo rapido de faixa (varios
+ * strm em poucos ms, ex.: next/previous via lms_cli): se a task antiga
+ * ainda estivesse rodando (presa numa etapa lenta do decode, ou atrasada
+ * por disputa de CPU/radio com o proprio comando que disparou o pulo) e o
+ * static stack fosse reusado por uma task nova antes dela realmente sair,
+ * as duas ficariam escrevendo no MESMO buffer de stack ao mesmo tempo --
+ * corrupcao de memoria real, PANIC. Um semaforo binario aguardado com
+ * timeout elimina a adivinhacao: espera exatamente ate a task antiga
+ * confirmar que saiu (ou ate o timeout, se nao havia task antiga nenhuma,
+ * ex. primeira faixa apos o boot). */
+static SemaphoreHandle_t s_data_task_exited_sem;
+
+/* Stack da task de dados (slim_data) ESTATICO, nao dinamico -- confirmado ao
+ * vivo (heap_caps_get_largest_free_block) que o maior bloco CONTIGUO de RAM
+ * interna disponivel em runtime, mesmo saudavel, fica travado em ~8192
+ * bytes -- pedir exatamente esse tanto pro xTaskCreate ainda falha (o TCB
+ * do FreeRTOS precisa de um pouco mais que o stack puro). Um buffer static
+ * e reservado pelo LINKER, em tempo de compilacao -- nao compete por um
+ * bloco contiguo em runtime, entao nao tem esse jeito de falhar. Reutilizado
+ * a cada faixa (xTaskCreateStatic de novo, mesmo buffer) depois que a task
+ * anterior se autodeleta -- a folga de 50ms antes de criar (ver
+ * start_stream_session) ja garante que o idle task processou a delecao
+ * anterior antes de reusarmos o mesmo TCB/stack. */
+/* De volta a 8192 (2026-08-14): tentamos 6144 mais cedo hoje (telemetria de
+ * high-water-mark sugeria so ~3824 bytes de pico, entao 6144 parecia ter
+ * folga de sobra) -- trouxe RAM interna real (mdns_send parou de falhar,
+ * WS do MA autenticou de primeira), MAS o dispositivo travou bem na hora
+ * de um play real logo depois. As duas medicoes de high-water-mark que
+ * embasaram o 6144 podem nao ter cobrido o pior caso de verdade da cadeia
+ * de decode C++ do FLAC (profundidade varia com bloco/canal/profundidade
+ * de bits) -- o PANIC original que comecou toda essa investigacao era
+ * exatamente isso.
+ *
+ * Subiu pra 16384 (2026-08-16): 8192 tambem nao era seguro o suficiente --
+ * dois PANICs reais (reset reason confirmado em /api/logs) aconteceram no
+ * mesmo dia, em testes separados, ambos SEM nenhuma mudanca de codigo nova
+ * envolvida (rodando o mesmo binario que ja tinha ficado 11h+ estavel antes
+ * disso -- ou seja, e intermitente/dependente do conteudo real da faixa,
+ * nao de uma regressao pontual). Subiu pra 16384 (valor de producao do
+ * squeezelite-esp32, `DECODE_THREAD_STACK_SIZE` em `embedded.h`) por
+ * algumas horas, mas **voltou pra 8192 no mesmo dia** depois de confirmar
+ * ao vivo, com captura serial de verdade (nao mais suposicao), que o custo
+ * era real e imediato: `wifi:mem fail` sustentado, MQTT caindo por timeout
+ * de conexao, RAM interna medida em ~8.6KB livre. E a telemetria de
+ * high-water-mark da PROPRIA sessao que rodou nesse teste (ver
+ * `uxTaskGetStackHighWaterMark` no fim desta task) mostrou uso real de
+ * pilha de so ~3.7KB (12656 bytes livres de 16384) -- ou seja, nem chegou
+ * perto de precisar dos 16KB inteiros. Motivo mais provavel dos PANICs
+ * originais: nao estouro de pilha por decode profundo, e sim a CORRIDA
+ * entre a task antiga (ainda saindo) e a nova (reusando o mesmo static
+ * stack/TCB) durante pulos rapidos de faixa -- ver `s_data_task_exited_sem`
+ * acima, que resolve isso de verdade (sincronizacao real, nao um
+ * vTaskDelay(50) as cegas). Se um PANIC voltar a acontecer mesmo com o
+ * semaforo em vigor E 8192, aí sim teriamos evidencia real de que
+ * profundidade de pilha e o problema, e valeria subir nesse caso -- mas
+ * com dados de uma falha real, nao de novo por suposicao. NAO mover esse
+ * stack pra PSRAM como alternativa: essa task faz rede (sockets lwIP), e
+ * PSRAM fica inacessivel durante qualquer escrita concorrente na
+ * flash/NVS por outra task (limitacao real de cache do ESP32) -- um stack
+ * de execucao em PSRAM travaria de um jeito pior e mais imprevisivel. */
+#define SLIM_DATA_STACK_BYTES 8192
+static StackType_t s_slim_data_stack[SLIM_DATA_STACK_BYTES / sizeof(StackType_t)];
+static StaticTask_t s_slim_data_tcb;
+
 /* Socket da conexao de CONTROLE (a mesma que slimproto_control_task usa
  * pros proprios STMt periodicos) -- exposto aqui pra a task de DADOS
  * conseguir mandar um STAT quando a faixa termina naturalmente (EOF limpo
@@ -248,6 +393,7 @@ typedef struct {
     uint16_t server_port;
     char http_header[MAX_CTRL_PAYLOAD];
     size_t http_header_len;
+    char format; /* 'p' = PCM/WAV, 'f' = FLAC -- ver handle_strm()/slimproto_data_task() */
     char pcm_sample_size;
     char pcm_sample_rate;
     char pcm_channels;
@@ -438,6 +584,9 @@ static void stop_stream_session(void)
     s_slim_session_id++; /* invalida qualquer write bloqueado da sessao anterior -- ver slim_write_ringbuf() */
     logger_log(ESP_LOG_INFO, TAG, "stop_stream_session: sessao %u -> %u (sock=%d)",
                (unsigned)old_id, (unsigned)s_slim_session_id, s_data_sock);
+    /* Marca o instante desta transicao -- ver slimproto_get_last_transition_time_us()
+     * e o comentario em lms_cli.c sobre por que isso importa. */
+    s_last_session_transition_us = esp_timer_get_time();
     xSemaphoreTake(s_data_mutex, portMAX_DELAY);
     if (s_data_sock >= 0) {
         shutdown(s_data_sock, SHUT_RDWR);
@@ -611,7 +760,7 @@ static bool body_read_n(int sock, http_body_reader_t *r, uint8_t *buf, size_t le
 }
 
 static void start_stream_session(uint32_t server_ip, uint16_t server_port,
-                                  const uint8_t *header, size_t header_len,
+                                  const uint8_t *header, size_t header_len, char format,
                                   char pcm_size, char pcm_rate, char pcm_channels, char pcm_endian)
 {
     stop_stream_session();
@@ -626,6 +775,7 @@ static void start_stream_session(uint32_t server_ip, uint16_t server_port,
     size_t copy_len = header_len < sizeof(args->http_header) ? header_len : sizeof(args->http_header);
     memcpy(args->http_header, header, copy_len);
     args->http_header_len = copy_len;
+    args->format = format;
     args->pcm_sample_size = pcm_size;
     args->pcm_sample_rate = pcm_rate;
     args->pcm_channels = pcm_channels;
@@ -645,13 +795,55 @@ static void start_stream_session(uint32_t server_ip, uint16_t server_port,
 
     s_data_paused = false;
 
-    /* Pequena folga pra task de dados da sessao anterior (se houver)
-     * perceber o socket fechado por stop_stream_session() e se autodeletar
-     * antes de outra comecar a escrever no mesmo codec de audio. */
-    vTaskDelay(pdMS_TO_TICKS(50));
+    /* Espera real (nao mais um vTaskDelay(50) fixo, ver comentario em
+     * s_data_task_exited_sem) ate a task de dados da sessao anterior (se
+     * houver) confirmar que saiu de vez -- so entao e seguro reusar o
+     * static stack/TCB pra uma task nova. Timeout de 200ms e so uma rede de
+     * seguranca (primeira faixa apos o boot, sem task anterior nenhuma
+     * pendente) -- no caso comum, se a task antiga ja tinha saido antes
+     * desta chamada, o take() retorna na hora, sem nenhuma espera. */
+    xSemaphoreTake(s_data_task_exited_sem, pdMS_TO_TICKS(200));
 
-    if (xTaskCreate(slimproto_data_task, "slim_data", 4096, args, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "falha ao criar task de dados (heap insuficiente)");
+    /* CRITICO, achado via backtrace real de um crash ao vivo (2026-08-16):
+     * o semaforo acima so garante que o CODIGO da task antiga terminou e
+     * chamou vTaskDelete() -- mas vTaskDelete() so MARCA a task pra
+     * remocao, quem de fato tira ela das listas internas do kernel
+     * (ready list etc.) e a task IDLE, rodando depois, de forma
+     * assincrona. Sem essa folga, xTaskCreateStatic() logo abaixo podia
+     * reusar o mesmo TCB/stack ANTES da IDLE ter processado a remocao da
+     * task antiga -- crash confirmado com backtrace real dentro do
+     * proprio FreeRTOS (prvAddNewTaskToReadyList, chamado por
+     * xTaskCreateStatic aqui). Mesma licao ja aprendida neste projeto
+     * sobre taskYIELD()/vTaskDelay(0) NAO bastarem pra deixar a IDLE
+     * rodar -- precisa de um vTaskDelay(>=1) de verdade. */
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    /* Stack ESTATICO (s_slim_data_stack, declarado no topo do arquivo), nao
+     * xTaskCreate dinamico -- ja tentamos 16KB (persistente, afogou
+     * MQTT/WiFi no boot), depois 10KB e 8KB por faixa (heap_caps_
+     * get_largest_free_block() mostrou o maior bloco CONTIGUO de RAM
+     * interna travado em ~8192 bytes mesmo com o sistema saudavel, e pedir
+     * exatamente esse valor ainda falhava por causa do overhead do TCB).
+     * xTaskCreateStatic() nao sofre disso: o espaco e reservado pelo
+     * LINKER, nao competido em runtime, entao sempre da certo. */
+    /* SEGUNDA TENTATIVA (2026-08-14) de fixar essa task no APP_CPU (core 1)
+     * -- REVERTIDA DE NOVO no mesmo dia: mesmo com o vTaskDelay(1) real a
+     * cada 32 voltas do loop de decode (ver comentario la), o dispositivo
+     * travou por completo (rede/HTTP inteiramente sem resposta, precisou
+     * de reset fisico via esptool) poucos minutos depois de gravar essa
+     * versao -- pior que os engasgos que essa mudanca tentava resolver, e
+     * sem confirmacao de que o pin estivesse realmente ajudando antes do
+     * travamento. De volta a xTaskCreateStatic sem pin (deixa o scheduler
+     * distribuir entre os dois nucleos). O vTaskDelay(1) periodico no loop
+     * de decode foi MANTIDO (nao tem custo/risco conhecido sozinho, sem
+     * pin) -- se o pin for tentado uma terceira vez no futuro, investigar
+     * a fundo a causa do travamento antes (pode nao ter sido so o watchdog
+     * de interrupcao; capturar serial ao vivo seria necessario). */
+    TaskHandle_t data_task = xTaskCreateStatic(slimproto_data_task, "slim_data",
+                                                sizeof(s_slim_data_stack), args, 5,
+                                                s_slim_data_stack, &s_slim_data_tcb);
+    if (data_task == NULL) {
+        logger_log(ESP_LOG_ERROR, TAG, "falha ao criar task de dados (inesperado -- stack e static)");
         free(args);
     }
 }
@@ -669,9 +861,22 @@ static void slimproto_data_task(void *arg)
     addr.sin_port = htons(args->server_port);
     addr.sin_addr.s_addr = args->server_ip;
 
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    /* socket() as vezes falha ("lwip_arch: thread_sem_init: out of memory")
+     * bem no meio de uma rajada de comandos strm (f/q/s em sequencia rapida,
+     * cada um fechando a sessao anterior e abrindo uma nova em milissegundos)
+     * mesmo com RAM interna geral saudavel (~23KB livres, confirmado ao vivo
+     * em 2026-08-14) -- parece ser contencao transitoria (cleanup assincrono
+     * de sockets anteriores ainda em andamento), nao falta de memoria de
+     * verdade. Retry curto em vez de desistir na primeira falha. */
+    int sock = -1;
+    for (int attempt = 0; attempt < 3 && sock < 0; attempt++) {
+        if (attempt > 0) {
+            vTaskDelay(pdMS_TO_TICKS(150));
+        }
+        sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    }
     if (sock < 0) {
-        ESP_LOGE(TAG, "falha ao criar socket de dados");
+        logger_log(ESP_LOG_ERROR, TAG, "falha ao criar socket de dados apos 3 tentativas");
         goto cleanup_no_sock;
     }
 
@@ -680,7 +885,45 @@ static void slimproto_data_task(void *arg)
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
 
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    /* CRITICO (achado ao vivo, 2026-08-16, com backtrace real): connect()
+     * bloqueante, sem timeout proprio -- SO_RCVTIMEO acima NAO limita
+     * connect() no lwIP, so recv(). Sob disputa de radio/rede, connect()
+     * podia ficar preso por varios segundos. Enquanto isso, s_data_sock so
+     * e atualizado DEPOIS do connect() ter sucesso (linha abaixo) -- entao
+     * um pulo de faixa rapido chegando nesse meio-tempo nao tinha como
+     * fechar essa conexao pendente, e o timeout de 200ms do semaforo em
+     * start_stream_session() (ver s_data_task_exited_sem) sempre expirava
+     * achando que a task antiga tinha sumido, quando na verdade ela
+     * continuava viva, presa aqui dentro -- reabrindo a MESMA corrida de
+     * reuso de stack que o semaforo foi feito pra evitar, so que via
+     * connect() lento em vez de falta de tempo pra IDLE. Quando o connect()
+     * atrasado finalmente completava (ou uma resposta de rede tardia
+     * chegava), o retorno mexia num stack ja reutilizado pela task nova --
+     * causa real de pelo menos 2 crashes distintos decodificados essa noite
+     * (ambos dentro de lwip_netconn_do_connected/xQueueGenericSend).
+     * Corrigido com o padrao classico non-blocking connect + select() com
+     * timeout real e curto (5s) -- garante que esta task NUNCA fica presa
+     * aqui por mais que isso, então o semaforo sempre reflete a realidade. */
+    int sock_flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, sock_flags | O_NONBLOCK);
+    int connect_ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (connect_ret != 0 && errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock, &wfds);
+        struct timeval connect_tv = {.tv_sec = 5, .tv_usec = 0};
+        int sel = select(sock + 1, NULL, &wfds, NULL, &connect_tv);
+        if (sel > 0) {
+            int so_error = 0;
+            socklen_t so_error_len = sizeof(so_error);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len);
+            connect_ret = (so_error == 0) ? 0 : -1;
+        } else {
+            connect_ret = -1; /* timeout ou erro no select() */
+        }
+    }
+    fcntl(sock, F_SETFL, sock_flags); /* volta pro modo bloqueante -- resto do codigo espera isso */
+    if (connect_ret != 0) {
         ESP_LOGW(TAG, "falha ao conectar no socket de dados (porta %d)", ntohs(addr.sin_port));
         goto cleanup;
     }
@@ -722,7 +965,27 @@ static void slimproto_data_task(void *arg)
         }
     }
 
-    {
+    uint8_t stream_magic[4];
+    if (!body_read_n(sock, &reader, stream_magic, sizeof(stream_magic))) {
+        ESP_LOGW(TAG, "conexao de dados fechada logo no inicio do audio");
+        goto cleanup;
+    }
+    logger_log(ESP_LOG_INFO, TAG, "Slimproto: primeiros 4 bytes do corpo: %02x %02x %02x %02x ('%c%c%c%c')",
+               stream_magic[0], stream_magic[1], stream_magic[2], stream_magic[3],
+               isprint(stream_magic[0]) ? stream_magic[0] : '.', isprint(stream_magic[1]) ? stream_magic[1] : '.',
+               isprint(stream_magic[2]) ? stream_magic[2] : '.', isprint(stream_magic[3]) ? stream_magic[3] : '.');
+
+    /* O campo "format" que o proprio STRM declara NAO e confiavel: bug
+     * conhecido do Music Assistant (extracao de mime_type quebrada pra URLs
+     * de streaming sem extensao de arquivo -- ver docs/music_assistant_
+     * integration.md) faz ele por vezes declarar 'p' (PCM) no STRM mas
+     * mandar FLAC de verdade no corpo (confirmado ao vivo: STRM dizia
+     * format='p', corpo comecava com o magic "fLaC"). Os 4 primeiros bytes
+     * reais do corpo sao a unica fonte confiavel -- "fLaC" e o magic number
+     * oficial do formato (spec do Xiph, sempre os 4 primeiros bytes de um
+     * stream FLAC nativo) -- entao decidimos o caminho de decodificacao por
+     * eles, nao pelo que o servidor alegou no cabecalho Slimproto. */
+    if (memcmp(stream_magic, "fLaC", 4) != 0) {
         int sample_rate = pcm_rate_to_hz(args->pcm_sample_rate);
         bool mono = (args->pcm_channels == '1');
         bool big_endian = (args->pcm_endian == '0');
@@ -748,16 +1011,7 @@ static void slimproto_data_task(void *arg)
          * de verdade), os 4 bytes lidos aqui SAO audio -- entram como sobra
          * pro loop principal processar, sem descartar nada. */
         {
-            uint8_t magic[4];
-            if (!body_read_n(sock, &reader, magic, sizeof(magic))) {
-                ESP_LOGW(TAG, "conexao de dados fechada logo no inicio do audio");
-                goto cleanup;
-            }
-            logger_log(ESP_LOG_INFO, TAG, "Slimproto: primeiros 4 bytes do corpo: %02x %02x %02x %02x ('%c%c%c%c')",
-                       magic[0], magic[1], magic[2], magic[3],
-                       isprint(magic[0]) ? magic[0] : '.', isprint(magic[1]) ? magic[1] : '.',
-                       isprint(magic[2]) ? magic[2] : '.', isprint(magic[3]) ? magic[3] : '.');
-            if (memcmp(magic, "RIFF", 4) == 0) {
+            if (memcmp(stream_magic, "RIFF", 4) == 0) {
                 uint8_t skip8[8]; /* riff_size(4) + "WAVE"(4) */
                 if (!body_read_n(sock, &reader, skip8, sizeof(skip8))) {
                     goto cleanup;
@@ -826,8 +1080,8 @@ static void slimproto_data_task(void *arg)
                 }
             } else {
                 /* nao e WAV -- ja e PCM cru, os 4 bytes lidos sao audio de verdade */
-                memcpy(frame_buf, magic, sizeof(magic));
-                carry_len = sizeof(magic);
+                memcpy(frame_buf, stream_magic, sizeof(stream_magic));
+                carry_len = sizeof(stream_magic);
             }
         }
 
@@ -930,6 +1184,194 @@ static void slimproto_data_task(void *arg)
             }
             carry_len = new_carry_len;
         }
+    } else {
+        /* FLAC nativo (detectado pelo magic "fLaC" real do corpo, nao pelo
+         * campo "format" do STRM -- ver comentario acima) -- decodificado
+         * localmente via esphome/micro-flac em vez de exigir PCM/WAV do
+         * servidor. Elimina de vez a dependencia de qualquer patch no lado
+         * do Music Assistant (a extracao de mime_type dele e quebrada pra
+         * URLs de streaming sem extensao de arquivo, entao ele volta a
+         * mandar FLAC -- o formato padrao -- com muita frequencia mesmo com
+         * CONF_OUTPUT_CODEC setado; ver docs/music_assistant_integration.md).
+         *
+         * Buffer de ENTRADA (bytes comprimidos, crus do socket): mantido o
+         * mais cheio possivel -- le mais dados so quando ha espaco livre,
+         * decode() consome do inicio e a sobra e compactada pra frente via
+         * memmove(). 32KB cobre com folga um frame FLAC tipico (bloco de
+         * 4096 amostras/canal, estereo, ate 24-bit VERBATIM no pior caso:
+         * 4096*2*3 = 24576 bytes).
+         *
+         * Buffer de SAIDA (amostras int32_t "left-justified", formato
+         * uniforme da lib independente da profundidade real do FLAC):
+         * alocado só depois do FLAC_STREAM_HEADER_READY, do tamanho exato
+         * que o proprio decoder informa (get_output_buffer_size_samples()).
+         *
+         * Os dois ficam em PSRAM (MALLOC_CAP_SPIRAM) -- sao grandes demais
+         * pra RAM interna, que ja e disputada por WiFi/BT (ver o comentario
+         * sobre isso em main.c). */
+        flac_stream_decoder_t *flac = flac_stream_decoder_create();
+        if (flac == NULL) {
+            ESP_LOGE(TAG, "falha ao criar decoder FLAC (sem heap)");
+            goto cleanup;
+        }
+
+        const size_t FLAC_IN_CAP = 32768;
+        uint8_t *in_buf = heap_caps_malloc(FLAC_IN_CAP, MALLOC_CAP_SPIRAM);
+        if (in_buf == NULL) {
+            ESP_LOGE(TAG, "falha ao alocar buffer de entrada FLAC (sem PSRAM)");
+            flac_stream_decoder_destroy(flac);
+            goto cleanup;
+        }
+        /* os 4 bytes de magic ja foram consumidos do socket acima (pra
+         * decidir este ramo) -- entram como os primeiros bytes de entrada
+         * do decoder, senao ele nunca veria o "fLaC" inicial. */
+        memcpy(in_buf, stream_magic, sizeof(stream_magic));
+        size_t in_len = sizeof(stream_magic);
+
+        int32_t *out_buf = NULL;
+        size_t out_cap_samples = 0;
+        uint32_t channels = 2;
+        bool clean_end = false;
+        bool socket_eof = false;
+        unsigned yield_counter = 0;
+
+        for (;;) {
+            if (s_data_paused) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+
+            /* Cede a vez de verdade (vTaskDelay, nao taskYIELD -- so um
+             * delay real tira a task da fila de prontas e deixa a IDLE
+             * rodar) a cada 32 voltas. Necessario pra fixar esta task num
+             * nucleo so (ver xTaskCreateStaticPinnedToCore mais abaixo):
+             * quando in_len==FLAC_IN_CAP, o laco roda decode+escrita no
+             * ring buffer em sequencia sem nenhuma chamada bloqueante --
+             * sem isso, a IDLE do nucleo nunca escalona e o watchdog de
+             * interrupcao mata o sistema (ja aconteceu, ver comentario
+             * junto do xTaskCreateStaticPinnedToCore). 32 voltas a ~poucas
+             * dezenas de us cada e um orcamento de CPU desprezivel perto
+             * do buffer de ~1s que o ring buffer da de folga.*/
+            if (++yield_counter >= 32) {
+                yield_counter = 0;
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+
+            if (!socket_eof && in_len < FLAC_IN_CAP) {
+                int n = http_body_read(sock, &reader, in_buf + in_len, FLAC_IN_CAP - in_len);
+                if (n < 0) {
+                    if (!(errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)) {
+                        break; /* erro real de socket */
+                    }
+                    /* timeout sem dado novo -- ainda tenta decodificar o que ja tem */
+                } else if (n == 0) {
+                    socket_eof = true; /* EOF limpo -- drena o que sobrou no buffer/decoder abaixo */
+                } else {
+                    in_len += (size_t)n;
+                }
+            }
+
+            size_t consumed = 0, decoded = 0;
+            flac_stream_result_t r = flac_stream_decoder_feed(flac, in_buf, in_len, out_buf,
+                                                                out_cap_samples, &consumed, &decoded);
+            if (consumed > 0) {
+                memmove(in_buf, in_buf + consumed, in_len - consumed);
+                in_len -= consumed;
+            }
+
+            if (r == FLAC_STREAM_HEADER_READY) {
+                channels = flac_stream_decoder_channels(flac);
+                uint32_t rate = flac_stream_decoder_sample_rate(flac);
+                out_cap_samples = flac_stream_decoder_output_buffer_samples(flac);
+                out_buf = heap_caps_malloc(out_cap_samples * sizeof(int32_t), MALLOC_CAP_SPIRAM);
+                if (out_buf == NULL) {
+                    ESP_LOGE(TAG, "falha ao alocar buffer de saida FLAC (sem PSRAM)");
+                    break;
+                }
+                audio_codec_reconfigure_clock(rate);
+                s_slim_sample_rate = rate;
+                logger_log(ESP_LOG_INFO, TAG, "Slimproto: FLAC iniciado (%u Hz, %u bits, %u canal(is))",
+                           (unsigned)rate, (unsigned)flac_stream_decoder_bits_per_sample(flac),
+                           (unsigned)channels);
+
+                xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+                s_status.playing = true;
+                xSemaphoreGive(s_status_mutex);
+                relay_control_notify_playing(true);
+                audio_codec_set_mute(false);
+                send_stat_safe("STMs", 0); /* ver explicacao no ramo PCM acima */
+                continue;
+            }
+
+            if (r == FLAC_STREAM_OK) {
+                if (decoded > 0 && channels > 0) {
+                    bt_audio_status_t bt;
+                    bt_audio_get_status(&bt);
+                    if (!bt.connected) {
+                        size_t total_frames = decoded / channels;
+                        size_t frame_idx = 0;
+                        while (frame_idx < total_frames) {
+                            size_t chunk_frames = total_frames - frame_idx;
+                            if (chunk_frames > 256) {
+                                chunk_frames = 256;
+                            }
+                            uint8_t chunk16[256 * 4];
+                            for (size_t f = 0; f < chunk_frames; f++) {
+                                const int32_t *frame = out_buf + (frame_idx + f) * channels;
+                                /* amostras vem alinhadas a esquerda em 32 bits -- os 16
+                                 * bits mais significativos ja sao o truncamento pra
+                                 * 16-bit, igual ao pcm_extract_16bit() do ramo PCM. */
+                                int16_t l = (int16_t)(frame[0] >> 16);
+                                int16_t rr = (channels >= 2) ? (int16_t)(frame[1] >> 16) : l;
+                                chunk16[f * 4 + 0] = (uint8_t)(l & 0xff);
+                                chunk16[f * 4 + 1] = (uint8_t)((l >> 8) & 0xff);
+                                chunk16[f * 4 + 2] = (uint8_t)(rr & 0xff);
+                                chunk16[f * 4 + 3] = (uint8_t)((rr >> 8) & 0xff);
+                            }
+                            slim_write_ringbuf(my_session, chunk16, chunk_frames * 4);
+                            frame_idx += chunk_frames;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (r == FLAC_STREAM_END_OF_STREAM) {
+                clean_end = true;
+                break;
+            }
+
+            if (r == FLAC_STREAM_ERROR) {
+                logger_log(ESP_LOG_WARN, TAG, "Slimproto: erro no decoder FLAC, encerrando faixa");
+                break;
+            }
+
+            /* FLAC_STREAM_NEED_MORE_DATA */
+            if (socket_eof) {
+                /* servidor ja fechou a conexao e o decoder ainda pede mais --
+                 * stream truncado ou o ultimo frame ja foi totalmente
+                 * consumido; de qualquer forma, nao ha mais nada a fazer. */
+                clean_end = true;
+                break;
+            }
+            if (in_len == FLAC_IN_CAP && consumed == 0) {
+                logger_log(ESP_LOG_ERROR, TAG, "Slimproto: buffer de entrada FLAC saturado, abortando faixa");
+                break;
+            }
+            /* buffer de entrada ainda tem espaco (ou o decoder consumiu algo) -- volta pro topo do loop */
+        }
+
+        if (clean_end) {
+            bool sent_d = send_stat_safe("STMd", 0);
+            logger_log(ESP_LOG_INFO, TAG, "Slimproto: fim natural da faixa (FLAC), avisando servidor (STMd=%d)",
+                       (int)sent_d);
+        }
+
+        if (out_buf != NULL) {
+            heap_caps_free(out_buf);
+        }
+        heap_caps_free(in_buf);
+        flac_stream_decoder_destroy(flac);
     }
 
 cleanup:
@@ -958,7 +1400,18 @@ cleanup_no_sock:
      * Quem decide "playing=false" de verdade agora e so um STOP/FLUSH
      * explicito (handle_strm) ou a conexao de CONTROLE cair de vez
      * (slimproto_control_task). */
+    /* Telemetria real (nao mais chute) de quanto stack esta task realmente
+     * precisou -- uxTaskGetStackHighWaterMark() devolve o MINIMO de bytes
+     * livres que a task teve em toda sua vida (quanto menor, mais perto
+     * chegou de estourar). Visivel em /api/logs -- decide se os 10KB atuais
+     * tem margem de sobra ou se e melhor subir um pouco. */
+    logger_log(ESP_LOG_INFO, TAG, "slim_data: margem de stack no pior momento desta sessao: %u bytes",
+               (unsigned)uxTaskGetStackHighWaterMark(NULL));
     free(args);
+    /* Ultima coisa antes de sair de vez -- sinaliza pra um eventual
+     * start_stream_session() esperando (ver s_data_task_exited_sem) que ja
+     * e seguro reusar o static stack/TCB agora. */
+    xSemaphoreGive(s_data_task_exited_sem);
     vTaskDelete(NULL);
 }
 
@@ -982,23 +1435,47 @@ static void handle_strm(int ctrl_sock, const uint8_t *payload, size_t len)
     uint16_t server_port = get_u16(payload + 18);
     uint32_t server_ip = get_u32(payload + 20);
 
+    /* Diagnostico: registra strm recebido no logger visivel (/api/logs) --
+     * antes so ia pro ESP_LOGW cru (so serial), entao a rejeicao de formato
+     * ficava invisivel remotamente. Exclui 'cmd==t' (heartbeat, repete a
+     * cada poucos segundos pra sempre) de proposito -- sem isso, o buffer
+     * circular de 100 entradas ficava tomado so por heartbeats em minutos,
+     * apagando informacao bem mais relevante (troca de sessao, motivo do
+     * reset no boot, etc.) rapido demais pra dar tempo de puxar via API. */
+    if (command != 't') {
+        logger_log(ESP_LOG_INFO, TAG, "strm recebido: cmd='%c' format='%c' pcm_size='%c' pcm_rate='%c' pcm_channels='%c'",
+                   command, format, pcm_size, pcm_rate, pcm_channels);
+    }
+
     switch (command) {
         case 's': /* start */
-            if (format != 'p') {
-                ESP_LOGW(TAG, "formato '%c' nao suportado (so PCM), ignorando faixa", format);
+            if (format != 'p' && format != 'f') {
+                logger_log(ESP_LOG_WARN, TAG, "formato '%c' nao suportado (so PCM/FLAC), ignorando faixa", format);
                 send_stat(ctrl_sock, "STMn", 0);
                 break;
             }
-            start_stream_session(htonl(server_ip), server_port, payload + 24, len - 24,
+            start_stream_session(htonl(server_ip), server_port, payload + 24, len - 24, format,
                                   pcm_size, pcm_rate, pcm_channels, pcm_endian);
             break;
         case 'p': /* pause */
             s_data_paused = true;
             audio_codec_set_mute(true);
+            /* s_status.playing nunca era atualizado aqui -- ficava travado
+             * no valor de quando a faixa comecou, entao lms_cli_send_
+             * transport() (que decide "pause 1" vs "pause 0" pro botao de
+             * alternar) sempre via o mesmo estado antigo e mandava sempre
+             * o mesmo comando, travando o toggle. Confirmado ao vivo em
+             * 2026-08-14. */
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_status.playing = false;
+            xSemaphoreGive(s_status_mutex);
             break;
         case 'u': /* unpause */
             s_data_paused = false;
             audio_codec_set_mute(false);
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_status.playing = true;
+            xSemaphoreGive(s_status_mutex);
             break;
         case 'q': /* stop */
         case 'f': /* flush */
@@ -1138,6 +1615,31 @@ static void slimproto_control_task(void *arg)
             continue;
         }
 
+        /* SO_KEEPALIVE ausente ate agora -- a conexao de CONTROLE (esta
+         * aqui) e a que fica aberta a vida toda, mas nunca tinha nenhuma
+         * deteccao de peer morto alem do proprio STMt de 5 em 5s falhar no
+         * envio, o que pode demorar muito (retransmissao TCP padrao) ou
+         * nunca acontecer de verdade se a rede so parou de entregar pacotes
+         * silenciosamente (NAT/roteador reiniciando, WiFi soluçando) sem
+         * nunca mandar um RST -- o socket fica "conectado" pro nosso lado
+         * pra sempre, mas o MA ja desistiu do outro lado (confirmado ao vivo
+         * em 2026-08-14: dispositivo mostrava slim_connected=true no nosso
+         * /api/status enquanto o MA ja via o player como indisponivel).
+         * Com keepalive ativo, idle=10s + intervalo=5s + 3 tentativas =
+         * detectamos um peer morto em ate ~25s e a logica de reconexao ja
+         * existente (ver "conexao perdida, tentando de novo" mais abaixo)
+         * cuida do resto. */
+        {
+            int keepalive = 1;
+            int keepidle = 10;
+            int keepintvl = 5;
+            int keepcnt = 3;
+            setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+            setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+            setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+            setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+        }
+
         if (!send_helo(sock)) {
             ESP_LOGW(TAG, "falha ao enviar HELO");
             close(sock);
@@ -1253,11 +1755,22 @@ void slimproto_get_status(slimproto_status_t *out)
     xSemaphoreGive(s_status_mutex);
 }
 
+int64_t slimproto_get_last_transition_time_us(void)
+{
+    return s_last_session_transition_us;
+}
+
 void slimproto_init(void)
 {
     s_status_mutex = xSemaphoreCreateMutex();
     s_data_mutex = xSemaphoreCreateMutex();
     s_data_sock = -1;
+    /* Binario, criado "vazio" (nao dado) -- correto: na primeiríssima
+     * chamada de start_stream_session() apos o boot nao ha task anterior
+     * nenhuma pra sinalizar, entao o take() la deve mesmo esperar o timeout
+     * inteiro e seguir em frente, igual o vTaskDelay(50) fixo que existia
+     * antes fazia sempre. */
+    s_data_task_exited_sem = xSemaphoreCreateBinary();
     s_ctrl_mutex = xSemaphoreCreateMutex();
     s_ctrl_sock = -1;
 
@@ -1265,9 +1778,53 @@ void slimproto_init(void)
      * I2S -- mesmo motivo do bt_audio.c: evita competir por heap contra
      * WiFi/BT durante o meio de uma sessao de streaming. A task fica viva
      * a vida toda do dispositivo, bloqueada no semaforo quando ociosa. */
-    s_slim_ringbuf = xRingbufferCreate(SLIM_RINGBUF_HIGHEST_WATER_LEVEL, RINGBUF_TYPE_BYTEBUF);
+    s_slim_ringbuf_storage = heap_caps_malloc(SLIM_RINGBUF_HIGHEST_WATER_LEVEL, MALLOC_CAP_SPIRAM);
+    if (s_slim_ringbuf_storage != NULL) {
+        s_slim_ringbuf = xRingbufferCreateStatic(SLIM_RINGBUF_HIGHEST_WATER_LEVEL, RINGBUF_TYPE_BYTEBUF,
+                                                  s_slim_ringbuf_storage, &s_slim_ringbuf_struct);
+    }
     s_slim_i2s_sem = xSemaphoreCreateBinary();
-    xTaskCreate(slim_i2s_task_handler, "slim_i2s", 3072, NULL, 6, NULL);
+    /* Prioridade quase maxima (igual ao bt_i2s_task do bt_audio.c, mesmo
+     * raciocinio) -- confirmado ao vivo em 2026-08-14 que engasgos
+     * ("picotes") continuavam mesmo com RAM/buffers saudaveis; comparar as
+     * duas tasks revelou que o audio do Bluetooth ja usa prioridade quase
+     * maxima (configMAX_PRIORITIES - 3) especificamente pra nao ser
+     * atropelado pela task de WiFi (prioridade 23, fixa do driver), mas
+     * essa aqui (que faz o mesmo trabalho -- drenar o ring buffer pro I2S
+     * em tempo real) ficou esquecida em prioridade 6. Qualquer rajada de
+     * WiFi/BT (coexistencia de radio, visivel nos avisos "wifi:m f null")
+     * podia atrasar essa task tempo suficiente pra estourar a folga do
+     * buffer DMA (~65ms, 12 descritores). */
+    /* Prioridade moderada (7, so 2 acima do decode) -- configMAX_PRIORITIES-3
+     * tentado antes (2026-08-14) causou um sintoma NOVO ("acelera/desacelera")
+     * provavelmente porque, no MESMO nucleo do decode (slim_data, prioridade
+     * 5), uma prioridade quase maxima podia sufocar o proprio decode que
+     * alimenta o ring buffer -- preempcao excessiva no lugar errado. Ainda
+     * mais alta que o decode (garante que drenar o buffer sempre vence
+     * empate), mas sem sufocar quem o enche. */
+    /* REVERTIDO o pin de nucleo junto com slim_data (ver comentario la --
+     * travamento completo do dispositivo em 2026-08-14) -- mantido so o
+     * ganho de prioridade (6->7), independente do pin. */
+    xTaskCreate(slim_i2s_task_handler, "slim_i2s", 3072, NULL, 7, NULL);
 
-    xTaskCreate(slimproto_control_task, "slim_ctrl", 4096, NULL, 4, NULL);
+    /* A task de dados (slim_data) e criada POR FAIXA em start_stream_session(),
+     * nao aqui -- ver o comentario grande la sobre por que uma task
+     * persistente unica (reservando 16KB de RAM interna desde o boot pra
+     * sempre) chegou a afogar o MQTT e o proprio driver de WiFi por falta
+     * de memoria, mesmo antes de qualquer faixa tocar. */
+
+    /* Prioridade 6 (nao 4): igual a task de I2S, e ACIMA da task de dados
+     * (slim_data, prioridade 5). Essa task responde ao heartbeat "strm t"
+     * periodico do servidor (STMt) -- decodificacao FLAC (slim_data,
+     * trabalho pesado de CPU em C++, sem ceder o processador com a mesma
+     * frequencia que o antigo caminho PCM cru cedia) rodando numa
+     * prioridade MAIOR que essa podia atrasar a resposta ao heartbeat o
+     * suficiente pro Music Assistant marcar o player como indisponivel
+     * temporariamente (observado ao vivo: dispositivo "desativado" no MA
+     * mesmo respondendo normal via /api/status, e um reinicio de stream
+     * logo no comeco de uma faixa). O trabalho desta task e sempre curto
+     * (parsear poucos bytes, mandar uma resposta pequena, voltar a
+     * bloquear em recv()), entao rodar numa prioridade alta nao rouba CPU
+     * de ninguem por muito tempo. */
+    xTaskCreate(slimproto_control_task, "slim_ctrl", 4096, NULL, 6, NULL);
 }

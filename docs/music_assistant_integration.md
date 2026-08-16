@@ -16,16 +16,33 @@ de bugs encontrados e corrigidos, tanto no firmware quanto no lado do servidor).
    ativado por padrão (diferente do DLNA, que é carregado automaticamente).
 2. O dispositivo aparece na lista de players assim que envia o primeiro `HELO`.
 
-## ⚠️ Patch necessário no container do Music Assistant (NÃO é persistente)
+## FLAC nativo (decodificado no próprio firmware)
 
 O provider Squeezelite do MA nunca expõe a opção "Output Codec" na UI de configuração do
 player (`get_config_entries()` do provider não inclui `CONF_ENTRY_OUTPUT_CODEC`) — então ele
-sempre usa o default hardcoded, que é **FLAC**. Este firmware só decodifica PCM/WAV, não FLAC,
-então **sem esse patch o Slimproto nunca recebe áudio reproduzível**.
+sempre usa o default hardcoded, que é **FLAC**. Pior: mesmo forçando esse default via patch (ver
+histórico abaixo), um bug real do próprio Music Assistant (`providers/squeezelite/player.py`,
+`_handle_play_url_for_slimplayer()`) extrai o `mime_type` cortando a URL de streaming pelo último
+`.` — mas essa URL não tem extensão de arquivo, só os pontos do IP do servidor, então a extração
+sempre pega lixo e cai no fallback FLAC de qualquer forma, **ignorando por completo** o parâmetro
+`fmt=` da URL. Ou seja: nenhum patch do lado do servidor resolve isso de forma confiável.
 
-**Fix aplicado**: dentro do container do Music Assistant, localizar `CONF_ENTRY_OUTPUT_CODEC`
-no código-fonte do `aioslimproto` (pacote Python instalado no container, arquivo `constants.py`)
-e mudar o `default_value` de `"flac"` para `"wav"`:
+A solução definitiva foi decodificar FLAC direto no dispositivo: `main/slimproto.c` agora aceita
+`format == 'f'` no `strm` (além do `'p'` de PCM/WAV já suportado) e usa o componente
+[`esphome/micro-flac`](https://github.com/esphome/micro-flac) (via `main/flac_stream_decoder.cpp`,
+um wrapper C sobre a API C++ da lib) para decodificar o stream comprimido em tempo real, amostra a
+amostra, direto pro mesmo ring buffer/pipeline de I2S já usado pelo caminho PCM. Buffers de
+entrada/saída do decoder ficam em PSRAM (~33KB de flash a mais, ~0 de RAM interna adicional —
+medido: 91,0% → 92,7% de uso de flash). Resultado prático: **o dispositivo agora toca o que quer
+que o Music Assistant mande, sem depender de nenhuma configuração ou patch no servidor.**
+
+### Histórico: patch flac→wav (não é mais necessário)
+
+Antes da decodificação nativa, a única forma de tocar algo era forçar o servidor a mandar WAV em
+vez de FLAC, editando `CONF_ENTRY_OUTPUT_CODEC` dentro do container em execução (não persistente —
+qualquer recriação do container apagava o patch silenciosamente). Esse patch está obsoleto e não
+precisa mais ser aplicado — mantido aqui só como referência histórica, caso o firmware precise
+voltar a rodar sem suporte a FLAC por algum motivo:
 
 ```sh
 # de dentro do container (ex.: via console do Portainer, ou docker exec):
@@ -37,35 +54,6 @@ print(p)  # confirma o caminho real antes de editar
 # depois de confirmar o caminho:
 sed -i 's/CONF_ENTRY_OUTPUT_CODEC = ConfigEntry(key=CONF_OUTPUT_CODEC, type=ConfigEntryType.STRING, default_value="flac"/CONF_ENTRY_OUTPUT_CODEC = ConfigEntry(key=CONF_OUTPUT_CODEC, type=ConfigEntryType.STRING, default_value="wav"/' <caminho-de-constants.py>
 ```
-
-Ajuste o `sed` para o texto exato encontrado na versão instalada — o nome do arquivo e a
-assinatura exata de `ConfigEntry` podem variar entre versões do `aioslimproto`. O importante é
-localizar a definição de `CONF_ENTRY_OUTPUT_CODEC` e trocar `default_value="flac"` por
-`default_value="wav"`, depois reiniciar o container do Music Assistant.
-
-**Por que isso precisa ser redocumentado aqui:** esse patch edita um arquivo Python **dentro do
-container em execução** — não é um volume montado, não é uma imagem customizada. Qualquer
-recriação do container (`docker compose up --force-recreate`, atualização de imagem, reinstalação)
-**apaga o patch silenciosamente**, e o sintoma volta a ser "Music Assistant mostra tocando, mas
-nenhum áudio chega no dispositivo" — sem nenhum erro óbvio nos logs do firmware (o Slimproto
-simplesmente nunca recebe um `strm` com formato que ele aceite).
-
-### TODO: tornar o patch persistente
-
-Ainda não implementado — opções a avaliar quando isso for revisitado:
-
-- **Imagem customizada**: `Dockerfile` próprio com `FROM ghcr.io/music-assistant/server:<tag>` +
-  um `RUN sed -i ...` no build, versionado neste repo (ex.: `docker/music-assistant.Dockerfile`).
-- **Patch na inicialização**: script de entrypoint customizado que aplica o `sed` toda vez que o
-  container sobe, antes do processo principal — mais simples de manter que uma imagem própria,
-  mas ainda depende de reconstruir/trocar a imagem de deploy.
-- **Contribuir a correção upstream**: abrir uma issue/PR no Music Assistant expondo
-  `CONF_ENTRY_OUTPUT_CODEC` na config do provider Squeezelite (a causa raiz real) — eliminaria a
-  necessidade do patch por completo, mas depende do time do MA aceitar.
-
-Até isso ser feito, **depois de qualquer atualização/recriação do container do Music Assistant,
-reaplicar o patch acima antes de testar o Slimproto** — se o áudio parar de chegar sem motivo
-aparente, este é o primeiro lugar a checar.
 
 ## Status ("o que está tocando") e controle (play/pause/próxima/anterior)
 
@@ -119,9 +107,11 @@ novo em Configurações.
 ## Diagnóstico sem precisar de serial
 
 O firmware expõe `GET /api/logs` (últimas 100 entradas do log interno) — inclui, para cada troca
-de faixa: número de sessão, chunks WAV parseados (`fmt `, `data`, taxa/bits/canais reais) e
-qualquer pacote descartado por sessão superada. Suficiente para depurar a maioria dos problemas
-de reprodução sem precisar abrir a serial (que reseta o dispositivo de forma não confiável — ver
+de faixa: número de sessão, formato recebido (`strm ... format='p'` ou `format='f'`), chunks WAV
+parseados (`fmt `, `data`, taxa/bits/canais reais) ou, no caminho FLAC, a linha "FLAC iniciado (N
+Hz, N bits, N canal(is))" assim que o STREAMINFO é decodificado, além de qualquer pacote
+descartado por sessão superada. Suficiente para depurar a maioria dos problemas de reprodução sem
+precisar abrir a serial (que reseta o dispositivo de forma não confiável — ver
 `feedback_verify_upload_took_effect`).
 
 ## DLNA (`dlna_renderer.c`) — status

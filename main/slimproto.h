@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Cliente Slimproto (protocolo do Squeezebox/Logitech Media Server) —
  * alternativa ao DLNA (ver dlna_renderer.h) para integrar com o Music
@@ -26,3 +27,11 @@ typedef struct {
 void slimproto_init(void);
 
 void slimproto_get_status(slimproto_status_t *out);
+
+/* Instante (esp_timer_get_time(), microssegundos) da última transição de
+ * sessão de dados (troca de faixa, natural ou via comando) -- usado por
+ * lms_cli.c pra dar uma folga antes de abrir sua própria conexão TCP nova
+ * se uma transição acabou de acontecer, reduzindo a janela de concorrência
+ * entre as duas operações de socket disputando as estruturas internas do
+ * lwIP ao mesmo tempo. Retorna 0 se nenhuma transição aconteceu ainda. */
+int64_t slimproto_get_last_transition_time_us(void);

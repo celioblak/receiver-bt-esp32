@@ -45,6 +45,22 @@ CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 # interna — era exatamente a causa dos crashes por heap fragmentado/exaurido
 # durante o A2DP com MQTT ativo, antes de descobrirmos a PSRAM.
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# NAO habilitar CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY: chegamos a ligar
+# essa opcao achando que moveria o stack da task do decoder FLAC (slim_data,
+# main/slimproto.c) pra PSRAM, poupando RAM interna. Confirmado via
+# documentacao oficial da Espressif (guia de RAM externa) que xTaskCreate()
+# -- a funcao dinamica que usamos -- SEMPRE aloca o stack da RAM interna,
+# nao importa esse Kconfig; so xTaskCreateStatic() com buffer alocado
+# manualmente em PSRAM consegue isso de verdade. E pior: fazer isso de
+# verdade seria a direcao ERRADA pra uma task que chama codigo de rede/ROM
+# (sockets lwIP) -- o cache que da acesso a PSRAM fica desligado durante
+# qualquer escrita de flash/NVS por QUALQUER task do sistema, entao um stack
+# de execucao em PSRAM pode "crashar" (excecao de acesso a cache invalido)
+# bem no meio de uma chamada, de forma intermitente e dificil de reproduzir.
+# Confirmado tambem no codigo-fonte do squeezelite-esp32 (sle118, referencia
+# ja usada neste projeto pra pinagem): a task de decode deles usa 16KB de
+# RAM interna (embedded.h, DECODE_THREAD_STACK_SIZE), nunca PSRAM -- PSRAM
+# la (como aqui) e so pra BUFFERS DE DADOS, nunca pro stack de uma task.
 
 # Sem essas duas, IRAM estoura com BT (Bluedroid) + Wi-Fi + mDNS juntos.
 # Custo: leve aumento no consumo de energia em modo power-save do Wi-Fi
@@ -72,6 +88,36 @@ CONFIG_MBEDTLS_TLS_SERVER=n
 
 # --- FreeRTOS ---
 CONFIG_FREERTOS_HZ=1000
+
+# --- Task "main" (app_main, loop principal) ---
+# Confirmado ao vivo (2026-08-14, captura serial): "***ERROR*** A stack
+# overflow in task main has been detected" -- duas vezes seguidas, poucos
+# segundos depois do boot, assim que MQTT/Slimproto/AGC/watchdog de rede
+# comecaram a rodar juntos de verdade (mqtt_ha_publish_state() e
+# network_watchdog_check(), chamados a cada 30s no loop de main.c, tem
+# varios buffers locais e chamadas aninhadas -- nunca auditados de perto
+# porque toda a investigacao de stack de hoje mirou a task slim_data do
+# decoder FLAC, nao a task main). O padrao (default do ESP-IDF) e so 3584
+# bytes -- pequeno demais pro que essa task faz hoje em dia. Task unica e
+# permanente (nao por-faixa), entao aumentar aqui e igual ao raciocinio ja
+# usado pro stack estatico do slim_data: seguro, sem fragmentacao.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# --- CPU ---
+# Confirmado ao vivo (2026-08-14) que a decodificacao FLAC + rede nao
+# sustentam o ritmo real de audio: o nivel do ring buffer (log de diagnostico
+# temporario) caiu de forma CONTINUA e SUSTENTADA (79KB -> 0KB em ~5-9s, todo
+# ciclo, nao um soluco isolado) durante reproducao normal. O boot log mostrava
+# "cpu freq: 160000000 Hz" -- 160MHz, nao os 240MHz maximos do ESP32 -- sem
+# nenhuma decisao documentada pra isso (nao aparecia em lugar nenhum deste
+# arquivo antes, provavelmente so o default que sobrou da config do board).
+# Decodificar FLAC e trabalho pesado de CPU; 160MHz tira ~33% do poder de
+# processamento disponivel comparado ao maximo. Aumentar pra 240MHz custa so
+# mais energia (irrelevante aqui, fonte externa) e mais um pouco de calor --
+# sem downside conhecido pro nosso caso de uso.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
 
 # --- Flash ---
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

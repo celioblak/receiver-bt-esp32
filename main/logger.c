@@ -1,11 +1,22 @@
 #include "logger.h"
 
 #include <string.h>
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-static log_entry_t s_entries[LOGGER_MAX_ENTRIES];
+/* LOGGER_MAX_ENTRIES(100) * sizeof(log_entry_t)(~144 bytes) = ~14KB -- so
+ * dados (nunca stack de execucao), lidos/escritos so via logger_log()/
+ * logger_get_entries() com mutex, entao seguro em PSRAM. Antes era um
+ * array static (RAM interna, direto no .bss) -- de longe o maior
+ * consumidor unico de RAM interna permanente que achamos ao vasculhar o
+ * firmware atras de folga (ver memoria project_wifi_instability_
+ * unresolved: RAM interna cronica em ~9-16KB depois do stack estatico do
+ * decoder FLAC). Alocado uma vez em logger_init(), que roda bem no inicio
+ * do app_main() -- PSRAM ja esta no pool do heap allocator nesse ponto
+ * (mapeada durante cpu_start, antes de app_main ser chamado). */
+static log_entry_t *s_entries = NULL;
 static size_t s_head = 0;   /* índice da próxima escrita */
 static size_t s_count = 0;  /* quantidade de entradas válidas */
 static SemaphoreHandle_t s_mutex = NULL;
@@ -14,6 +25,9 @@ void logger_init(void)
 {
     if (s_mutex == NULL) {
         s_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_entries == NULL) {
+        s_entries = heap_caps_malloc(sizeof(log_entry_t) * LOGGER_MAX_ENTRIES, MALLOC_CAP_SPIRAM);
     }
     s_head = 0;
     s_count = 0;
@@ -37,7 +51,7 @@ void logger_log(esp_log_level_t level, const char *tag, const char *fmt, ...)
         default: break;
     }
 
-    if (s_mutex == NULL) {
+    if (s_mutex == NULL || s_entries == NULL) {
         return;
     }
 
@@ -58,7 +72,7 @@ void logger_log(esp_log_level_t level, const char *tag, const char *fmt, ...)
 
 size_t logger_get_entries(log_entry_t *out_buf, size_t max_entries)
 {
-    if (s_mutex == NULL) {
+    if (s_mutex == NULL || s_entries == NULL) {
         return 0;
     }
 

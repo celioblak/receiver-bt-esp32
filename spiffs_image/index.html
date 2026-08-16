@@ -43,8 +43,8 @@
     </div>
 
     <div class="card">
-        <label for="volume">Volume</label>
-        <input type="range" id="volume" min="0" max="200" value="140">
+        <label for="volume">Volume <span id="volume-value">70</span></label>
+        <input type="range" id="volume" min="0" max="100" value="70" title="70">
     </div>
 
     <div class="card">
@@ -60,8 +60,14 @@
 <script>
 let volumeDragging = false;
 
+function setVolumeDisplay(v) {
+    document.getElementById("volume-value").textContent = v;
+    document.getElementById("volume").title = v;
+}
+
 document.getElementById("volume").addEventListener("input", (e) => {
     volumeDragging = true;
+    setVolumeDisplay(e.target.value);
 });
 document.getElementById("volume").addEventListener("change", async (e) => {
     await apiPost("/api/volume", { volume: parseInt(e.target.value, 10) });
@@ -117,6 +123,7 @@ async function refresh() {
 
         if (!volumeDragging) {
             document.getElementById("volume").value = s.volume;
+            setVolumeDisplay(s.volume);
         }
         document.getElementById("wifi-ip").textContent = s.wifi_ip || "sem rede";
         document.getElementById("device-mac").textContent = s.device_mac;

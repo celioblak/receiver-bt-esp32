@@ -144,8 +144,23 @@ esp_err_t audio_codec_set_volume(int volume)
         } else if (volume > VOLUME_STEPS) {
             volume = VOLUME_STEPS;
         }
-        s_current_volume = volume;
-        storage_set_i32(NVS_KEY_VOLUME_USER, volume);
+        /* So grava na NVS se o valor de fato mudou -- achado ao vivo
+         * (2026-08-16): handle_audg() em slimproto.c chama esta funcao toda
+         * vez que o Music Assistant manda um "audg" (sincronizacao de
+         * volume, visto nos logs acontecendo perto de reconexoes/trocas de
+         * faixa), MESMO quando o volume nao mudou de verdade -- gravando na
+         * NVS sem necessidade a cada vez. Uma escrita na flash desliga o
+         * cache por um instante; se isso coincidir com outra task tocando
+         * PSRAM (nossos ring buffers de audio) ou no meio de uma operacao
+         * de rede (lwIP), da exatamente o tipo de crash "Cache disabled but
+         * cached memory region accessed" capturado ao vivo essa noite
+         * durante uma rajada de pulo de faixa. Nao elimina o mecanismo por
+         * completo (uma mudanca de volume real ainda grava), mas corta a
+         * fonte mais frequente e desnecessaria dessas escritas. */
+        if (volume != s_current_volume) {
+            s_current_volume = volume;
+            storage_set_i32(NVS_KEY_VOLUME_USER, volume);
+        }
         bt_audio_notify_volume_changed(volume);
     }
     return err;

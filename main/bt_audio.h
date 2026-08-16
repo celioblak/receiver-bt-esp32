@@ -63,6 +63,16 @@ esp_err_t bt_audio_media_control(const char *cmd);
 void bt_audio_set_discoverable(bool discoverable);
 bool bt_audio_get_discoverable(void);
 
+/* Liga o "descobrivel" por um tempo limitado (nao grava no NVS -- some
+ * sozinho, nao sobrevive a um reboot por design), pra permitir parear um
+ * aparelho novo sem deixar a varredura periodica de radio do BT ligada o
+ * tempo todo (ela disputa CPU/radio com a decodificacao de audio -- ver
+ * memoria do projeto sobre engasgo). Chamar de novo estende o prazo.
+ * bt_audio_check_discoverable_timeout() precisa ser chamada periodicamente
+ * (main.c) pra desligar sozinho quando o prazo vencer. */
+void bt_audio_enable_discoverable_temporary(uint32_t duration_s);
+void bt_audio_check_discoverable_timeout(void);
+
 /* true = novos pareamentos exigem "Passkey Entry": um codigo de 6 digitos
  * gerado na hora e mostrado em /api/status (pending_pin_code), que a
  * pessoa deve digitar no celular. Dispositivos ja pareados nao sao
