@@ -142,10 +142,28 @@ async function refresh() {
         document.getElementById("media-prev").style.display = skipDisplay;
         document.getElementById("media-next").style.display = skipDisplay;
 
+        /* O badge segue o ESTADO REAL do transporte, nao a assinatura de
+         * eventos. Erro anterior: usava dlna_subscribed, e como o Music
+         * Assistant nem sempre assina o eventing (ele funciona por polling
+         * tambem), a pagina mostrava "inativo" com a musica tocando.
+         * dlna_subscribed continua no /api/status, mas so pra diagnostico. */
         const dlnaBadge = document.getElementById("dlna-badge");
-        const dlnaLabels = { playing: "tocando", paused: "pausado", stopped: "conectado" };
-        dlnaBadge.textContent = s.dlna_subscribed ? (dlnaLabels[s.dlna_state] || "conectado") : "inativo";
-        dlnaBadge.className = "badge " + (s.dlna_subscribed ? "on" : "off");
+        let dlnaTexto, dlnaAtivoBadge;
+        if (s.dlna_state === "playing") {
+            dlnaTexto = "tocando";
+            dlnaAtivoBadge = true;
+        } else if (s.dlna_state === "paused") {
+            dlnaTexto = "pausado";
+            dlnaAtivoBadge = true;
+        } else if (s.dlna_client_ip) {
+            dlnaTexto = "conectado"; /* control point ja falou com a gente, mas parado */
+            dlnaAtivoBadge = true;
+        } else {
+            dlnaTexto = "inativo";
+            dlnaAtivoBadge = false;
+        }
+        dlnaBadge.textContent = dlnaTexto;
+        dlnaBadge.className = "badge " + (dlnaAtivoBadge ? "on" : "off");
         const dlnaRow = document.getElementById("dlna-device-row");
         if (s.dlna_client_ip) {
             document.getElementById("dlna-client-ip").textContent =
