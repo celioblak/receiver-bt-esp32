@@ -30,6 +30,7 @@ static const char *TAG = "mqtt_ha";
 #define TOPIC_CMD_VOLUME        "homeassistant/receiver_bt/cmd/volume"
 #define TOPIC_CMD_AGC_ENABLED   "homeassistant/receiver_bt/cmd/agc_enabled"
 #define TOPIC_CMD_DISCOVERABLE  "homeassistant/receiver_bt/cmd/bt_discoverable"
+#define TOPIC_CMD_PAIRING_MODE  "homeassistant/receiver_bt/cmd/bt_pairing_mode"
 #define TOPIC_CMD_REQUIRE_PIN   "homeassistant/receiver_bt/cmd/bt_require_pin"
 #define TOPIC_CMD_DISCONNECT    "homeassistant/receiver_bt/cmd/disconnect"
 #define TOPIC_CMD_RELAY_TIMEOUT "homeassistant/receiver_bt/cmd/relay_timeout"
@@ -286,6 +287,17 @@ static void publish_all_discovery_configs(void)
     publish_button_discovery("receiver_bt_pause", "Receiver BT Pause", TOPIC_CMD_MEDIA, "pause");
     publish_button_discovery("receiver_bt_next", "Receiver BT Proxima", TOPIC_CMD_MEDIA, "next");
     publish_button_discovery("receiver_bt_previous", "Receiver BT Anterior", TOPIC_CMD_MEDIA, "previous");
+
+    /* Janela de pareamento: o Bluetooth deixou de ficar visivel o tempo todo
+     * (ver DEFAULT_BT_DISCOVERABLE em config.h), entao o Home Assistant
+     * precisa de um jeito de abrir a janela e de ver quanto tempo resta. */
+    publish_button_discovery("receiver_bt_pairing", "Receiver BT Permitir Pareamento",
+                              TOPIC_CMD_PAIRING_MODE, "start");
+    publish_button_discovery("receiver_bt_pairing_stop", "Receiver BT Encerrar Pareamento",
+                              TOPIC_CMD_PAIRING_MODE, "stop");
+    publish_generic_sensor_discovery("receiver_bt_pairing_remaining",
+                                      "Receiver BT Pareamento Restante",
+                                      "{{ value_json.bt_discoverable_remaining_s }}");
 }
 
 static void subscribe_commands(void)
@@ -301,6 +313,7 @@ static void subscribe_commands(void)
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_VOLUME, 1);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_AGC_ENABLED, 1);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCOVERABLE, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_PAIRING_MODE, 1);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_REQUIRE_PIN, 1);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCONNECT, 1);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_RELAY_TIMEOUT, 1);
@@ -361,6 +374,16 @@ static void handle_command(esp_mqtt_event_handle_t event)
         audio_codec_set_volume((novo * VOLUME_STEPS) / 100);
     } else if (topic_is(event, TOPIC_CMD_AGC_ENABLED)) {
         audio_agc_enable(strcmp(payload, "1") == 0);
+    } else if (topic_is(event, TOPIC_CMD_PAIRING_MODE)) {
+        /* "stop" encerra antes do prazo; qualquer outro payload ("start", ou
+         * um numero de segundos) abre a janela. */
+        if (strcmp(payload, "stop") == 0) {
+            bt_audio_stop_discoverable_temporary();
+        } else {
+            int segundos = atoi(payload); /* 0 se vier "start" */
+            bt_audio_enable_discoverable_temporary(segundos > 0 ? (uint32_t)segundos
+                                                                : DEFAULT_BT_PAIRING_WINDOW_S);
+        }
     } else if (topic_is(event, TOPIC_CMD_DISCOVERABLE)) {
         bt_audio_set_discoverable(strcmp(payload, "1") == 0);
     } else if (topic_is(event, TOPIC_CMD_REQUIRE_PIN)) {
@@ -534,6 +557,10 @@ void mqtt_ha_publish_state(void)
     cJSON_AddNumberToObject(root, "agc_target", audio_agc_get_target());
     cJSON_AddNumberToObject(root, "agc_mode", audio_agc_get_mode());
     cJSON_AddBoolToObject(root, "bt_discoverable", bt_audio_get_discoverable());
+    /* Tempo restante da janela de pareamento (0 = sem janela: desligado ou
+     * visibilidade permanente) -- alimenta o sensor "Pareamento Restante". */
+    cJSON_AddNumberToObject(root, "bt_discoverable_remaining_s",
+                            bt_audio_get_discoverable_remaining_s());
     cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
     cJSON_AddStringToObject(root, "connected_device", connected_device);
     cJSON_AddNumberToObject(root, "paired_count", (double)paired_count);

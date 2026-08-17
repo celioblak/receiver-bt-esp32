@@ -163,6 +163,10 @@ static esp_err_t api_status_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "wifi_ip", ip);
     cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
     cJSON_AddBoolToObject(root, "bt_discoverable", bt_audio_get_discoverable());
+    /* Segundos restantes da janela de pareamento. 0 com bt_discoverable=true
+     * significa visibilidade PERMANENTE (nao ha prazo pra contar). */
+    cJSON_AddNumberToObject(root, "bt_discoverable_remaining_s",
+                            bt_audio_get_discoverable_remaining_s());
     cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
     cJSON_AddStringToObject(root, "pending_pin_mac", bt.pending_pin_mac);
     cJSON_AddStringToObject(root, "pending_pin_code", bt.pending_pin_code);
@@ -484,17 +488,27 @@ static esp_err_t api_bt_pairing_mode_post(httpd_req_t *req)
     if (root == NULL) {
         return ESP_FAIL;
     }
-    uint32_t duration_s = 180;
+    uint32_t duration_s = DEFAULT_BT_PAIRING_WINDOW_S;
     cJSON *item = cJSON_GetObjectItem(root, "duration_s");
     if (cJSON_IsNumber(item) && item->valueint > 0) {
         duration_s = (uint32_t)item->valueint;
     }
+    /* "stop": encerra a janela antes do prazo (botao "Encerrar agora"). */
+    cJSON *stop = cJSON_GetObjectItem(root, "stop");
+    bool encerrar = cJSON_IsTrue(stop);
     cJSON_Delete(root);
-    bt_audio_enable_discoverable_temporary(duration_s);
+
+    if (encerrar) {
+        bt_audio_stop_discoverable_temporary();
+        duration_s = 0;
+    } else {
+        bt_audio_enable_discoverable_temporary(duration_s);
+    }
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", true);
     cJSON_AddNumberToObject(resp, "duration_s", duration_s);
+    cJSON_AddNumberToObject(resp, "remaining_s", bt_audio_get_discoverable_remaining_s());
     return send_json(req, resp);
 }
 

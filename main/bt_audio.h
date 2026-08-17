@@ -73,6 +73,17 @@ bool bt_audio_get_discoverable(void);
 void bt_audio_enable_discoverable_temporary(uint32_t duration_s);
 void bt_audio_check_discoverable_timeout(void);
 
+/* Segundos que faltam na janela temporaria, pra interface mostrar contagem
+ * regressiva. Devolve 0 quando NAO ha janela em andamento -- tanto no caso
+ * "desligado" quanto no caso "visivel de forma permanente" (esse ultimo nao
+ * tem prazo pra contar). Ou seja: bt_discoverable=true com restante 0
+ * significa permanente. */
+uint32_t bt_audio_get_discoverable_remaining_s(void);
+
+/* Encerra a janela temporaria antes do prazo. Sem efeito se a visibilidade
+ * for permanente (aquela vem do NVS e se desliga por bt_audio_set_discoverable). */
+void bt_audio_stop_discoverable_temporary(void);
+
 /* true = novos pareamentos exigem "Passkey Entry": um codigo de 6 digitos
  * gerado na hora e mostrado em /api/status (pending_pin_code), que a
  * pessoa deve digitar no celular. Dispositivos ja pareados nao sao

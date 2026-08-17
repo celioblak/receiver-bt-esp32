@@ -63,7 +63,18 @@
 #define DEFAULT_RELAY_TIMEOUT_S 30      /* segundos sem PLAYING até desligar o ampli */
 #define RELAY_SILENCE_DEBOUNCE_S 2      /* ignora pausas curtas entre faixas */
 
-#define DEFAULT_BT_DISCOVERABLE 1  /* 1 = aparece na busca de dispositivos de quem ainda não pareou */
+/* 0 = NÃO aparece na busca de aparelhos novos por padrão; para parear, abre-se
+ * uma janela temporária ("Permitir pareamento", ver
+ * bt_audio_enable_discoverable_temporary / DEFAULT_BT_PAIRING_WINDOW_S).
+ * Aparelhos JÁ pareados continuam conectando normalmente -- isso é
+ * "connectable", que segue sempre ligado. Era 1 (visível para sempre), o que
+ * mantinha a varredura periódica de rádio do BT ativa o tempo todo disputando
+ * CPU/rádio com a decodificação de áudio (ver memória do projeto sobre
+ * engasgo), além de deixar o aparelho pareável por qualquer um indefinidamente. */
+#define DEFAULT_BT_DISCOVERABLE 0
+
+/* Duração padrão da janela de pareamento, em segundos. */
+#define DEFAULT_BT_PAIRING_WINDOW_S 180
 #define DEFAULT_BT_REQUIRE_PIN  0  /* 1 = exige passkey de 6 dígitos (mostrado na página Dispositivos) para novos pareamentos */
 
 /* -------------------------------------------------------------------------

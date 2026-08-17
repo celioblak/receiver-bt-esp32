@@ -39,6 +39,21 @@ static volatile bool s_discoverable = DEFAULT_BT_DISCOVERABLE;
 /* 0 = nenhuma janela temporaria de descobrivel ativa. Ver bt_audio_enable_
  * discoverable_temporary()/bt_audio_check_discoverable_timeout(). */
 static volatile int64_t s_discoverable_temp_deadline_us = 0;
+/* Estado de visibilidade de ANTES da janela temporaria, pra restaurar quando
+ * ela terminar. Sem isso a janela apagava em runtime uma visibilidade
+ * PERMANENTE que estivesse ligada: ao expirar, s_discoverable ia pra false
+ * mesmo com o NVS dizendo true -- o aparelho sumia da busca sem ninguem ter
+ * pedido, e voltava sozinho no proximo reboot (inconsistencia flagrada em
+ * auto-teste). */
+static volatile bool s_discoverable_before_temp = false;
+/* Timer de disparo unico que fecha a janela no instante exato. Antes isso
+ * dependia so de bt_audio_check_discoverable_timeout() chamada pelo loop de
+ * main.c, que roda a cada 30s DE PROPOSITO (cada publicacao MQTT e atividade
+ * de radio, que acopla ruido audivel no ES8388 -- ver comentario la). Efeito
+ * flagrado em auto-teste: uma janela de 10s continuava visivel bem depois do
+ * prazo, e a contagem exibia "0s restantes" enquanto o aparelho ainda estava
+ * pareavel. A checagem no loop continua existindo como rede de seguranca. */
+static esp_timer_handle_t s_discoverable_timer = NULL;
 static volatile bool s_require_pin = DEFAULT_BT_REQUIRE_PIN;
 
 /* -------------------------------------------------------------------------
@@ -706,7 +721,13 @@ esp_err_t bt_audio_media_control(const char *cmd)
 
 void bt_audio_set_discoverable(bool discoverable)
 {
-    s_discoverable_temp_deadline_us = 0; /* toggle manual/permanente cancela qualquer janela temporaria pendente */
+    /* Toggle manual/permanente cancela qualquer janela temporaria pendente --
+     * inclusive desarmando o timer, senao ele dispararia depois e restauraria
+     * o estado anterior por cima da escolha que acabou de ser feita aqui. */
+    s_discoverable_temp_deadline_us = 0;
+    if (s_discoverable_timer != NULL) {
+        esp_timer_stop(s_discoverable_timer);
+    }
     s_discoverable = discoverable;
     storage_set_i32(NVS_KEY_BT_DISCOVERABLE, discoverable ? 1 : 0);
     /* So aplica na hora se nao tiver ninguem conectado -- enquanto
@@ -726,9 +747,61 @@ bool bt_audio_get_discoverable(void)
     return s_discoverable;
 }
 
+/* Fecha a janela e devolve a visibilidade ao que era antes dela. Chamada pelo
+ * timer (caminho normal), pela checagem do loop de main.c (rede de seguranca)
+ * e pelo encerramento manual. */
+static void discoverable_window_close(const char *motivo)
+{
+    if (s_discoverable_temp_deadline_us == 0) {
+        return; /* nenhuma janela ativa */
+    }
+    s_discoverable_temp_deadline_us = 0;
+    /* Restaura o que havia ANTES da janela (o NVS nunca foi escrito por ela).
+     * Normalmente false; mas se a visibilidade permanente estava ligada, ela
+     * continua ligada -- a janela nao deve revogar configuracao do usuario. */
+    s_discoverable = s_discoverable_before_temp;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    bool connected = s_status.connected;
+    xSemaphoreGive(s_status_mutex);
+    if (!connected) {
+        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
+                                  s_discoverable ? ESP_BT_GENERAL_DISCOVERABLE
+                                                 : ESP_BT_NON_DISCOVERABLE);
+    }
+    logger_log(ESP_LOG_INFO, TAG, "bt_audio: janela de pareamento encerrada (%s, visivel=%d)",
+               motivo, (int)s_discoverable);
+}
+
+static void discoverable_timer_cb(void *arg)
+{
+    (void)arg;
+    discoverable_window_close("prazo");
+}
+
 void bt_audio_enable_discoverable_temporary(uint32_t duration_s)
 {
+    /* Guarda o estado anterior so na PRIMEIRA abertura -- chamar de novo pra
+     * estender o prazo nao pode sobrescrever o valor salvo por "true". */
+    if (s_discoverable_temp_deadline_us == 0) {
+        s_discoverable_before_temp = s_discoverable;
+    }
     s_discoverable_temp_deadline_us = esp_timer_get_time() + (int64_t)duration_s * 1000000LL;
+
+    /* Timer de disparo unico pro instante exato do fim (ver comentario em
+     * s_discoverable_timer). Recriar prazo cancela o anterior. */
+    if (s_discoverable_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = discoverable_timer_cb,
+            .name = "bt_disc_win",
+        };
+        if (esp_timer_create(&args, &s_discoverable_timer) != ESP_OK) {
+            s_discoverable_timer = NULL; /* segue so com a checagem do loop */
+        }
+    }
+    if (s_discoverable_timer != NULL) {
+        esp_timer_stop(s_discoverable_timer); /* sem efeito se nao estiver armado */
+        esp_timer_start_once(s_discoverable_timer, (uint64_t)duration_s * 1000000ULL);
+    }
     /* Igual a bt_audio_set_discoverable(true), mas SEM persistir no NVS --
      * de proposito: se o dispositivo reiniciar no meio da janela, volta pro
      * padrao persistido (normalmente false), nao fica preso "descobrivel"
@@ -745,24 +818,36 @@ void bt_audio_enable_discoverable_temporary(uint32_t duration_s)
 
 void bt_audio_check_discoverable_timeout(void)
 {
+    /* Rede de seguranca: o caminho normal e o timer de disparo unico. Isto so
+     * pega o caso de o timer nao ter sido criado (falta de recurso). */
+    int64_t deadline = s_discoverable_temp_deadline_us;
+    if (deadline == 0 || esp_timer_get_time() < deadline) {
+        return;
+    }
+    discoverable_window_close("prazo (verificacao periodica)");
+}
+
+uint32_t bt_audio_get_discoverable_remaining_s(void)
+{
     int64_t deadline = s_discoverable_temp_deadline_us;
     if (deadline == 0 || !s_discoverable) {
-        return; /* nenhuma janela temporaria ativa, ou ja foi desligado por outro caminho */
+        return 0; /* visivel de forma permanente, ou desligado -- sem contagem */
     }
-    if (esp_timer_get_time() < deadline) {
-        return; /* ainda dentro do prazo */
+    int64_t restante = deadline - esp_timer_get_time();
+    if (restante <= 0) {
+        return 0; /* expirou; bt_audio_check_discoverable_timeout() ja vai desligar */
     }
-    s_discoverable_temp_deadline_us = 0;
-    /* NVS ja reflete o padrao persistido (false, nunca foi escrito true por
-     * esta janela temporaria) -- so precisa desfazer o efeito em runtime. */
-    s_discoverable = false;
-    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-    bool connected = s_status.connected;
-    xSemaphoreGive(s_status_mutex);
-    if (!connected) {
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    /* Arredonda pra cima: mostrar "0s restantes" enquanto ainda esta visivel
+     * seria enganoso na interface. */
+    return (uint32_t)((restante + 999999) / 1000000);
+}
+
+void bt_audio_stop_discoverable_temporary(void)
+{
+    if (s_discoverable_timer != NULL) {
+        esp_timer_stop(s_discoverable_timer);
     }
-    logger_log(ESP_LOG_INFO, TAG, "bt_audio: janela de descobrivel temporario expirou, desligando");
+    discoverable_window_close("manual");
 }
 
 void bt_audio_set_require_pin(bool require_pin)
