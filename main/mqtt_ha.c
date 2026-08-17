@@ -349,8 +349,16 @@ static void handle_command(esp_mqtt_event_handle_t event)
             }
         }
     } else if (topic_is(event, TOPIC_CMD_VOLUME)) {
-        /* payload chega em 0-100 (ver publish_number_discovery acima) */
-        audio_codec_set_volume((atoi(payload) * VOLUME_STEPS) / 100);
+        /* payload chega em 0-100 (ver publish_number_discovery acima).
+         * Loga a origem: mudanca de volume vinda de fora era invisivel no
+         * log, o que fez parecer que o volume "nao persistia" apos reset --
+         * ele persiste (NVS), mas era sobrescrito por quem controla. */
+        int novo = atoi(payload);
+        int antes = (audio_codec_get_volume() * 100 + VOLUME_STEPS / 2) / VOLUME_STEPS;
+        if (antes != novo) {
+            logger_log(ESP_LOG_INFO, TAG, "volume via MQTT: %d -> %d", antes, novo);
+        }
+        audio_codec_set_volume((novo * VOLUME_STEPS) / 100);
     } else if (topic_is(event, TOPIC_CMD_AGC_ENABLED)) {
         audio_agc_enable(strcmp(payload, "1") == 0);
     } else if (topic_is(event, TOPIC_CMD_DISCOVERABLE)) {

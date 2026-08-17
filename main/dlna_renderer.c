@@ -2072,6 +2072,16 @@ static esp_err_t renderingcontrol_control_handler(httpd_req_t *req)
         char val[16];
         if (extract_xml_tag(body, "DesiredVolume", val, sizeof(val))) {
             int upnp_vol = atoi(val); /* 0-100 */
+            /* Loga a origem: sem isso, uma mudanca de volume vinda do control
+             * point era INVISIVEL no log -- e foi exatamente o que confundiu o
+             * diagnostico de "o volume nao persiste apos reset". Ele persiste
+             * (fica na NVS, ver audio_codec.c); o que acontece e o control
+             * point mandar o valor que ELE guarda alguns segundos depois do
+             * boot, sobrescrevendo o nosso. */
+            int antes = (audio_codec_get_volume() * 100 + VOLUME_STEPS / 2) / VOLUME_STEPS;
+            if (antes != upnp_vol) {
+                logger_log(ESP_LOG_INFO, TAG, "SetVolume do control point: %d -> %d", antes, upnp_vol);
+            }
             audio_codec_set_volume((upnp_vol * VOLUME_STEPS) / 100);
         }
         soap_respond(req, "urn:schemas-upnp-org:service:RenderingControl:1", "SetVolume", NULL);
