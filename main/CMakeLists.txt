@@ -5,6 +5,6 @@ idf_component_register(
          "flac_stream_decoder.cpp"
     INCLUDE_DIRS "."
     REQUIRES nvs_flash esp_timer driver bt esp_wifi esp_netif esp_event mdns
-             esp_http_server spiffs cjson mqtt app_update lwip
+             esp_http_server esp_http_client spiffs cjson mqtt app_update lwip
     PRIV_REQUIRES esphome__micro-flac
 )

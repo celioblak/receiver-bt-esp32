@@ -132,5 +132,12 @@ CONFIG_SPIFFS_USE_MAGIC_LENGTH=y
 # 10 estoura fácil (visto em log: "httpd_accept_conn: error in accept
 # (23)" = ENFILE, sem socket livre pra aceitar conexao nova) assim que
 # algum control point DLNA abre varias conexoes seguidas buscando os XMLs
-# de descricao/SCPD.
-CONFIG_LWIP_MAX_SOCKETS=16
+# de descricao/SCPD. Subido de 10 pra 16 nessa mesma investigacao -- e
+# ainda ESTOUROU de novo (mesmo erro, ao vivo) depois que o Pause/Play
+# real do DLNA passou a MANTER a conexao HTTP de busca aberta durante uma
+# pausa (antes, pausar fechava a conexao na hora, liberando o socket; agora
+# fica reservado por todo o tempo pausado). 16 ainda nao e suficiente sob
+# uma rajada de comandos do MA (Stop/SetAVTransportURI/Play repetidos) --
+# subindo pra 24 (custo de RAM irrisorio, ~200-400 bytes por socket extra,
+# sobra de PSRAM de sobra neste projeto).
+CONFIG_LWIP_MAX_SOCKETS=24

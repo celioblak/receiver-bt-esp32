@@ -22,6 +22,18 @@
             <span id="bt-device-name">—</span>
         </div>
         <div class="row">
+            <span class="label">DLNA</span>
+            <span class="badge off" id="dlna-badge">inativo</span>
+        </div>
+        <div class="row" id="dlna-device-row" style="display:none">
+            <span class="label">Control point</span>
+            <span id="dlna-client-ip">—</span>
+        </div>
+        <div class="row" id="dlna-position-row" style="display:none">
+            <span class="label">Posição</span>
+            <span id="dlna-position">—</span>
+        </div>
+        <div class="row">
             <span class="label">Amplificador</span>
             <span class="badge off" id="amp-badge">desligado</span>
         </div>
@@ -65,6 +77,36 @@ document.getElementById("volume").addEventListener("change", async (e) => {
     volumeDragging = false;
 });
 
+let dlnaPositionSecs = 0;
+let dlnaDurationText = "0:00:00";
+let dlnaTicking = false;
+
+function parseHMS(text) {
+    const parts = (text || "0:00:00").split(":").map(Number);
+    while (parts.length < 3) parts.unshift(0);
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+}
+
+function fmtHMS(totalSecs) {
+    const h = Math.floor(totalSecs / 3600);
+    const m = Math.floor((totalSecs % 3600) / 60);
+    const s = Math.floor(totalSecs % 60);
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function renderDlnaPosition() {
+    const known = dlnaDurationText && dlnaDurationText !== "0:00:00";
+    document.getElementById("dlna-position").textContent =
+        known ? `${fmtHMS(dlnaPositionSecs)} / ${dlnaDurationText}` : fmtHMS(dlnaPositionSecs);
+}
+
+setInterval(() => {
+    if (dlnaTicking) {
+        dlnaPositionSecs++;
+        renderDlnaPosition();
+    }
+}, 1000);
+
 async function refresh() {
     try {
         const s = await apiGet("/api/status");
@@ -91,6 +133,31 @@ async function refresh() {
             disconnectBtn.style.display = "none";
         }
         mediaControls.style.display = s.bt_connected ? "flex" : "none";
+
+        const dlnaBadge = document.getElementById("dlna-badge");
+        const dlnaLabels = { playing: "tocando", paused: "pausado", stopped: "conectado" };
+        dlnaBadge.textContent = s.dlna_subscribed ? (dlnaLabels[s.dlna_state] || "conectado") : "inativo";
+        dlnaBadge.className = "badge " + (s.dlna_subscribed ? "on" : "off");
+        const dlnaRow = document.getElementById("dlna-device-row");
+        if (s.dlna_client_ip) {
+            document.getElementById("dlna-client-ip").textContent =
+                s.dlna_client_agent ? `${s.dlna_client_ip} (${s.dlna_client_agent})` : s.dlna_client_ip;
+            dlnaRow.style.display = "flex";
+        } else {
+            dlnaRow.style.display = "none";
+        }
+
+        const dlnaPositionRow = document.getElementById("dlna-position-row");
+        if (s.dlna_state === "playing" || s.dlna_state === "paused") {
+            dlnaPositionSecs = parseHMS(s.dlna_position);
+            dlnaDurationText = s.dlna_duration || "0:00:00";
+            dlnaTicking = s.dlna_state === "playing";
+            renderDlnaPosition();
+            dlnaPositionRow.style.display = "flex";
+        } else {
+            dlnaTicking = false;
+            dlnaPositionRow.style.display = "none";
+        }
 
         const ampBadge = document.getElementById("amp-badge");
         ampBadge.textContent = s.amplifier ? "ligado" : "desligado";

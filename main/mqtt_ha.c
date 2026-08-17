@@ -7,6 +7,7 @@
 #include "audio_codec.h"
 #include "bt_audio.h"
 #include "config.h"
+#include "dlna_renderer.h"
 #include "logger.h"
 #include "pairing.h"
 #include "relay_control.h"
@@ -159,26 +160,6 @@ static void publish_button_discovery(const char *object_id, const char *name, co
      * tudo (backend, protocolo LMS) confirmado correto. QoS 1 pede
      * confirmacao de entrega (PUBACK) e retransmite se nao vier. */
     cJSON_AddNumberToObject(root, "qos", 1);
-
-    char *payload = cJSON_PrintUnformatted(root);
-    esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
-    free(payload);
-    cJSON_Delete(root);
-}
-
-static void publish_binary_sensor_discovery(const char *object_id, const char *name,
-                                             const char *device_class, const char *value_template)
-{
-    char config_topic[80];
-    snprintf(config_topic, sizeof(config_topic), "homeassistant/binary_sensor/%s/config", object_id);
-
-    cJSON *root = cJSON_CreateObject();
-    add_common_device_fields(root, object_id, name);
-    cJSON_AddStringToObject(root, "device_class", device_class);
-    cJSON_AddStringToObject(root, "state_topic", TOPIC_STATE);
-    cJSON_AddStringToObject(root, "value_template", value_template);
-    cJSON_AddStringToObject(root, "payload_on", "1");
-    cJSON_AddStringToObject(root, "payload_off", "0");
 
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
@@ -463,6 +444,17 @@ void mqtt_ha_publish_state(void)
     const char *album = bt.album;
     bool connected = bt.connected;
     bool playing = bt.playing;
+    dlna_status_t dlna = {0};
+    if (!bt.connected) {
+        dlna_renderer_get_status(&dlna);
+        if (dlna.playing) {
+            track = dlna.track;
+            artist = dlna.artist;
+            album = dlna.album;
+            connected = true;
+            playing = true;
+        }
+    }
     const char *status_str = connected ? (playing ? "playing" : "connected") : "disconnected";
 
     /* "Dispositivo conectado" e "dispositivos pareados" pedidos como
@@ -481,6 +473,8 @@ void mqtt_ha_publish_state(void)
                 break;
             }
         }
+    } else if (dlna.playing) {
+        strlcpy(connected_device, "DLNA", sizeof(connected_device));
     }
 
     pairing_device_t paired_history[PAIRING_HISTORY_MAX];

@@ -7,6 +7,7 @@
 #include "audio_codec.h"
 #include "bt_audio.h"
 #include "config.h"
+#include "dlna_renderer.h"
 #include "logger.h"
 #include "ota_manager.h"
 #include "pairing.h"
@@ -102,10 +103,21 @@ static esp_err_t api_status_get(httpd_req_t *req)
         }
     }
 
+    /* BT sempre tem prioridade (mesma regra do audio em si, ver
+     * dlna_should_abort() em dlna_renderer.c) -- so mostra o que o DLNA
+     * esta tocando quando nao ha celular conectado. */
     const char *track = bt.title;
     const char *artist = bt.artist;
     const char *album = bt.album;
     bool playing = bt.playing;
+    dlna_status_t dlna = {0};
+    dlna_renderer_get_status(&dlna);
+    if (!bt.connected && dlna.playing) {
+        track = dlna.track;
+        artist = dlna.artist;
+        album = dlna.album;
+        playing = true;
+    }
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "bt_connected", bt.connected);
@@ -117,6 +129,20 @@ static esp_err_t api_status_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "artist", artist);
     cJSON_AddStringToObject(root, "album", album);
     cJSON_AddBoolToObject(root, "playing", playing);
+    /* DLNA fica ativo independente do BT estar conectado (BT so tem
+     * prioridade pra decidir o que sai no I2S, ver dlna_should_abort()) --
+     * exposto separado pra pagina web mostrar "quem esta conectado via
+     * DLNA" mesmo quando o audio de fato tocando e via Bluetooth. "state"
+     * e "subscribed" (nao so um bool "active") pra distinguir pausado de
+     * parado/nunca conectado -- client_ip/agent sozinhos ficavam gravados
+     * da ultima acao SOAP mesmo depois de pausar, o que fazia a pagina
+     * mostrar "conectado" e "inativo" ao mesmo tempo, contraditorio. */
+    cJSON_AddStringToObject(root, "dlna_state", dlna.state);
+    cJSON_AddBoolToObject(root, "dlna_subscribed", dlna.subscribed);
+    cJSON_AddStringToObject(root, "dlna_client_ip", dlna.client_ip);
+    cJSON_AddStringToObject(root, "dlna_client_agent", dlna.client_agent);
+    cJSON_AddStringToObject(root, "dlna_position", dlna.position);
+    cJSON_AddStringToObject(root, "dlna_duration", dlna.duration);
     cJSON_AddBoolToObject(root, "amplifier", relay_control_is_on());
     /* API/UI expoem 0-100 pro usuario -- a precisao fina de 0-VOLUME_STEPS
      * (200, ver config.h) e so um detalhe interno da curva de audio_codec.c,
