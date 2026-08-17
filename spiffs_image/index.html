@@ -22,6 +22,11 @@
             <span id="bt-device-name">—</span>
         </div>
         <div class="row">
+            <span class="label">Visível para parear</span>
+            <span class="badge off" id="pairing-badge">desligado</span>
+        </div>
+        <button type="button" id="pairing-btn" style="margin-top:0.5rem">Permitir pareamento (3 min)</button>
+        <div class="row">
             <span class="label">DLNA</span>
             <span class="badge off" id="dlna-badge">inativo</span>
         </div>
@@ -193,6 +198,7 @@ async function refresh() {
             document.getElementById("volume").value = s.volume;
             setVolumeDisplay(s.volume);
         }
+        btPairing.update(s);
         document.getElementById("wifi-ip").textContent = s.wifi_ip || "sem rede";
         document.getElementById("device-mac").textContent = s.device_mac;
         document.getElementById("uptime").textContent = fmtUptime(s.uptime_s);
@@ -211,6 +217,8 @@ document.getElementById("disconnect-btn").addEventListener("click", async (e) =>
 document.getElementById("media-prev").addEventListener("click", () => apiPost("/api/media", { cmd: "previous" }));
 document.getElementById("media-playpause").addEventListener("click", () => apiPost("/api/media", { cmd: "playpause" }));
 document.getElementById("media-next").addEventListener("click", () => apiPost("/api/media", { cmd: "next" }));
+
+btPairing.init("pairing-badge", "pairing-btn", refresh);
 
 refresh();
 setInterval(refresh, 5000);

@@ -48,50 +48,9 @@ async function pair(mac, action) {
     load();
 }
 
-/* Contagem regressiva da janela de pareamento. O valor vem do firmware a cada
- * atualização; entre uma e outra ela decrementa localmente, pra não ficar
- * "pulando" de 2 em 2 segundos na tela. */
-let janelaRestante = 0;
-let janelaPermanente = false;
-
-function fmtRestante(s) {
-    const m = Math.floor(s / 60);
-    const seg = s % 60;
-    return m > 0 ? `${m}min ${String(seg).padStart(2, "0")}s` : `${seg}s`;
-}
-
-function renderJanela() {
-    const badge = document.getElementById("pairing-badge");
-    const btn = document.getElementById("pairing-btn");
-    if (janelaPermanente) {
-        badge.textContent = "sempre visível";
-        badge.className = "badge on";
-        btn.textContent = "Permitir pareamento (3 min)";
-        return;
-    }
-    if (janelaRestante > 0) {
-        badge.textContent = fmtRestante(janelaRestante) + " restantes";
-        badge.className = "badge on";
-        btn.textContent = "Encerrar agora";
-    } else {
-        badge.textContent = "desligado";
-        badge.className = "badge off";
-        btn.textContent = "Permitir pareamento (3 min)";
-    }
-}
-
-setInterval(() => {
-    if (!janelaPermanente && janelaRestante > 0) {
-        janelaRestante--;
-        renderJanela();
-    }
-}, 1000);
-
-document.getElementById("pairing-btn").addEventListener("click", async () => {
-    const encerrar = (!janelaPermanente && janelaRestante > 0);
-    await apiPost("/api/bt/pairing_mode", encerrar ? { stop: true } : {});
-    await refreshPendingPin();
-});
+/* Lógica da janela de pareamento vive em app.js (btPairing), compartilhada
+ * com a página inicial -- aqui só ligamos os elementos desta página. */
+btPairing.init("pairing-badge", "pairing-btn", () => refreshPendingPin());
 
 async function refreshPendingPin() {
     try {
@@ -105,9 +64,7 @@ async function refreshPendingPin() {
             card.style.display = "none";
         }
         /* visível sem prazo = interruptor permanente ligado nas Configurações */
-        janelaRestante = s.bt_discoverable_remaining_s || 0;
-        janelaPermanente = s.bt_discoverable && janelaRestante === 0;
-        renderJanela();
+        btPairing.update(s);
     } catch (e) {
         console.error(e);
     }
