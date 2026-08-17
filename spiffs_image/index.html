@@ -132,7 +132,15 @@ async function refresh() {
             deviceRow.style.display = "none";
             disconnectBtn.style.display = "none";
         }
-        mediaControls.style.display = s.bt_connected ? "flex" : "none";
+        /* Controles tambem no DLNA -- antes so apareciam no Bluetooth. Mas
+         * ⏮/⏭ ficam escondidos no DLNA: a fila pertence ao control point
+         * (Music Assistant) e o protocolo nao permite ao renderer pedir
+         * "proxima faixa". Melhor nao mostrar botao que nao funciona. */
+        const dlnaAtivo = !s.bt_connected && (s.dlna_state === "playing" || s.dlna_state === "paused");
+        mediaControls.style.display = (s.bt_connected || dlnaAtivo) ? "flex" : "none";
+        const skipDisplay = s.bt_connected ? "inline-block" : "none";
+        document.getElementById("media-prev").style.display = skipDisplay;
+        document.getElementById("media-next").style.display = skipDisplay;
 
         const dlnaBadge = document.getElementById("dlna-badge");
         const dlnaLabels = { playing: "tocando", paused: "pausado", stopped: "conectado" };

@@ -2,6 +2,8 @@
 
 #include <stdbool.h>
 
+#include "esp_err.h"
+
 /* DLNA/UPnP MediaRenderer -- permite que o Music Assistant (ou qualquer
  * control point DLNA: BubbleUPnP, VLC, etc.) descubra, "veja" e toque áudio
  * de verdade neste dispositivo, independente do Bluetooth.
@@ -49,3 +51,16 @@ typedef struct {
 
 /* Cópia thread-safe do estado atual (usado por web_server.c/mqtt_ha.c). */
 void dlna_renderer_get_status(dlna_status_t *out);
+
+/* Controle de mídia da fonte DLNA, para a página web e o MQTT/Home Assistant
+ * (o equivalente ao bt_audio_media_control() do lado Bluetooth).
+ *
+ * Aceita "play", "pause", "playpause" e "stop" -- todas operações locais
+ * nossas. Devolve ESP_ERR_NOT_SUPPORTED para "next"/"previous": no DLNA a
+ * fila pertence ao control point (Music Assistant) e o protocolo não dá ao
+ * renderer nenhuma forma de pedir "próxima faixa" -- quem pula faixa é quem
+ * manda o SetAVTransportURI. Para pular faixa fora da tela do MA, o caminho
+ * é controlar o MA (integração nativa dele no Home Assistant).
+ *
+ * Devolve ESP_ERR_INVALID_STATE se não há nada carregado/tocando via DLNA. */
+esp_err_t dlna_renderer_media_control(const char *cmd);

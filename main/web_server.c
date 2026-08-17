@@ -347,11 +347,29 @@ static esp_err_t api_media_post(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    bool ok = (bt_audio_media_control(item->valuestring) == ESP_OK);
-    if (!ok) {
+    /* BT primeiro (mesma prioridade do resto do projeto); se nao ha celular
+     * conectado, tenta a fonte DLNA -- antes o comando ia so pro bt_audio e
+     * sumia sem efeito nenhum quando quem tocava era o DLNA. */
+    bt_audio_status_t bt;
+    bt_audio_get_status(&bt);
+    esp_err_t err;
+    if (bt.connected) {
+        err = bt_audio_media_control(item->valuestring);
+    } else {
+        err = dlna_renderer_media_control(item->valuestring);
+    }
+
+    if (err == ESP_ERR_NOT_SUPPORTED) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                             "comando invalido ou nenhuma fonte de audio ativa (BT)");
+                             "pular faixa nao e possivel via DLNA: a fila pertence ao control point "
+                             "(use o Music Assistant para trocar de faixa)");
+        return ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                             "comando invalido ou nenhuma fonte de audio ativa");
         return ESP_FAIL;
     }
     cJSON_Delete(root);

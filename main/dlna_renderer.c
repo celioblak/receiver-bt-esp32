@@ -983,19 +983,44 @@ done:
      * nova numa corrida entre "sessao antiga terminando" e "sessao nova
      * comecando". */
     if (s_target_generation == my_generation) {
+        /* Bluetooth assumiu no meio da faixa? Ai a fila NAO continua, mesmo
+         * havendo proxima enfileirada. BUG REAL reportado: sem tratar esse
+         * caso separado, o estado ficava PLAYING (a task ate promovia a
+         * proxima faixa antes de abortar de novo) e nenhum NOTIFY saia -- o
+         * control point seguia mostrando "tocando" enquanto o audio na
+         * verdade era do celular. */
+        bt_audio_status_t bt;
+        bt_audio_get_status(&bt);
+        const bool bt_took_over = bt.connected;
+
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         bool has_next = (s_next_uri[0] != '\0');
-        if (!has_next) {
+        bool stopping = bt_took_over || !has_next;
+        if (stopping) {
             s_playing = false;
             s_transport_state = DLNA_STATE_STOPPED;
             s_playback_elapsed_base_us = 0;
+            if (bt_took_over) {
+                /* Descarta a fila: quando o BT sair, quem decide o que tocar
+                 * de novo e o control point, nao um resto de fila antigo. */
+                s_next_uri[0] = '\0';
+            }
         }
         xSemaphoreGive(s_state_mutex);
-        /* So para de verdade se a fila acabou -- havendo proxima faixa, nao
-         * muta nem desliga o rele: a task ja vai emendar nela. */
-        if (!has_next) {
-            audio_codec_set_mute(true);
-            relay_control_notify_playing(false);
+
+        if (stopping) {
+            /* Mute/rele SO quando paramos por conta propria. Cedendo pro
+             * Bluetooth, quem manda no codec e no rele passa a ser o
+             * bt_audio.c (ele mesmo faz set_mute/notify_playing conforme o
+             * estado do celular) -- desligar o rele aqui cortaria o
+             * amplificador justo quando o BT vai comecar a tocar. */
+            if (!bt_took_over) {
+                audio_codec_set_mute(true);
+                relay_control_notify_playing(false);
+            } else {
+                logger_log(ESP_LOG_INFO, TAG,
+                           "dlna: Bluetooth assumiu -- DLNA para e avisa o control point (STOPPED)");
+            }
             dlna_notify_state_change_async();
         }
     }
@@ -1065,6 +1090,17 @@ static void dlna_fetch_task(void *arg)
 
             if (s_target_generation != my_generation) {
                 break; /* superado por Play/Stop/faixa nova -- nao emenda */
+            }
+            {
+                /* BT com prioridade: nao emenda na proxima (o dlna_fetch_and_play
+                 * acima ja marcou STOPPED e avisou o control point). Sem essa
+                 * checagem a task promovia a faixa seguinte, marcava PLAYING e
+                 * so entao abortava -- deixando o estado mentindo. */
+                bt_audio_status_t bt;
+                bt_audio_get_status(&bt);
+                if (bt.connected) {
+                    break;
+                }
             }
             if (!dlna_advance_to_next_track()) {
                 break; /* fim da fila */
@@ -2394,6 +2430,59 @@ void dlna_renderer_get_status(dlna_status_t *out)
     dlna_format_hms(elapsed_us, out->position, sizeof(out->position));
     dlna_effective_duration(elapsed_us, out->duration, sizeof(out->duration));
     xSemaphoreGive(s_state_mutex);
+}
+
+esp_err_t dlna_renderer_media_control(const char *cmd)
+{
+    if (cmd == NULL || s_state_mutex == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Pular faixa nao existe do lado do renderer: a fila e do control point.
+     * Melhor devolver "nao suportado" e deixar a interface avisar do que
+     * fingir que funcionou (era o que acontecia -- o comando ia so pro
+     * bt_audio e sumia silenciosamente quando a fonte era DLNA). */
+    if (strcmp(cmd, "next") == 0 || strcmp(cmd, "previous") == 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool have_uri = (s_current_uri[0] != '\0');
+    dlna_transport_state_t state = s_transport_state;
+    xSemaphoreGive(s_state_mutex);
+
+    if (strcmp(cmd, "stop") == 0) {
+        if (!have_uri && state == DLNA_STATE_STOPPED) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        dlna_engine_stop();
+        return ESP_OK;
+    }
+    if (strcmp(cmd, "pause") == 0) {
+        if (state != DLNA_STATE_PLAYING) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        dlna_engine_pause();
+        return ESP_OK;
+    }
+    if (strcmp(cmd, "play") == 0) {
+        if (!have_uri) {
+            return ESP_ERR_INVALID_STATE; /* nada carregado pra tocar */
+        }
+        dlna_engine_play();
+        return ESP_OK;
+    }
+    if (strcmp(cmd, "playpause") == 0) {
+        if (state == DLNA_STATE_PLAYING) {
+            dlna_engine_pause();
+            return ESP_OK;
+        }
+        if (!have_uri) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        dlna_engine_play();
+        return ESP_OK;
+    }
+    return ESP_ERR_INVALID_ARG;
 }
 
 void dlna_renderer_init(void)

@@ -331,7 +331,23 @@ static void handle_command(esp_mqtt_event_handle_t event)
     copy_payload(event, payload, sizeof(payload));
 
     if (topic_is(event, TOPIC_CMD_MEDIA)) {
-        bt_audio_media_control(payload);
+        /* BT tem prioridade; sem celular conectado, o comando vai pra fonte
+         * DLNA (antes ia so pro bt_audio e sumia sem efeito). "next"/
+         * "previous" nao existem no DLNA -- a fila e do control point --
+         * entao o log deixa isso explicito em vez de falhar em silencio. */
+        bt_audio_status_t bt;
+        bt_audio_get_status(&bt);
+        if (bt.connected) {
+            bt_audio_media_control(payload);
+        } else {
+            esp_err_t err = dlna_renderer_media_control(payload);
+            if (err == ESP_ERR_NOT_SUPPORTED) {
+                logger_log(ESP_LOG_WARN, TAG,
+                           "mqtt: '%s' nao se aplica ao DLNA (a fila e do control point)", payload);
+            } else if (err != ESP_OK) {
+                logger_log(ESP_LOG_WARN, TAG, "mqtt: comando de midia '%s' sem efeito no DLNA", payload);
+            }
+        }
     } else if (topic_is(event, TOPIC_CMD_VOLUME)) {
         /* payload chega em 0-100 (ver publish_number_discovery acima) */
         audio_codec_set_volume((atoi(payload) * VOLUME_STEPS) / 100);
