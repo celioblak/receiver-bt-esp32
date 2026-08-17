@@ -112,11 +112,18 @@ static esp_err_t api_status_get(httpd_req_t *req)
     bool playing = bt.playing;
     dlna_status_t dlna = {0};
     dlna_renderer_get_status(&dlna);
-    if (!bt.connected && dlna.playing) {
+    /* Mostra os metadados do DLNA quando ha faixa CARREGADA -- tocando OU
+     * pausada. Antes a condicao era dlna.playing, que o Pause zera: a faixa
+     * desaparecia da pagina ao pausar, o que e incoerente (pausado nao e
+     * parado, a faixa continua carregada). O campo "playing" segue refletindo
+     * so a reproducao de fato. */
+    const bool dlna_tem_faixa = (strcmp(dlna.state, "playing") == 0 ||
+                                 strcmp(dlna.state, "paused") == 0);
+    if (!bt.connected && dlna_tem_faixa) {
         track = dlna.track;
         artist = dlna.artist;
         album = dlna.album;
-        playing = true;
+        playing = dlna.playing;
     }
 
     cJSON *root = cJSON_CreateObject();

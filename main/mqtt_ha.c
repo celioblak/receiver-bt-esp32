@@ -461,14 +461,20 @@ void mqtt_ha_publish_state(void)
     bool connected = bt.connected;
     bool playing = bt.playing;
     dlna_status_t dlna = {0};
+    bool dlna_tem_faixa = false;
     if (!bt.connected) {
         dlna_renderer_get_status(&dlna);
-        if (dlna.playing) {
+        /* Faixa CARREGADA (tocando ou pausada), nao so tocando: antes um Pause
+         * apagava titulo/artista e o status voltava pra "disconnected" no Home
+         * Assistant, como se nada estivesse carregado. */
+        dlna_tem_faixa = (strcmp(dlna.state, "playing") == 0 ||
+                          strcmp(dlna.state, "paused") == 0);
+        if (dlna_tem_faixa) {
             track = dlna.track;
             artist = dlna.artist;
             album = dlna.album;
             connected = true;
-            playing = true;
+            playing = dlna.playing;
         }
     }
     const char *status_str = connected ? (playing ? "playing" : "connected") : "disconnected";
@@ -489,7 +495,7 @@ void mqtt_ha_publish_state(void)
                 break;
             }
         }
-    } else if (dlna.playing) {
+    } else if (dlna_tem_faixa) {
         strlcpy(connected_device, "DLNA", sizeof(connected_device));
     }
 

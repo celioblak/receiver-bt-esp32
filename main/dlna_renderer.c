@@ -1223,7 +1223,7 @@ static esp_err_t description_xml_handler(httpd_req_t *req)
      * estaticos e baratos -- nao custam nada em RAM (const em flash). */
     static const char PART2[] =
         "</friendlyName>"
-        "<manufacturer>DIY</manufacturer>"
+        "<manufacturer>Celio</manufacturer>"
         "<manufacturerURL>https://github.com/celioblak</manufacturerURL>"
         "<modelDescription>Receiver Bluetooth DIY (ESP32 + ES8388)</modelDescription>"
         "<modelName>ESP32 Audio Kit V2.2</modelName>"
