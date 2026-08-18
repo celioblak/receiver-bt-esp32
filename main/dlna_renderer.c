@@ -504,19 +504,34 @@ static void soap_respond(httpd_req_t *req, const char *service_type, const char 
     httpd_resp_send(req, resp, len);
 }
 
-static void soap_fault(httpd_req_t *req)
+/* Falha SOAP com codigo UPnP especifico. Os que usamos:
+ *   401 - Invalid Action (acao que nao implementamos)
+ *   705 - Transport is locked (o transporte esta indisponivel agora) */
+static void soap_fault_code(httpd_req_t *req, int code, const char *desc)
 {
-    static const char *resp =
+    char resp[512];
+    int len = snprintf(resp, sizeof(resp),
         "<?xml version=\"1.0\"?>"
         "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
         "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
         "<s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring>"
         "<detail><UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\">"
-        "<errorCode>401</errorCode><errorDescription>Invalid Action</errorDescription>"
-        "</UPnPError></detail></s:Fault></s:Body></s:Envelope>";
+        "<errorCode>%d</errorCode><errorDescription>%s</errorDescription>"
+        "</UPnPError></detail></s:Fault></s:Body></s:Envelope>",
+        code, desc);
+    if (len < 0) {
+        len = 0;
+    } else if ((size_t)len >= sizeof(resp)) {
+        len = (int)sizeof(resp) - 1;
+    }
     httpd_resp_set_status(req, "500 Internal Server Error");
     httpd_resp_set_type(req, "text/xml; charset=\"utf-8\"");
-    httpd_resp_sendstr(req, resp);
+    httpd_resp_send(req, resp, len);
+}
+
+static void soap_fault(httpd_req_t *req)
+{
+    soap_fault_code(req, 401, "Invalid Action");
 }
 
 /* -------------------------------------------------------------------------
@@ -1972,6 +1987,26 @@ static esp_err_t avtransport_control_handler(httpd_req_t *req)
                    uri[0] ? "enfileirada" : "(fila limpa)", track, artist, duration);
         soap_respond(req, "urn:schemas-upnp-org:service:AVTransport:1", "SetNextAVTransportURI", NULL);
     } else if (strcmp(action, "Play") == 0) {
+        /* Bluetooth tem prioridade sobre o DLNA em todo o projeto (ver
+         * dlna_should_abort). Com um celular conectado nos NAO vamos tocar --
+         * entao RECUSAR agora, com o codigo que a spec reserva pra isso, em
+         * vez de responder OK e ficar mudo.
+         *
+         * MOTIVO (reportado em uso real): aceitando o Play, o control point
+         * ficava convencido de que estava tocando -- e, por achar isso, nem
+         * tentava de novo depois que o Bluetooth desconectava, deixando o
+         * usuario sem audio nenhum e com a interface do MA mentindo. Avisar
+         * pela via SINCRONA e essencial porque o eventing pode nem estar
+         * assinado (dlna_subscribed=false e comum aqui), entao NOTIFY sozinho
+         * nao garante que a informacao chegue. */
+        bt_audio_status_t bt;
+        bt_audio_get_status(&bt);
+        if (bt.connected) {
+            logger_log(ESP_LOG_WARN, TAG,
+                       "Play recusado (705): Bluetooth conectado tem prioridade");
+            soap_fault_code(req, 705, "Transport is locked");
+            return ESP_OK;
+        }
         dlna_engine_play();
         logger_log(ESP_LOG_INFO, TAG, "Play solicitado (uri=%s)", s_current_uri);
         soap_respond(req, "urn:schemas-upnp-org:service:AVTransport:1", "Play", NULL);
