@@ -422,21 +422,71 @@ static esp_err_t api_agc_post(httpd_req_t *req)
     return send_json(req, resp);
 }
 
+/* Escapa uma string para caber dentro de aspas em JSON. Só os casos que a RFC
+ * exige -- aspas, barra invertida e controles. */
+static void json_escape_into(char *out, size_t out_size, const char *in)
+{
+    size_t o = 0;
+    for (; *in && o + 7 < out_size; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (c == '"' || c == '\\') {
+            out[o++] = '\\';
+            out[o++] = (char)c;
+        } else if (c == '\n') {
+            out[o++] = '\\'; out[o++] = 'n';
+        } else if (c == '\r') {
+            out[o++] = '\\'; out[o++] = 'r';
+        } else if (c == '\t') {
+            out[o++] = '\\'; out[o++] = 't';
+        } else if (c < 0x20) {
+            o += snprintf(out + o, out_size - o, "\\u%04x", c);
+        } else {
+            out[o++] = (char)c; /* UTF-8 passa direto */
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Responde em PEDACOS, uma entrada por vez, em vez de montar o array inteiro
+ * com cJSON e imprimir num buffer unico.
+ *
+ * MOTIVO (bug real, reproduzido 3/3): com o buffer de log cheio (100 entradas
+ * x 128 bytes) o JSON passa de ~17KB, e o cJSON aloca da RAM INTERNA -- onde
+ * sobram ~20KB neste firmware, e o print ainda realoca crescendo, chegando a
+ * pedir o dobro. O endpoint entao devolvia 0 byte e prendia a conexao ate o
+ * timeout do cliente, enquanto /api/status e /api/devices (JSON pequeno)
+ * respondiam normalmente. Funcionava logo apos o boot, com poucas entradas, e
+ * quebrava depois que o buffer enchia -- o que fazia parecer intermitente.
+ * Em pedacos, o pico de memoria e o de UMA entrada. */
 static esp_err_t api_logs_get(httpd_req_t *req)
 {
     static log_entry_t entries[LOGGER_MAX_ENTRIES];
     size_t n = logger_get_entries(entries, LOGGER_MAX_ENTRIES);
 
-    cJSON *arr = cJSON_CreateArray();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send_chunk(req, "[", 1);
+
+    /* Uma entrada por vez: msg escapada pode crescer, entao folga generosa. */
+    static char esc[LOGGER_MSG_MAX_LEN * 6 + 8];
+    static char piece[LOGGER_MSG_MAX_LEN * 6 + 96];
     for (size_t i = 0; i < n; i++) {
-        cJSON *item = cJSON_CreateObject();
-        cJSON_AddNumberToObject(item, "timestamp_ms", (double)entries[i].timestamp_ms);
-        cJSON_AddNumberToObject(item, "level", entries[i].level);
-        cJSON_AddStringToObject(item, "msg", entries[i].msg);
-        cJSON_AddItemToArray(arr, item);
+        json_escape_into(esc, sizeof(esc), entries[i].msg);
+        int len = snprintf(piece, sizeof(piece),
+                           "%s{\"timestamp_ms\":%llu,\"level\":%d,\"msg\":\"%s\"}",
+                           i ? "," : "",
+                           (unsigned long long)entries[i].timestamp_ms,
+                           (int)entries[i].level, esc);
+        if (len > 0) {
+            if ((size_t)len >= sizeof(piece)) {
+                len = (int)sizeof(piece) - 1; /* nunca enviar alem do buffer */
+            }
+            httpd_resp_send_chunk(req, piece, len);
+        }
     }
 
-    return send_json(req, arr);
+    httpd_resp_send_chunk(req, "]", 1);
+    httpd_resp_send_chunk(req, NULL, 0); /* termina o chunked encoding */
+    return ESP_OK;
 }
 
 static esp_err_t api_devices_get(httpd_req_t *req)
