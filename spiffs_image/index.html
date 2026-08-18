@@ -25,6 +25,10 @@
             <span class="label">Visível para parear</span>
             <span class="badge off" id="pairing-badge">desligado</span>
         </div>
+        <p class="track-sub" id="pairing-aviso" style="display:none; margin:0.4rem 0 0">
+            ⚠ Há dispositivos autorizados: só eles conseguem parear. Para um aparelho
+            novo, esvazie a lista em <a href="/devices.html">Dispositivos</a> primeiro.
+        </p>
         <button type="button" id="pairing-btn" style="margin-top:0.5rem">Permitir pareamento (3 min)</button>
         <div class="row">
             <span class="label">DLNA</span>
@@ -218,7 +222,7 @@ document.getElementById("media-prev").addEventListener("click", () => apiPost("/
 document.getElementById("media-playpause").addEventListener("click", () => apiPost("/api/media", { cmd: "playpause" }));
 document.getElementById("media-next").addEventListener("click", () => apiPost("/api/media", { cmd: "next" }));
 
-btPairing.init("pairing-badge", "pairing-btn", refresh);
+btPairing.init("pairing-badge", "pairing-btn", refresh, "pairing-aviso");
 
 refresh();
 setInterval(refresh, 5000);

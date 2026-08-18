@@ -737,8 +737,17 @@ void bt_audio_set_discoverable(bool discoverable)
     bool connected = s_status.connected;
     xSemaphoreGive(s_status_mutex);
     if (!connected) {
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
-                                  discoverable ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+        /* Confere o retorno tambem aqui: uma recusa do radio passando calada
+         * deixava a interface dizendo "visivel" com o aparelho invisivel. */
+        esp_err_t err = esp_bt_gap_set_scan_mode(
+            ESP_BT_CONNECTABLE,
+            discoverable ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+        if (err != ESP_OK) {
+            logger_log(ESP_LOG_ERROR, TAG, "bt_audio: falha ao mudar visibilidade: %s",
+                       esp_err_to_name(err));
+        } else {
+            logger_log(ESP_LOG_INFO, TAG, "bt_audio: visibilidade permanente = %d", (int)discoverable);
+        }
     }
 }
 
@@ -810,10 +819,30 @@ void bt_audio_enable_discoverable_temporary(uint32_t duration_s)
     xSemaphoreTake(s_status_mutex, portMAX_DELAY);
     bool connected = s_status.connected;
     xSemaphoreGive(s_status_mutex);
-    if (!connected) {
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    if (connected) {
+        /* Com um celular conectado a pilha mantem NON_DISCOVERABLE de
+         * proposito -- a janela so vai valer de fato quando ele desconectar.
+         * Dizer isso agora evita a impressao de que "abriu mas nao aparece". */
+        logger_log(ESP_LOG_WARN, TAG,
+                   "bt_audio: janela aberta, mas ha um aparelho conectado -- so fica visivel apos desconectar");
+    } else {
+        /* Confere o retorno: sem isso, uma recusa do radio passava calada e
+         * a interface dizia "visivel" com o aparelho invisivel de fato. */
+        esp_err_t err = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+        if (err != ESP_OK) {
+            logger_log(ESP_LOG_ERROR, TAG, "bt_audio: falha ao ficar visivel: %s", esp_err_to_name(err));
+        }
     }
-    logger_log(ESP_LOG_INFO, TAG, "bt_audio: descobrivel temporario ligado por %u s", (unsigned)duration_s);
+    /* Com a lista de autorizados preenchida, so quem esta nela consegue
+     * parear (ver pairing_is_allowed) -- abrir a janela nao basta pra um
+     * aparelho novo. Avisa, senao o pareamento falha sem explicacao. */
+    size_t autorizados = pairing_get_allowed_count();
+    if (autorizados > 0) {
+        logger_log(ESP_LOG_WARN, TAG,
+                   "bt_audio: %u dispositivo(s) autorizado(s) -- aparelho novo sera REJEITADO ate ser autorizado",
+                   (unsigned)autorizados);
+    }
+    logger_log(ESP_LOG_INFO, TAG, "bt_audio: janela de pareamento aberta por %u s", (unsigned)duration_s);
 }
 
 void bt_audio_check_discoverable_timeout(void)

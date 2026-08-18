@@ -30,8 +30,13 @@ function fmtUptime(seconds) {
 const btPairing = (() => {
     let restante = 0;
     let permanente = false;
+    let bloqueadoPorLista = false;
     let els = null;
     let aoMudar = null;
+
+    function janelaAtiva() {
+        return permanente || restante > 0;
+    }
 
     function fmt(s) {
         const m = Math.floor(s / 60);
@@ -41,17 +46,29 @@ const btPairing = (() => {
 
     function render() {
         if (!els) return;
+        /* Com lista de autorizados ativa, abrir a janela NÃO basta: um
+         * aparelho novo é rejeitado em pairing_is_allowed(). Avisar aqui
+         * evita o pareamento falhar sem explicação. */
+        if (els.aviso) {
+            const precisaAutorizar = (janelaAtiva() && bloqueadoPorLista);
+            els.aviso.style.display = precisaAutorizar ? "block" : "none";
+        }
         if (permanente) {
+            /* Com "sempre visível" ligado nas Configurações, abrir janela
+             * temporária não faria diferença nenhuma -- some com o botão em
+             * vez de oferecer uma ação sem efeito. */
             els.badge.textContent = "sempre visível";
             els.badge.className = "badge on";
-            els.btn.textContent = "Permitir pareamento (3 min)";
+            els.btn.style.display = "none";
         } else if (restante > 0) {
             els.badge.textContent = fmt(restante) + " restantes";
             els.badge.className = "badge on";
+            els.btn.style.display = "";
             els.btn.textContent = "Encerrar agora";
         } else {
             els.badge.textContent = "desligado";
             els.badge.className = "badge off";
+            els.btn.style.display = "";
             els.btn.textContent = "Permitir pareamento (3 min)";
         }
     }
@@ -59,11 +76,11 @@ const btPairing = (() => {
     return {
         /* onChange: chamado após o clique, pra página recarregar o status na
          * hora em vez de esperar o próximo ciclo. */
-        init(badgeId, btnId, onChange) {
+        init(badgeId, btnId, onChange, avisoId) {
             const badge = document.getElementById(badgeId);
             const btn = document.getElementById(btnId);
             if (!badge || !btn) return; /* página não tem esse bloco */
-            els = { badge, btn };
+            els = { badge, btn, aviso: avisoId ? document.getElementById(avisoId) : null };
             aoMudar = onChange;
             btn.addEventListener("click", async () => {
                 const encerrar = (!permanente && restante > 0);
@@ -86,6 +103,7 @@ const btPairing = (() => {
         update(s) {
             restante = s.bt_discoverable_remaining_s || 0;
             permanente = !!s.bt_discoverable && restante === 0;
+            bloqueadoPorLista = (s.bt_allowed_count || 0) > 0;
             render();
         },
     };

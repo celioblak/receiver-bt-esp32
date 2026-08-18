@@ -29,6 +29,10 @@
             que a varredura de rádio do Bluetooth fique ligada o tempo todo disputando
             com o áudio. Aparelhos já pareados continuam conectando normalmente.
         </p>
+        <p class="track-sub" id="pairing-aviso" style="display:none; margin:0.4rem 0 0">
+            ⚠ Há dispositivos autorizados na lista abaixo: só eles conseguem parear.
+            Para um aparelho novo, remova todos da lista primeiro.
+        </p>
         <button type="button" id="pairing-btn">Permitir pareamento (3 min)</button>
     </div>
 
@@ -50,7 +54,7 @@ async function pair(mac, action) {
 
 /* Lógica da janela de pareamento vive em app.js (btPairing), compartilhada
  * com a página inicial -- aqui só ligamos os elementos desta página. */
-btPairing.init("pairing-badge", "pairing-btn", () => refreshPendingPin());
+btPairing.init("pairing-badge", "pairing-btn", () => refreshPendingPin(), "pairing-aviso");
 
 async function refreshPendingPin() {
     try {

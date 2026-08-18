@@ -168,6 +168,10 @@ static esp_err_t api_status_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "bt_discoverable_remaining_s",
                             bt_audio_get_discoverable_remaining_s());
     cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
+    /* >0 significa lista de autorizados ativa: SO os dessa lista conseguem
+     * parear, entao abrir a janela nao basta pra um aparelho novo (ver
+     * pairing_is_allowed). A pagina usa isso pra avisar. */
+    cJSON_AddNumberToObject(root, "bt_allowed_count", (double)pairing_get_allowed_count());
     cJSON_AddStringToObject(root, "pending_pin_mac", bt.pending_pin_mac);
     cJSON_AddStringToObject(root, "pending_pin_code", bt.pending_pin_code);
 

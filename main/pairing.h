@@ -34,6 +34,12 @@ size_t pairing_get_history(pairing_device_t *out, size_t max_entries);
  *         false = remove da lista de autorizados ("block") */
 void pairing_set_allowed(const uint8_t mac[6], bool allowed);
 
+/* Quantos dispositivos estao na lista de autorizados. Importa pra interface:
+ * com a lista VAZIA qualquer um pode parear; com pelo menos um, so os da
+ * lista conseguem -- abrir a janela de pareamento nao basta pra um aparelho
+ * novo, ele seria rejeitado em pairing_is_allowed(). */
+size_t pairing_get_allowed_count(void);
+
 /* Remove uma entrada do histórico (não mexe na lista de autorizados). */
 void pairing_remove_from_history(const uint8_t mac[6]);
 

@@ -127,6 +127,14 @@ size_t pairing_get_history(pairing_device_t *out, size_t max_entries)
     return n;
 }
 
+size_t pairing_get_allowed_count(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    size_t n = (size_t)s_allowed.count;
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
 void pairing_set_allowed(const uint8_t mac[6], bool allowed)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
