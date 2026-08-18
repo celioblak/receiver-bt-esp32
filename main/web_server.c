@@ -17,6 +17,7 @@
 
 #include "cJSON.h"
 #include "esp_bt_device.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
@@ -458,27 +459,56 @@ static void json_escape_into(char *out, size_t out_size, const char *in)
  * respondiam normalmente. Funcionava logo apos o boot, com poucas entradas, e
  * quebrava depois que o buffer enchia -- o que fazia parecer intermitente.
  * Em pedacos, o pico de memoria e o de UMA entrada. */
+/* Buffers do endpoint de log em PSRAM, NAO em RAM interna.
+ *
+ * MOTIVO (medido ao vivo): a copia das entradas sozinha eram ~14,4KB
+ * (100 x sizeof(log_entry_t)) num `static` dentro da funcao -- ou seja, .bss,
+ * RAM interna. E RAM interna e o recurso critico aqui: no boot sobram ~21KB, e
+ * conectar um aparelho Bluetooth (A2DP+AVRCP) consome ~11KB, deixando ~9KB.
+ * Nesse ponto o WiFi passa a falhar alocacao (`wifi:m f null` no log), e HTTP
+ * e MQTT caem juntos -- o dispositivo continua vivo, mas a pagina web fica
+ * inacessivel enquanto o Bluetooth estiver conectado (sintoma reportado como
+ * "crash"). Tirar esses ~16KB da RAM interna e o maior ganho isolado
+ * disponivel. Alocado sob demanda, na primeira chamada. */
+static log_entry_t *s_log_copy = NULL;
+static char *s_log_esc = NULL;
+static char *s_log_piece = NULL;
+#define LOG_ESC_SIZE   (LOGGER_MSG_MAX_LEN * 6 + 8)
+#define LOG_PIECE_SIZE (LOGGER_MSG_MAX_LEN * 6 + 96)
+
 static esp_err_t api_logs_get(httpd_req_t *req)
 {
-    static log_entry_t entries[LOGGER_MAX_ENTRIES];
+    if (s_log_copy == NULL) {
+        s_log_copy = heap_caps_malloc(sizeof(log_entry_t) * LOGGER_MAX_ENTRIES, MALLOC_CAP_SPIRAM);
+        s_log_esc = heap_caps_malloc(LOG_ESC_SIZE, MALLOC_CAP_SPIRAM);
+        s_log_piece = heap_caps_malloc(LOG_PIECE_SIZE, MALLOC_CAP_SPIRAM);
+    }
+    if (s_log_copy == NULL || s_log_esc == NULL || s_log_piece == NULL) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "[]");
+        return ESP_OK;
+    }
+
+    log_entry_t *entries = s_log_copy;
+    char *esc = s_log_esc;
+    char *piece = s_log_piece;
     size_t n = logger_get_entries(entries, LOGGER_MAX_ENTRIES);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send_chunk(req, "[", 1);
 
-    /* Uma entrada por vez: msg escapada pode crescer, entao folga generosa. */
-    static char esc[LOGGER_MSG_MAX_LEN * 6 + 8];
-    static char piece[LOGGER_MSG_MAX_LEN * 6 + 96];
     for (size_t i = 0; i < n; i++) {
-        json_escape_into(esc, sizeof(esc), entries[i].msg);
-        int len = snprintf(piece, sizeof(piece),
+        json_escape_into(esc, LOG_ESC_SIZE, entries[i].msg);
+        /* LOG_PIECE_SIZE, nao sizeof(piece): agora e ponteiro, e sizeof daria
+         * 4 bytes silenciosamente. */
+        int len = snprintf(piece, LOG_PIECE_SIZE,
                            "%s{\"timestamp_ms\":%llu,\"level\":%d,\"msg\":\"%s\"}",
                            i ? "," : "",
                            (unsigned long long)entries[i].timestamp_ms,
                            (int)entries[i].level, esc);
         if (len > 0) {
-            if ((size_t)len >= sizeof(piece)) {
-                len = (int)sizeof(piece) - 1; /* nunca enviar alem do buffer */
+            if ((size_t)len >= LOG_PIECE_SIZE) {
+                len = (int)LOG_PIECE_SIZE - 1; /* nunca enviar alem do buffer */
             }
             httpd_resp_send_chunk(req, piece, len);
         }
