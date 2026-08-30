@@ -34,10 +34,44 @@
             <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Dispositivos já pareados continuam conectando normalmente mesmo oculto.</div>
 
             <div class="row">
-                <span class="label">Exigir código de 6 dígitos para novos pareamentos</span>
-                <input type="checkbox" id="bt_require_pin">
+                <span class="label">Controle de dispositivo</span>
+                <input type="checkbox" id="pairing_lock">
             </div>
-            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Não afeta dispositivos já pareados. Veja o código na página Dispositivos quando alguém tentar parear.</div>
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Ligado: o primeiro dispositivo a parear vira automaticamente o único autorizado (os seguintes são bloqueados, autorize manualmente na página Dispositivos se precisar). Desligado: qualquer um que parear fica liberado, sem restrição automática.</div>
+
+            <div class="row">
+                <span class="label">Entrada de microfone (karaokê)</span>
+                <input type="checkbox" id="mic_enabled">
+            </div>
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Mistura o microfone em cima da música tocando. Aplica na hora, sem reiniciar.</div>
+
+            <div class="row">
+                <span class="label">Estado do microfone</span>
+                <span id="mic-adc">—</span>
+            </div>
+            <div class="track-sub" id="mic-adc-hint" style="margin:0.3rem 0 0.6rem">O conversor de áudio desta placa nem sempre inicia corretamente. Quando não inicia, o microfone é silenciado de propósito (melhor mudo que chiando) — reinicie para tentar de novo.</div>
+            <button type="button" id="mic-restart" class="secondary" style="margin-bottom:0.8rem">Reiniciar para tentar de novo</button>
+
+            <div class="row">
+                <span class="label">Detecção automática de voz (mic)</span>
+                <input type="checkbox" id="mic_auto_gate">
+            </div>
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Só mistura o mic quando detecta alguém falando/cantando de perto — sem isso, o ruído de fundo do microfone fica misturado na música o tempo todo enquanto o mic estiver ligado. Aplica na hora, sem reiniciar.</div>
+
+            <label for="mic_gain">Volume do microfone <span id="mic-gain-value">60</span></label>
+            <input type="range" id="mic_gain" min="0" max="100" value="60">
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Aplica na hora — dá pra cantar e ajustar ao vivo. Se ficar baixo, suba; se distorcer ou chiar muito, desça.</div>
+
+            <label for="mic_gate_level">Sensibilidade do portão <span id="mic-gate-value">500</span></label>
+            <input type="range" id="mic_gate_level" min="0" max="4000" step="50" value="500">
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Nível mínimo pra abrir o microfone. <strong>Maior</strong> = corta mais chiado no silêncio, mas exige cantar mais forte. <strong>Menor</strong> = pega voz mais fraca, deixando passar mais ruído. Use o medidor abaixo.</div>
+
+            <div class="row">
+                <span class="label">Nível captado agora</span>
+                <span id="mic-peak">—</span>
+            </div>
+            <div class="meter" aria-hidden="true"><div id="mic-peak-bar"></div></div>
+            <div class="track-sub" style="margin:0.3rem 0 0.6rem">Fale/cante e observe: o valor deve subir bem acima do portão na voz, e ficar bem abaixo no silêncio. Só atualiza com o microfone ligado.</div>
 
             <label for="relay_timeout_s">Timeout do amplificador (segundos sem tocar)</label>
             <input type="number" id="relay_timeout_s" min="5" max="600">
@@ -160,7 +194,13 @@ async function load() {
     document.getElementById("mqtt_port").value = c.mqtt_port;
     document.getElementById("mqtt_user").value = c.mqtt_user;
     document.getElementById("bt_discoverable").checked = c.bt_discoverable;
-    document.getElementById("bt_require_pin").checked = c.bt_require_pin;
+    document.getElementById("mic_enabled").checked = c.mic_enabled;
+    document.getElementById("mic_auto_gate").checked = c.mic_auto_gate;
+    document.getElementById("mic_gain").value = c.mic_gain;
+    document.getElementById("mic-gain-value").textContent = c.mic_gain;
+    document.getElementById("mic_gate_level").value = c.mic_gate_level;
+    document.getElementById("mic-gate-value").textContent = c.mic_gate_level;
+    document.getElementById("pairing_lock").checked = c.pairing_lock;
 }
 
 /* -------------------------------------------------------------------------
@@ -193,6 +233,70 @@ document.getElementById("agc-mode").addEventListener("change", async (e) => {
     await apiPost("/api/agc", { mode: parseInt(e.target.value, 10) });
 });
 
+/* Mic: ganho e portao aplicam NA HORA (o firmware nao exige reiniciar) --
+ * a ideia e cantar e regular ao vivo. Manda no "change" (ao soltar), nao no
+ * "input", pra nao inundar o dispositivo de requisicoes durante o arrasto. */
+const micGain = document.getElementById("mic_gain");
+micGain.addEventListener("input", () => {
+    document.getElementById("mic-gain-value").textContent = micGain.value;
+});
+micGain.addEventListener("change", async () => {
+    await apiPost("/api/config", { mic_gain: parseInt(micGain.value, 10) });
+});
+
+const micGate = document.getElementById("mic_gate_level");
+micGate.addEventListener("input", () => {
+    document.getElementById("mic-gate-value").textContent = micGate.value;
+});
+micGate.addEventListener("change", async () => {
+    await apiPost("/api/config", { mic_gate_level: parseInt(micGate.value, 10) });
+});
+
+/* Medidor de nivel do mic -- atualiza rapido (1s) so enquanto a pagina esta
+ * aberta, pra dar resposta util enquanto a pessoa canta. */
+async function refreshMicPeak() {
+    try {
+        const s = await apiGet("/api/status");
+        const pico = s.mic_peak || 0;
+        document.getElementById("mic-peak").textContent = pico;
+        /* Escala logaritmica: a voz vive na parte baixa do range 0-32767 e
+         * numa barra linear quase nao se mexeria. */
+        const pct = pico > 0 ? Math.min(100, (Math.log10(pico) / Math.log10(32767)) * 100) : 0;
+        const estado = s.mic_adc || "—";
+        const elEstado = document.getElementById("mic-adc");
+        const rotulos = {
+            saudavel: ["funcionando", "var(--ok)"],
+            travado:  ["não iniciou — silenciado", "var(--err)"],
+            chiando:  ["iniciou com chiado — silenciado", "var(--err)"],
+            medindo:  ["desligado", "var(--off)"]
+        };
+        const [txt, cor] = rotulos[estado] || [estado, "var(--off)"];
+        elEstado.textContent = txt;
+        elEstado.style.color = cor;
+        /* Botao de reiniciar so aparece quando ha o que resolver. */
+        document.getElementById("mic-restart").style.display =
+            (estado === "travado" || estado === "chiando") ? "" : "none";
+
+        const barra = document.getElementById("mic-peak-bar");
+        barra.style.width = pct.toFixed(0) + "%";
+        /* Verde quando o portao esta aberto (acima do limiar), cinza abaixo. */
+        barra.style.background = pico >= parseInt(micGate.value, 10) ? "var(--ok)" : "var(--off)";
+    } catch (e) {
+        console.error(e);
+    }
+}
+document.getElementById("mic-restart").addEventListener("click", async () => {
+    const b = document.getElementById("mic-restart");
+    b.disabled = true;
+    b.textContent = "Reiniciando…";
+    try {
+        await fetch("/api/system/restart", {method: "POST"});
+    } catch (e) { /* a resposta se perde no reboot, e esperado */ }
+    setTimeout(() => location.reload(), 20000);
+});
+refreshMicPeak();
+setInterval(refreshMicPeak, 1000);
+
 async function refreshVolumeAgc() {
     try {
         const s = await apiGet("/api/status");
@@ -222,7 +326,9 @@ document.getElementById("config-form").addEventListener("submit", async (e) => {
         mqtt_port: parseInt(document.getElementById("mqtt_port").value, 10) || 1883,
         mqtt_user: document.getElementById("mqtt_user").value,
         bt_discoverable: document.getElementById("bt_discoverable").checked,
-        bt_require_pin: document.getElementById("bt_require_pin").checked,
+        mic_enabled: document.getElementById("mic_enabled").checked,
+        mic_auto_gate: document.getElementById("mic_auto_gate").checked,
+        pairing_lock: document.getElementById("pairing_lock").checked,
     };
     const wifiPass = document.getElementById("wifi_pass").value;
     if (wifiPass) body.wifi_pass = wifiPass;

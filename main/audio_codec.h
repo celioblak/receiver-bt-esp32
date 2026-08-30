@@ -28,6 +28,19 @@ esp_err_t audio_codec_set_mute(bool mute);
  * audio_codec_reconfigure_clock). Bloqueia até enviar tudo ou timeout. */
 esp_err_t audio_codec_write(const uint8_t *data, size_t len, size_t *bytes_written);
 
+/* esp_timer_get_time() da ultima chamada bem-sucedida de audio_codec_write()
+ * com len>0 -- 0 se nunca escreveu nada ainda. Usado por um watchdog
+ * (dlna_renderer.c) pra detectar "estado diz tocando mas nada sai de
+ * verdade". */
+int64_t audio_codec_last_write_us(void);
+
+/* true enquanto audio_codec_reconfigure_clock() espera o mutex do I2S. As
+ * tasks de I2S (bt_audio.c/dlna_renderer.c), que rodam em prioridade bem
+ * mais alta, devem checar isso e ceder (dormir um pouco) antes de escrever
+ * -- senao a reconfiguracao nunca consegue o mutex e o audio fica na taxa
+ * errada/mudo (inanicao por prioridade, diagnosticada 2026-08-27). */
+bool audio_codec_clock_change_pending(void);
+
 /* A2DP pode informar sample rate diferente de faixa pra faixa (ex.: 44100 ou
  * 48000 Hz). Reconfigura o clock do I2S sem reinicializar o codec. */
 esp_err_t audio_codec_reconfigure_clock(uint32_t sample_rate_hz);
@@ -42,3 +55,73 @@ esp_err_t audio_codec_reconfigure_clock(uint32_t sample_rate_hz);
  * WiFi/BT estabilizarem, e suspeito de causar falha de boot standalone sem
  * USB/serial, ver main.c). Bloqueia pela duracao do tom. */
 void audio_codec_play_test_tone(void);
+
+/* Entrada de microfone (ADC do ES8388) -- desligada por padrão
+ * (DEFAULT_MIC_ENABLED em config.h). Decidida uma única vez em
+ * audio_codec_init() (lê NVS_KEY_MIC_ENABLED): se ligada, aloca o canal I2S
+ * RX (full-duplex, mesmo MCLK/BCLK/WS do TX, DIN em PIN_I2S_DIN, buffer de
+ * DMA bem mais raso que o TX -- ver i2s_init() em audio_codec.c) além do TX
+ * de sempre -- se desligada, o comportamento é idêntico ao de antes dessa
+ * funcionalidade existir (só TX). Não há como ligar/desligar em runtime sem
+ * reiniciar (ver comentário em config.h). Quando ligada, `audio_codec_write`
+ * mistura automaticamente o microfone em cima de qualquer áudio que esteja
+ * tocando (Bluetooth ou DLNA) -- "modo karaokê", único uso do mic hoje. */
+bool audio_codec_mic_is_enabled(void);
+
+/* Lê PCM 16 bits estéreo capturado do microfone (mesmo sample rate do I2S).
+ * Bloqueia até receber `len` bytes ou o timeout. Retorna
+ * ESP_ERR_INVALID_STATE se o mic não estiver habilitado. Uso direto
+ * opcional (ex. diagnóstico) -- a mixagem em audio_codec_write() lê o mic
+ * por conta própria, não passa por aqui. */
+esp_err_t audio_codec_mic_read(uint8_t *data, size_t len, size_t *bytes_read, uint32_t timeout_ms);
+
+/* Deteccao automatica de voz (noise gate) na mixagem do mic -- ligada por
+ * padrão (DEFAULT_MIC_AUTO_GATE em config.h). Com o mic habilitado
+ * (audio_codec_mic_is_enabled), write_with_mic_mix() só soma o áudio
+ * captado quando o nível passa de um limiar (fala/canto de perto) --
+ * silêncio o resto do tempo, em vez de misturar o ruído de fundo do
+ * microfone o tempo todo. Ao contrário de mic_enabled, aplica em runtime
+ * (sem reiniciar) e persiste em NVS_KEY_MIC_AUTO_GATE. */
+void audio_codec_set_mic_auto_gate(bool enabled);
+bool audio_codec_get_mic_auto_gate(void);
+
+/* Ganho digital do microfone na mixagem (0-100 -> 0..4x) e limiar do portao
+ * automatico. Ambos aplicam NA HORA e persistem em NVS -- a ideia e cantar e
+ * regular ao vivo pela pagina/API, ja que o nivel util depende do microfone
+ * e da distancia da boca. audio_codec_get_mic_peak() devolve o pico do
+ * ultimo bloco captado (0-32767), util como "medidor" pra saber se o
+ * microfone esta captando e se o limiar do portao esta bem escolhido. */
+void audio_codec_set_mic_gain(int gain_0_to_100);
+int audio_codec_get_mic_gain(void);
+void audio_codec_set_mic_gate_threshold(int threshold);
+int audio_codec_get_mic_gate_threshold(void);
+int audio_codec_get_mic_peak(void);
+
+/* Em que estado o ADC do microfone subiu neste boot: "saudavel", "travado",
+ * "chiando" ou "medindo". O conversor desta placa sobe aleatoriamente em um
+ * de tres estados e nada em runtime corrige -- so reiniciar. Fora de
+ * "saudavel" o audio do microfone NAO e misturado na saida, pra nao despejar
+ * chiado em cima da musica. Exposto em /api/status pra interface poder
+ * avisar e oferecer o reinicio. */
+const char *audio_codec_get_mic_adc_estado(void);
+
+/* Captura amostras CRUAS do microfone (canal esquerdo, antes de filtro,
+ * portao, ganho e mixagem) -- diagnostico. Ver GET /api/mic/raw. */
+size_t audio_codec_mic_capture_raw(int16_t *dest, size_t max_amostras);
+
+/* Liga/desliga o microfone em RUNTIME, sem reiniciar o aparelho, e persiste em
+ * NVS. Ligar cria o canal I2S RX naquele instante e mede em que estado o ADC
+ * subiu; desligar o remove. Como o RX e a unica coisa que sobe instavel nesta
+ * placa, manter o microfone desligado deixa Bluetooth e DLNA sempre limpos --
+ * e, se o microfone subir ruim, desligar e ligar de novo tenta outra vez sem
+ * derrubar a musica. */
+esp_err_t audio_codec_mic_set_enabled(bool on);
+
+/* Diagnostico temporario: troca o audio do microfone por um tom continuo,
+ * pra isolar se a escrita da task do microfone chega no alto-falante. */
+void audio_codec_set_mic_test_tone(bool on);
+
+/* Diagnostico: passagem direta escreve silencio no lugar do audio do mic (o
+ * mic segue ligado e lendo). Separa "chiado vem do ADC" de "chiado vem do
+ * caminho de saida". Ver POST /api/mic/tone {"silence":true}. */
+void audio_codec_set_mic_force_silence(bool on);
