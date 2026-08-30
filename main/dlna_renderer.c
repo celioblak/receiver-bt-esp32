@@ -9,6 +9,7 @@
 
 #include "audio_agc.h"
 #include "audio_codec.h"
+#include "audio_source.h"
 #include "bt_audio.h"
 #include "config.h"
 #include "flac_stream_decoder.h"
@@ -155,6 +156,79 @@ static TaskHandle_t s_event_task_handle = NULL;
  * real no arquivo. */
 static void dlna_notify_state_change_async(void);
 
+/* Rastreamento do cliente HTTP "ativo" da task de busca -- pedido explicito
+ * do usuario 2026-08-27 depois de reproduzir ao vivo um caso em que a task
+ * ficava presa DENTRO de esp_http_client_open()/fetch_headers() (nunca
+ * chegava nem a logar "Content-Type"), e nenhum mecanismo existente
+ * (retry, watchdog chamando dlna_engine_play() de novo) conseguia destravar
+ * -- notificacao de task so e processada quando a chamada bloqueante atual
+ * retorna, e essa nunca retornava sozinha.
+ *
+ * s_fetch_client_mutex protege so a LEITURA/ESCRITA do ponteiro (nunca a
+ * chamada de rede em si, que roda sem lock nenhum -- se o watchdog tivesse
+ * que esperar um mutex que a task travada esta seruando, nunca conseguiria
+ * agir). O watchdog (outra task) pode chamar esp_http_client_close() nesse
+ * handle enquanto a task de busca esta bloqueada dentro de uma chamada
+ * usando o MESMO handle -- isso e o padrao POSIX padrao pra interromper uma
+ * chamada bloqueante de outra thread (fechar o socket derruba o recv()
+ * pendente) e funciona na pratica mesmo o esp_http_client nao sendo
+ * formalmente thread-safe pra isso. O watchdog NUNCA chama cleanup() (que
+ * libera a memoria) -- só quem criou o client (dlna_fetch_attempt) faz
+ * isso, depois que sua propria chamada bloqueante retornar com erro. Ainda
+ * existe uma janela de corrida bem pequena (o dono podia ja ter chegado no
+ * cleanup() bem na hora que o watchdog pega o ponteiro) -- aceitavel aqui:
+ * o pior caso e um crash-e-reboot automatico, contra o cenario atual de
+ * ficar preso mudo indefinidamente sem nenhuma recuperacao. */
+static SemaphoreHandle_t s_fetch_client_mutex = NULL;
+static esp_http_client_handle_t s_active_fetch_client = NULL;
+static int64_t s_active_fetch_started_us = 0;
+
+static void dlna_fetch_client_register(esp_http_client_handle_t client)
+{
+    if (s_fetch_client_mutex == NULL) {
+        s_fetch_client_mutex = xSemaphoreCreateMutex();
+    }
+    xSemaphoreTake(s_fetch_client_mutex, portMAX_DELAY);
+    s_active_fetch_client = client;
+    s_active_fetch_started_us = esp_timer_get_time();
+    xSemaphoreGive(s_fetch_client_mutex);
+}
+
+static void dlna_fetch_client_unregister(esp_http_client_handle_t client)
+{
+    if (s_fetch_client_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_fetch_client_mutex, portMAX_DELAY);
+    if (s_active_fetch_client == client) {
+        s_active_fetch_client = NULL;
+    }
+    xSemaphoreGive(s_fetch_client_mutex);
+}
+
+/* Chamado só pelo watchdog de audio -- ver dlna_audio_watchdog_task(). Se
+ * houver uma busca em andamento ha muito tempo sem produzir nada (nem um
+ * log de Content-Type sequer), forca o fechamento pra destravar a task de
+ * busca. Retorna true se de fato havia algo pra fechar. */
+static bool dlna_force_close_stuck_fetch(int64_t max_age_us)
+{
+    if (s_fetch_client_mutex == NULL) {
+        return false;
+    }
+    esp_http_client_handle_t victim = NULL;
+    xSemaphoreTake(s_fetch_client_mutex, portMAX_DELAY);
+    if (s_active_fetch_client != NULL && (esp_timer_get_time() - s_active_fetch_started_us) > max_age_us) {
+        victim = s_active_fetch_client;
+    }
+    xSemaphoreGive(s_fetch_client_mutex);
+
+    if (victim == NULL) {
+        return false;
+    }
+    esp_http_client_close(victim);
+    return true;
+}
+
 /* Incrementado a cada Play/SetAVTransportURI -- a task de busca compara seu
  * proprio "my_generation" contra isso periodicamente; se mudou, uma
  * transicao mais nova ja superou essa busca, e ela aborta sozinha. Mesma
@@ -186,6 +260,13 @@ static SemaphoreHandle_t s_fetch_resume_sem = NULL;
  * estatico que derrubou o Slimproto nao existe aqui: e sempre a mesma
  * instancia de task, do boot ate o dispositivo desligar. */
 #define DLNA_RINGBUF_HIGHEST_WATER_LEVEL  (128 * 1024)
+/* Voltou pra 80KB (2026-08-28). Tentei 24KB pra encurtar a pausa de
+ * reenchimento e PIOROU muito (relato ao vivo): com menos reserva a
+ * reproducao volta antes da hora e seca de novo logo em seguida -- mais
+ * pausas, ainda que mais curtas. O problema nunca foi o tamanho da reserva,
+ * e sim o produtor nao acompanhar o tempo real (log confirmou o buffer
+ * secando ~1x/s); isso foi atacado na leitura HTTP (blocos maiores, sem
+ * pausas artificiais). Reserva grande e o comportamento correto aqui. */
 #define DLNA_RINGBUF_PREFETCH_WATER_LEVEL (80 * 1024)
 
 typedef enum {
@@ -209,6 +290,18 @@ static volatile dlna_ringbuf_mode_t s_ringbuf_mode = DLNA_RINGBUF_MODE_PREFETCHI
 static size_t dlna_write_ringbuf(const uint8_t *data, size_t size)
 {
     if (s_ringbuf == NULL || size == 0) {
+        return 0;
+    }
+
+    /* Fonte inativa: descarta na ORIGEM. Sem isso havia uma corrida real
+     * (diagnosticada 2026-08-28 pelo relato "chiado depois de algumas trocas
+     * de fonte, principalmente no DLNA"): ao trocar de fonte, o
+     * dlna_renderer_on_source_deactivated() esvazia o ring buffer, mas a
+     * task de busca ainda esta viva naquele instante e podia escrever MAIS
+     * audio logo depois do esvaziamento. Esse residuo ficava guardado e era
+     * tocado quando a fonte voltasse -- e pior, acumulava a cada troca,
+     * exatamente o padrao relatado. */
+    if (!audio_source_is_dlna()) {
         return 0;
     }
 
@@ -251,14 +344,36 @@ static void dlna_i2s_task_handler(void *arg)
 
     for (;;) {
         if (xSemaphoreTake(s_i2s_write_sem, portMAX_DELAY) == pdTRUE) {
+            /* Fonte inativa: volta a dormir sem tocar no codec (custo zero de
+             * CPU) -- garantia de "uma fonte por vez", ver audio_source.h. */
+            if (!audio_source_is_dlna()) {
+                continue;
+            }
             for (;;) {
                 size_t item_size = 0;
                 uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(
                     s_ringbuf, &item_size, pdMS_TO_TICKS(20), max_chunk);
                 if (item_size == 0) {
+                    /* Buffer secou: a reproducao PARA aqui e so volta quando o
+                     * produtor reenche ate DLNA_RINGBUF_PREFETCH_WATER_LEVEL.
+                     * Esse intervalo e silencio audivel -- forte candidato ao
+                     * "picotamento" relatado (2026-08-28), que ate agora nao
+                     * aparecia em log nenhum. Instrumentado pra confirmar com
+                     * evidencia em vez de suposicao. */
+                    static int64_t ultimo_log_us;
+                    int64_t agora = esp_timer_get_time();
+                    if (agora - ultimo_log_us > 1000000) {
+                        ultimo_log_us = agora;
+                        logger_log(ESP_LOG_WARN, TAG,
+                                   "dlna: buffer secou -- pausando ate reencher %d KB (fonte do picote)",
+                                   DLNA_RINGBUF_PREFETCH_WATER_LEVEL / 1024);
+                    }
                     s_ringbuf_mode = DLNA_RINGBUF_MODE_PREFETCHING;
                     break;
                 }
+                /* REVERTIDO 2026-08-28 -- ver explicacao em bt_audio.c: o
+                 * laco de cessao (hipotese de inanicao por prioridade) nao
+                 * se confirmou e coincidiu com uma piora relatada ao vivo. */
                 audio_agc_feed((const int16_t *)data, item_size / sizeof(int16_t));
                 size_t written = 0;
                 audio_codec_write(data, item_size, &written);
@@ -558,11 +673,10 @@ static bool dlna_should_abort(uint32_t my_generation)
     if (s_target_generation != my_generation) {
         return true; /* uma transicao mais nova ja superou esta busca */
     }
-    /* BT sempre tem prioridade -- mesma regra aplicada em todo o projeto
-     * (bt_audio.c/web_server.c/mqtt_ha.c). */
-    bt_audio_status_t bt;
-    bt_audio_get_status(&bt);
-    return bt.connected;
+    /* Antes: "BT conectado tem prioridade". Agora quem decide e o seletor de
+     * fonte (audio_source.h) -- nao existe mais disputa implicita entre as
+     * duas fontes, e sim uma unica ativa por vez. */
+    return !audio_source_is_dlna();
 }
 
 /* Bloqueia a task de busca EXATAMENTE onde ela esta (conexao HTTP, decoder
@@ -589,11 +703,21 @@ static bool dlna_wait_while_paused(uint32_t my_generation)
 static int dlna_http_read_exact(esp_http_client_handle_t client, uint8_t *buf, size_t len, uint32_t my_generation)
 {
     size_t got = 0;
+    int iter = 0;
     while (got < len) {
         if (dlna_should_abort(my_generation)) {
             return -1;
         }
+        /* Instrumentacao 2026-08-27: numa trava reproduzida ao vivo, o log
+         * parava aqui sem NUNCA sair -- precisamos saber se e uma unica
+         * chamada que nao volta, ou o laco girando com retornos vazios. */
+        int64_t call_start_us = esp_timer_get_time();
         int n = esp_http_client_read(client, (char *)buf + got, len - got);
+        int64_t call_ms = (esp_timer_get_time() - call_start_us) / 1000;
+        if (++iter <= 3 || call_ms > 1000) {
+            logger_log(ESP_LOG_INFO, TAG, "dlna: read_exact iter=%d n=%d em %lldms (got=%u/%u)",
+                       iter, n, (long long)call_ms, (unsigned)got, (unsigned)len);
+        }
         if (n <= 0) {
             return (int)got; /* fim de stream ou erro -- devolve o que conseguiu */
         }
@@ -722,7 +846,10 @@ static void dlna_emit_pcm16(const int16_t *samples, size_t sample_count, uint16_
 /* Caminho WAV/PCM/L16: sem decoder, so repassa (com truncamento de 24->16
  * bits quando for o caso -- mesma convencao ja usada pelo decoder FLAC:
  * pega os 2 bytes mais significativos de cada amostra). */
-static void dlna_stream_pcm(esp_http_client_handle_t client, uint32_t my_generation,
+/* Retorna true se chegou a desmutar (audio real produzido) -- usado por
+ * dlna_fetch_and_play() pra decidir se vale tentar de novo com conexao
+ * nova (ver dlna_fetch_attempt()). */
+static bool dlna_stream_pcm(esp_http_client_handle_t client, uint32_t my_generation,
                              uint32_t sample_rate, uint16_t channels, uint16_t bits, bool big_endian)
 {
     audio_codec_reconfigure_clock(sample_rate);
@@ -735,15 +862,15 @@ static void dlna_stream_pcm(esp_http_client_handle_t client, uint32_t my_generat
 
     for (;;) {
         if (dlna_should_abort(my_generation)) {
-            return;
+            return true;
         }
         if (s_fetch_paused && !dlna_wait_while_paused(my_generation)) {
-            return;
+            return true;
         }
         if (bits == 16) {
             int n = esp_http_client_read(client, (char *)in_buf, sizeof(in_buf));
             if (n <= 0) {
-                return; /* fim de stream ou erro/timeout */
+                return true; /* fim de stream ou erro/timeout -- ja tinha desmutado acima */
             }
             size_t sample_count = (size_t)n / sizeof(int16_t);
             if (big_endian) {
@@ -763,7 +890,7 @@ static void dlna_stream_pcm(esp_http_client_handle_t client, uint32_t my_generat
             size_t want = (sizeof(in_buf) / 3) * 3;
             int n = esp_http_client_read(client, (char *)in_buf, want);
             if (n <= 0) {
-                return;
+                return true;
             }
             size_t sample_count = (size_t)n / 3;
             for (size_t i = 0; i < sample_count; i++) {
@@ -772,7 +899,7 @@ static void dlna_stream_pcm(esp_http_client_handle_t client, uint32_t my_generat
             dlna_emit_pcm16(out_buf, sample_count, channels);
         } else {
             logger_log(ESP_LOG_WARN, TAG, "dlna: profundidade de bits nao suportada (%u)", bits);
-            return;
+            return false; /* nunca chegou a desmutar -- formato nao suportado */
         }
     }
 }
@@ -781,21 +908,36 @@ static void dlna_stream_pcm(esp_http_client_handle_t client, uint32_t my_generat
  * dlna_fetch_and_play pra identificar o formato -- semeia o buffer de
  * entrada do decoder com eles em vez de le-los de novo (ja foram
  * consumidos do socket). */
-static void dlna_stream_flac(esp_http_client_handle_t client, uint32_t my_generation, const uint8_t magic4[4])
+static bool dlna_stream_flac(esp_http_client_handle_t client, uint32_t my_generation, const uint8_t magic4[4])
 {
+    /* Instrumentacao 2026-08-27: numa trava reproduzida ao vivo, o log
+     * mostrou os 4 bytes iniciais lidos com SUCESSO e depois silencio
+     * absoluto -- nem "FLAC ... Hz", nem "sem PSRAM", nem o aviso de 8s do
+     * laco abaixo. Ou seja, nem chegava ao laco: a unica coisa entre um
+     * ponto e outro sao estas alocacoes, ate agora um ponto cego sem log
+     * nenhum. Suspeita: com a RAM interna no fundo do poco logo apos o BT
+     * conectar (visto 11KB livre / maior bloco 8KB), a criacao do decoder
+     * ou do buffer falha/demora de forma nao obvia. */
+    int64_t alloc_start_us = esp_timer_get_time();
     flac_stream_decoder_t *dec = flac_stream_decoder_create();
     if (dec == NULL) {
         logger_log(ESP_LOG_ERROR, TAG, "dlna: falha ao criar decoder FLAC");
-        return;
+        return false;
     }
 
     uint8_t *in_buf = heap_caps_malloc(DLNA_FLAC_IN_CAP, MALLOC_CAP_SPIRAM);
+    logger_log(ESP_LOG_INFO, TAG, "dlna: decoder+buffer alocados em %lldms (in_buf=%s, interna livre=%u)",
+               (long long)((esp_timer_get_time() - alloc_start_us) / 1000),
+               in_buf ? "ok" : "FALHOU",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     int32_t *out_buf = NULL;
     int16_t *pcm_buf = NULL;
     size_t out_cap_samples = 0;
     size_t in_len = 0;
     uint16_t channels = 2;
     bool unmuted = false;
+    int feed_iter = 0;
+    int read_iter = 0;
 
     if (in_buf == NULL) {
         logger_log(ESP_LOG_ERROR, TAG, "dlna: sem PSRAM pro buffer de entrada FLAC");
@@ -804,27 +946,134 @@ static void dlna_stream_flac(esp_http_client_handle_t client, uint32_t my_genera
     memcpy(in_buf, magic4, 4);
     in_len = 4;
 
+    int64_t header_wait_start_us = esp_timer_get_time();
     for (;;) {
+        /* Diagnostico 2026-08-27: os 4 pontos de saida abaixo cobrem abort/
+         * pausa/erro de rede/fim de stream, mas um relato "mudo" reproduzido
+         * ao vivo nao bateu com NENHUM deles -- nem com sucesso (nunca
+         * logou "FLAC ... Hz"). So sobra uma explicacao: o loop continua
+         * girando de verdade (sem erro, sem abortar), so que
+         * flac_stream_decoder_feed() nunca chega a FLAC_STREAM_HEADER_READY
+         * -- preso pedindo mais dados pra sempre, sem erro nem timeout de
+         * rede pra sair. Limite de tempo pra nao ficar preso mudo
+         * indefinidamente: 8s e bem mais que suficiente pra qualquer
+         * cabecalho FLAC real chegar (os casos que funcionam levam bem
+         * menos de 1s). */
+        if (!unmuted && (esp_timer_get_time() - header_wait_start_us) > 8000000) {
+            logger_log(ESP_LOG_ERROR, TAG,
+                       "dlna: FLAC preso esperando cabecalho ha 8s (in_len=%u) -- desistindo desta faixa",
+                       (unsigned)in_len);
+            break;
+        }
+        /* Diagnostico 2026-08-25: mesmo relato de audio "mudo" com dlna_state
+         * continuando "playing" (o cronometro de posicao roda por relogio,
+         * nao por audio de verdade decodificado -- ver dlna_renderer_get_
+         * status). Os 4 "break" deste loop eram silenciosos; se qualquer um
+         * disparar ANTES do cabecalho FLAC ser processado (!unmuted), o mute
+         * nunca chega a ser desligado e nada explica por que no log. So loga
+         * quando ainda mudo -- uma saida normal no FIM da faixa (ja
+         * desmutado) nao precisa disso. */
         if (dlna_should_abort(my_generation)) {
+            if (!unmuted) {
+                logger_log(ESP_LOG_WARN, TAG, "dlna: FLAC abortado antes do cabecalho (prioridade BT/nova geracao)");
+            }
             break;
         }
         if (s_fetch_paused && !dlna_wait_while_paused(my_generation)) {
+            if (!unmuted) {
+                logger_log(ESP_LOG_WARN, TAG, "dlna: FLAC abortado antes do cabecalho (pausado/invalidado)");
+            }
             break;
         }
         if (in_len < DLNA_FLAC_IN_CAP) {
-            int n = esp_http_client_read(client, (char *)in_buf + in_len, DLNA_FLAC_IN_CAP - in_len);
+            /* CAUSA RAIZ confirmada 2026-08-27 pela instrumentacao "feed #N":
+             * no caso bom, o laco chama o decoder varias vezes (#1 r=3, #2
+             * r=3, #3 r=1 -> cabecalho pronto). No caso travado, ele chama
+             * UMA vez (r=3 = "preciso de mais dados") e nunca mais volta --
+             * ou seja, fica preso justamente NESTA leitura, nao no decoder.
+             *
+             * Motivo: pedir "o buffer inteiro que falta" (ate 4096 bytes de
+             * uma vez) faz o esp_http_client esperar ATE JUNTAR TUDO. Logo
+             * apos a interrupcao do BT o servidor do MA volta a mandar aos
+             * poucos, entao esse pedido grande nunca se satisfaz e a leitura
+             * fica pendurada -- sem erro, sem timeout, com o audio mudo pra
+             * sempre ate reiniciar (exatamente o sintoma relatado).
+             *
+             * Correcao: pedir blocos pequenos (o decoder trabalha bem com
+             * qualquer quantidade -- ele mesmo pede mais quando precisa) e
+             * tratar "nada disponivel agora" como normal, cedendo a CPU e
+             * tentando de novo, com o limite de 8s acima como rede de
+             * seguranca real. */
+            /* Blocos de 1024 -> ate 4096 de novo (2026-08-28). Os blocos
+             * pequenos e as pausas abaixo foram criados quando a leitura
+             * parecia travar pra sempre -- mas a causa real daquilo era
+             * OUTRA (o mutex orfao do vTaskDelete, ver bt_audio.c), ja
+             * corrigida. O que sobrou foi um produtor lento demais: o log
+             * instrumentado mostrou o buffer secando ~1x por segundo, que e
+             * exatamente o picote. Ler em blocos maiores reduz drasticamente
+             * a quantidade de chamadas por segundo de audio. */
+            size_t want = DLNA_FLAC_IN_CAP - in_len;
+            int64_t rd_start_us = esp_timer_get_time();
+            int n = esp_http_client_read(client, (char *)in_buf + in_len, want);
+            int64_t rd_ms = (esp_timer_get_time() - rd_start_us) / 1000;
+            /* Primeiras leituras antes de desmutar (fase onde a trava
+             * acontece) + qualquer leitura anormalmente lenta. */
+            if ((!unmuted && ++read_iter <= 14) || rd_ms > 1000) {
+                logger_log(ESP_LOG_INFO, TAG, "dlna: read #%d n=%d em %lldms (want=%u in_len=%u)",
+                           read_iter, n, (long long)rd_ms, (unsigned)want, (unsigned)in_len);
+            }
             if (n < 0) {
-                break; /* erro/timeout de rede */
+                if (n == -ESP_ERR_HTTP_EAGAIN) {
+                    /* "Sem dados agora" -- normal em streaming, NAO e erro.
+                     * Pausa MINIMA (era 20ms): so pra ceder a CPU sem virar
+                     * espera ocupada. Pausas longas aqui estrangulavam o
+                     * produtor e faziam o buffer secar (ver o log de "buffer
+                     * secou"); quando ha dado no buffer nem paramos -- o
+                     * decoder trabalha com o que ja temos. */
+                    if (in_len == 0) {
+                        vTaskDelay(1);
+                    }
+                    continue;
+                }
+                if (!unmuted) {
+                    logger_log(ESP_LOG_WARN, TAG, "dlna: FLAC erro/timeout de rede antes do cabecalho (n=%d, in_len=%u)",
+                               n, (unsigned)in_len);
+                }
+                break; /* erro real de rede */
             }
             in_len += (size_t)n;
-            if (n == 0 && in_len == 0) {
-                break; /* fim de stream, nada mais a decodificar */
+            if (n == 0) {
+                if (in_len == 0) {
+                    if (!unmuted) {
+                        logger_log(ESP_LOG_WARN, TAG, "dlna: FLAC fim de stream antes do cabecalho (0 bytes recebidos)");
+                    }
+                    break; /* fim de stream, nada mais a decodificar */
+                }
+                /* Nada novo agora, mas ha dado no buffer: NAO dorme -- so
+                 * segue pro decoder processar o que ja temos. O
+                 * vTaskDelay(10ms) que existia aqui era puro estrangulamento
+                 * do produtor (ate 100 pausas/s), uma das causas do buffer
+                 * secar. */
             }
         }
 
         size_t consumed = 0, decoded = 0;
+        /* CORRIGIDO: era `static int` -- persistia entre execucoes e, na
+         * segunda reproducao, o filtro (<=5) suprimia TODOS os logs de feed,
+         * dando a falsa impressao de que o decoder nem era chamado. Contador
+         * local, por execucao, e o correto aqui. */
+        if (!unmuted) {
+            feed_iter++;
+        }
         flac_stream_result_t r = flac_stream_decoder_feed(dec, in_buf, in_len, out_buf, out_cap_samples,
                                                             &consumed, &decoded);
+        /* So as primeiras iteracoes antes de desmutar -- e exatamente a
+         * fase onde a trava acontece; depois disso o log ficaria inutil de
+         * tao cheio. */
+        if (!unmuted && feed_iter <= 14) {
+            logger_log(ESP_LOG_INFO, TAG, "dlna: feed #%d r=%d consumed=%u decoded=%u in_len=%u",
+                       feed_iter, (int)r, (unsigned)consumed, (unsigned)decoded, (unsigned)in_len);
+        }
         if (consumed > 0 && consumed <= in_len) {
             memmove(in_buf, in_buf + consumed, in_len - consumed);
             in_len -= consumed;
@@ -835,6 +1084,9 @@ static void dlna_stream_flac(esp_http_client_handle_t client, uint32_t my_genera
             break;
         }
         if (r == FLAC_STREAM_END_OF_STREAM) {
+            if (!unmuted) {
+                logger_log(ESP_LOG_WARN, TAG, "dlna: FLAC fim de stream antes do cabecalho ficar pronto");
+            }
             break;
         }
         if (r == FLAC_STREAM_HEADER_READY) {
@@ -877,18 +1129,16 @@ cleanup:
         heap_caps_free(pcm_buf);
     }
     flac_stream_decoder_destroy(dec);
+    return unmuted;
 }
 
-/* continuation=true quando esta emendando na proxima faixa da fila (ver
- * dlna_advance_to_next_track): nesse caso NAO descarta o que ainda esta no
- * ring buffer -- e justamente a cauda da faixa anterior, que precisa
- * terminar de tocar pra transicao ficar continua (gapless). */
-static void dlna_fetch_and_play(const char *uri, uint32_t my_generation, bool continuation)
+/* Uma unica tentativa de conectar+identificar formato+decodificar. Retorna
+ * true se chegou a produzir audio real (desmutou) -- usado por
+ * dlna_fetch_and_play() pra decidir se vale abrir uma conexao nova e
+ * tentar de nov (ver comentario la sobre o FLAC as vezes travando preso
+ * pedindo cabecalho que nunca chega, sem erro nem timeout). */
+static bool dlna_fetch_attempt(const char *uri, uint32_t my_generation)
 {
-    if (!continuation) {
-        dlna_ringbuf_flush();
-    }
-
     esp_http_client_config_t config = {
         .url = uri,
         .method = HTTP_METHOD_GET,
@@ -898,8 +1148,9 @@ static void dlna_fetch_and_play(const char *uri, uint32_t my_generation, bool co
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
         logger_log(ESP_LOG_ERROR, TAG, "dlna: falha ao criar cliente HTTP");
-        return;
+        return false;
     }
+    dlna_fetch_client_register(client);
     /* REVERTIDO (achado ao vivo, 2026-08-16): mandar "Icy-MetaData: 1" nao
      * trouxe o icy-metaint na resposta (MA nao honra esse pedido nesse
      * endpoint), e passou a coincidir com erros reais de decode FLAC logo
@@ -910,14 +1161,52 @@ static void dlna_fetch_and_play(const char *uri, uint32_t my_generation, bool co
      * playback -- volta pro pedido original sem esse cabecalho. */
 
     bool played_anything = false;
+    int64_t open_start_us = esp_timer_get_time();
     if (esp_http_client_open(client, 0) != ESP_OK) {
         logger_log(ESP_LOG_WARN, TAG, "dlna: falha ao conectar em %s", uri);
         goto done;
     }
 
+    /* CAUSA RAIZ confirmada 2026-08-27 pela instrumentacao de etapas: numa
+     * trava, o log parava DEPOIS do "Content-Type" e nenhum dos avisos de
+     * tempo/erro da leitura seguinte aparecia -- nem o de ">500ms", nem o
+     * de retorno negativo. A unica explicacao possivel e a leitura NUNCA
+     * retornar: a task fica bloqueada pra sempre esperando bytes que o
+     * servidor nao manda mais, sem erro e sem timeout.
+     *
+     * O .timeout_ms do esp_http_client_config_t NAO cobre isso de forma
+     * confiavel nas leituras de corpo em streaming (ele e aplicado no
+     * handshake/transacao, nao garante SO_RCVTIMEO no socket para cada
+     * recv() subsequente). A correcao de verdade e no proprio socket:
+     * SO_RCVTIMEO obriga cada recv() a devolver -1 (EAGAIN) apos o prazo,
+     * transformando a trava eterna num erro tratavel -- que o codigo acima
+     * ja sabe reportar e o retry/watchdog ja sabem recuperar. Mesma
+     * tecnica que este projeto ja usa no socket do SSDP (ver ssdp_task). */
     {
+        int sock = esp_http_client_get_socket(client);
+        if (sock >= 0) {
+            struct timeval tv = {.tv_sec = DLNA_HTTP_TIMEOUT_MS / 1000, .tv_usec = 0};
+            if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+                logger_log(ESP_LOG_WARN, TAG, "dlna: nao consegui aplicar SO_RCVTIMEO no socket de busca");
+            }
+        } else {
+            logger_log(ESP_LOG_WARN, TAG, "dlna: socket da busca indisponivel -- sem SO_RCVTIMEO");
+        }
+    }
+
+    {
+        int64_t open_ms = (esp_timer_get_time() - open_start_us) / 1000;
+        int64_t hdr_start_us = esp_timer_get_time();
         int64_t content_length = esp_http_client_fetch_headers(client);
-        (void)content_length; /* nao usado -- lemos ate o servidor fechar/EOF, chunked ou nao */
+        int64_t hdr_ms = (esp_timer_get_time() - hdr_start_us) / 1000;
+        /* Instrumentacao 2026-08-27 -- ver comentario na leitura dos 4 bytes
+         * iniciais mais abaixo. So loga quando alguma etapa demora de
+         * verdade, pra nao poluir o log em reproducao normal. */
+        if (open_ms > 500 || hdr_ms > 500) {
+            logger_log(ESP_LOG_WARN, TAG,
+                       "dlna: conexao lenta -- open=%lldms headers=%lldms content_length=%lld",
+                       (long long)open_ms, (long long)hdr_ms, (long long)content_length);
+        }
         int status = esp_http_client_get_status_code(client);
         if (status != 200) {
             logger_log(ESP_LOG_WARN, TAG, "dlna: servidor respondeu %d pra %s", status, uri);
@@ -941,6 +1230,21 @@ static void dlna_fetch_and_play(const char *uri, uint32_t my_generation, bool co
 
 
         if (dlna_should_abort(my_generation)) {
+            /* Diagnostico 2026-08-25: relato do usuario de "dlna_state fica
+             * 'playing' com posicao avancando, mas sem audio nenhum saindo"
+             * -- ate agora esse abort era silencioso (goto done sem log
+             * nenhum), e o estado ja tinha sido marcado PLAYING de forma
+             * otimista em dlna_engine_play() ANTES desta busca sequer
+             * confirmar o formato/comecar a decodificar. Se o abort cair
+             * aqui, a posicao so avanca pelo relogio (esp_timer_get_time()
+             * em dlna_renderer_get_status), sem nenhum audio de verdade
+             * fluindo -- exatamente o sintoma relatado. */
+            bt_audio_status_t bt_abort_check;
+            bt_audio_get_status(&bt_abort_check);
+            logger_log(ESP_LOG_WARN, TAG,
+                       "dlna: abortando ANTES de decodificar (geracao %" PRIu32 " vs alvo %" PRIu32
+                       ", bt_connected=%d) -- uri=%s",
+                       my_generation, s_target_generation, (int)bt_abort_check.connected, uri);
             goto done;
         }
 
@@ -959,22 +1263,48 @@ static void dlna_fetch_and_play(const char *uri, uint32_t my_generation, bool co
             uint32_t rate;
             uint16_t channels;
             dlna_parse_l16_params(ct_lower, &rate, &channels);
-            dlna_stream_pcm(client, my_generation, rate, channels, 16, true /* L16 e big-endian, RFC 2586 */);
-            played_anything = true;
+            played_anything = dlna_stream_pcm(client, my_generation, rate, channels, 16, true /* L16 e big-endian, RFC 2586 */);
         } else {
+            /* Instrumentacao 2026-08-27: o log de varias travas ao vivo
+             * parava exatamente depois do "Content-Type" e antes de
+             * qualquer coisa aqui -- ou seja, ficava preso NESTA leitura
+             * dos 4 primeiros bytes, sem nunca sair nem com erro. Medir
+             * quanto tempo essa leitura leva (e distinguir os casos de
+             * retorno) e o unico jeito de saber se o socket simplesmente
+             * nao entrega dado, se aborta por prioridade, ou se fica preso
+             * de vez. */
+            logger_log(ESP_LOG_INFO, TAG, "dlna: entrando na leitura dos 4 bytes iniciais");
+            int64_t magic_start_us = esp_timer_get_time();
             uint8_t magic[4] = {0};
             int got = dlna_http_read_exact(client, magic, sizeof(magic), my_generation);
-            if (got != (int)sizeof(magic)) {
+            /* Loga os bytes crus recebidos: e a prova definitiva de o stream
+             * comecar (ou nao) com a assinatura "fLaC" (66 4c 61 43). */
+            logger_log(ESP_LOG_INFO, TAG, "dlna: saiu da leitura inicial (got=%d) bytes=%02x %02x %02x %02x",
+                       got, magic[0], magic[1], magic[2], magic[3]);
+            int64_t magic_elapsed_ms = (esp_timer_get_time() - magic_start_us) / 1000;
+            if (magic_elapsed_ms > 500 || got != (int)sizeof(magic)) {
+                logger_log(ESP_LOG_WARN, TAG,
+                           "dlna: leitura dos 4 bytes iniciais levou %lldms e devolveu %d",
+                           (long long)magic_elapsed_ms, got);
+            }
+            if (got < 0) {
+                /* -1 = abortou por prioridade BT/geracao nova, NAO e "stream
+                 * fechou" -- a mensagem anterior confundia os dois casos. */
+                bt_audio_status_t bt_dbg;
+                bt_audio_get_status(&bt_dbg);
+                logger_log(ESP_LOG_WARN, TAG,
+                           "dlna: leitura inicial abortada (geracao %" PRIu32 " vs alvo %" PRIu32
+                           ", bt_connected=%d)",
+                           my_generation, s_target_generation, (int)bt_dbg.connected);
+            } else if (got != (int)sizeof(magic)) {
                 logger_log(ESP_LOG_WARN, TAG, "dlna: stream fechou antes de mandar dado suficiente pra identificar o formato");
             } else if (memcmp(magic, "fLaC", 4) == 0) {
-                dlna_stream_flac(client, my_generation, magic);
-                played_anything = true;
+                played_anything = dlna_stream_flac(client, my_generation, magic);
             } else if (memcmp(magic, "RIFF", 4) == 0) {
                 uint32_t rate = 0;
                 uint16_t channels = 0, bits = 0;
                 if (dlna_wav_parse_header(client, my_generation, magic, &rate, &channels, &bits)) {
-                    dlna_stream_pcm(client, my_generation, rate, channels, bits, false);
-                    played_anything = true;
+                    played_anything = dlna_stream_pcm(client, my_generation, rate, channels, bits, false);
                 }
             } else if (memcmp(magic, "ID3", 3) == 0 || (magic[0] == 0xFF && (magic[1] & 0xE0) == 0xE0)) {
                 /* ID3v2 (tag no inicio) ou sync word MPEG cru -- MP3. Sem
@@ -990,8 +1320,35 @@ static void dlna_fetch_and_play(const char *uri, uint32_t my_generation, bool co
     }
 
 done:
+    dlna_fetch_client_unregister(client);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    return played_anything;
+}
+
+/* continuation=true quando esta emendando na proxima faixa da fila (ver
+ * dlna_advance_to_next_track): nesse caso NAO descarta o que ainda esta no
+ * ring buffer -- e justamente a cauda da faixa anterior, que precisa
+ * terminar de tocar pra transicao ficar continua (gapless). */
+static void dlna_fetch_and_play(const char *uri, uint32_t my_generation, bool continuation)
+{
+    if (!continuation) {
+        dlna_ringbuf_flush();
+    }
+
+    bool played_anything = dlna_fetch_attempt(uri, my_generation);
+    /* Relato do usuario 2026-08-27: FLAC as vezes trava pedindo cabecalho
+     * que nunca chega, sem erro nem timeout de rede (ver diagnostico em
+     * dlna_stream_flac) -- fica "playing" mas mudo, e so um "pular faixa"
+     * manual destravava. Se a primeira tentativa nao produziu audio
+     * nenhum E ninguem mais novo assumiu nesse meio tempo, tenta de novo
+     * com uma conexao HTTP nova antes de desistir de verdade -- na
+     * pratica cobre o caso de o servidor/conexao ter simplesmente
+     * engasgado uma vez. */
+    if (!played_anything && !dlna_should_abort(my_generation)) {
+        logger_log(ESP_LOG_WARN, TAG, "dlna: tentativa nao produziu audio -- tentando de novo com conexao nova");
+        played_anything = dlna_fetch_attempt(uri, my_generation);
+    }
 
     /* So mexe no estado "tocando" se ninguem mais novo assumiu -- mesma
      * regra ja usada no Slimproto pra nao cortar o comeco de uma faixa
@@ -1039,7 +1396,6 @@ done:
             dlna_notify_state_change_async();
         }
     }
-    (void)played_anything;
 }
 
 /* Promove a faixa enfileirada por SetNextAVTransportURI a faixa atual --
@@ -1140,6 +1496,16 @@ static void dlna_engine_play(void)
      * ficou pausada (SetAVTransportURI com uma URI diferente ja teria
      * zerado s_transport_state pra STOPPED -- ver aquele handler). */
     bool resuming = have_uri && (s_transport_state == DLNA_STATE_PAUSED);
+    /* Diagnostico 2026-08-27: relato de audio "mudo" com dlna_state=playing
+     * e posicao avancando (so pelo relogio) -- suspeita forte: "resuming"
+     * dando true incorretamente aqui faz o audio_codec_set_mute(false) sem
+     * NUNCA acordar/criar uma busca nova (xTaskNotifyGive so roda no ramo
+     * !resuming) -- se a fetch task nao estiver de verdade parada esperando
+     * o semaforo (ex.: ja tinha saido por causa do BT ter assumido), dar o
+     * semaforo e um no-op, e nenhum audio real chega a fluir, mesmo com o
+     * mute desligado e o estado marcado "playing". */
+    logger_log(ESP_LOG_INFO, TAG, "dlna: Play -- have_uri=%d resuming=%d estado_antes=%d fetch_paused=%d",
+               (int)have_uri, (int)resuming, (int)s_transport_state, (int)s_fetch_paused);
     if (have_uri) {
         s_playing = true;
         s_transport_state = DLNA_STATE_PLAYING;
@@ -1627,6 +1993,21 @@ static void dlna_notify_state_change_async(void)
     }
 }
 
+bool dlna_renderer_force_notify(void)
+{
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool subscribed = s_event_subscribed;
+    xSemaphoreGive(s_state_mutex);
+
+    if (!subscribed) {
+        logger_log(ESP_LOG_WARN, TAG, "dlna: forcar NOTIFY pedido, mas nao ha assinatura ativa -- nada a mandar");
+        return false;
+    }
+    logger_log(ESP_LOG_INFO, TAG, "dlna: forcando reenvio manual de NOTIFY (diagnostico)");
+    dlna_notify_state_change_async();
+    return true;
+}
+
 /* O LastChange precisa carregar mais que o TransportState: quando a fila
  * avanca internamente (dlna_advance_to_next_track), o estado CONTINUA
  * "PLAYING" -- se o evento so disser isso, o control point nao tem como
@@ -1731,6 +2112,13 @@ static void dlna_event_task(void *arg)
              * erro (control point pode cancelar a assinatura/reiniciar sem
              * mandar UNSUBSCRIBE, isso e normal e nao indica bug daqui). */
             logger_log(ESP_LOG_WARN, TAG, "dlna: NOTIFY de evento falhou (%s)", esp_err_to_name(err));
+        } else {
+            /* Log de sucesso adicionado 2026-08-27 pra diagnostico manual
+             * (dlna_renderer_force_notify) -- antes so se sabia de falha,
+             * nao dava pra confirmar no log que um NOTIFY realmente saiu e
+             * foi aceito (2xx) pelo control point. */
+            logger_log(ESP_LOG_INFO, TAG, "dlna: NOTIFY de evento enviado (seq=%s, status=%d, estado=%s)",
+                       seq_str, esp_http_client_get_status_code(client), state_str);
         }
         esp_http_client_cleanup(client);
     }
@@ -1999,11 +2387,13 @@ static esp_err_t avtransport_control_handler(httpd_req_t *req)
          * pela via SINCRONA e essencial porque o eventing pode nem estar
          * assinado (dlna_subscribed=false e comum aqui), entao NOTIFY sozinho
          * nao garante que a informacao chegue. */
-        bt_audio_status_t bt;
-        bt_audio_get_status(&bt);
-        if (bt.connected) {
+        /* Agora a condicao e o SELETOR DE FONTE, nao mais "BT conectado":
+         * com uma fonte ativa por vez (audio_source.h), o DLNA so aceita
+         * tocar quando ele proprio e a fonte escolhida (botao KEY1 ou
+         * POST /api/source). */
+        if (!audio_source_is_dlna()) {
             logger_log(ESP_LOG_WARN, TAG,
-                       "Play recusado (705): Bluetooth conectado tem prioridade");
+                       "Play recusado (705): fonte ativa e o Bluetooth -- troque no botao KEY1 ou /api/source");
             soap_fault_code(req, 705, "Transport is locked");
             return ESP_OK;
         }
@@ -2402,6 +2792,118 @@ static void build_uuid(void)
  * bt_audio_prealloc_ring_buffer(): alocar sob demanda, so quando a primeira
  * faixa DLNA chegasse, concorreria com WiFi/HTTP/mDNS ja fragmentando o
  * heap depois do boot. */
+/* Watchdog de audio: pedido explicito do usuario 2026-08-27, depois de
+ * varios relatos ao vivo de "estado diz tocando mas nao sai som nenhum"
+ * (achado: o decoder FLAC as vezes trava pedindo cabecalho que nunca chega,
+ * sem erro nem timeout de rede -- ja mitigado parcialmente com o retry em
+ * dlna_fetch_and_play(), mas essa e uma rede de seguranca por cima,
+ * independente da causa exata, e mais rapida que os 8s do timeout do FLAC
+ * sozinho). Roda a cada 1s (rapido de proposito, pra nao dar sensacao de
+ * travamento) e olha o timestamp global da ultima escrita real no I2S
+ * (audio_codec_last_write_us(), compartilhado entre BT e DLNA).
+ *
+ * So mexe no lado DLNA (reinicia a faixa atual chamando dlna_engine_play()
+ * de novo -- o mesmo caminho que um Play normal do control point usa,
+ * gera geracao nova e acorda a task de busca). No lado Bluetooth so loga
+ * bem visivel: forcar desconexao/reconexao do BT por conta propria e mais
+ * arriscado (a pilha BT e mais sensivel a esse tipo de intervencao), e o
+ * padrao ainda precisa ser melhor entendido antes de agir sozinho ali. */
+static void dlna_audio_watchdog_task(void *arg)
+{
+    (void)arg;
+    /* CORRIGIDO 2026-08-27 (ao vivo, reproduzido na hora): a carencia
+     * original (3s) era MENOR que o proprio orcamento de tempo que o
+     * mecanismo de retry em dlna_fetch_and_play() precisa pra funcionar
+     * sozinho (ate ~8s esperando o cabecalho FLAC, mais uma segunda
+     * tentativa inteira com conexao nova -- na pratica ate uns 15-20s num
+     * caso legitimo mas lento). Com carencia curta, o watchdog reiniciava o
+     * Play a cada 6s pra sempre, ANTES do retry interno ter chance de
+     * terminar, e cada reinicio zerava o cronometro de novo -- um loop que
+     * nunca dava certo nem desistia, pior que o bug original. Agora: espera
+     * bem mais que o pior caso legitimo, e desiste de vez (para com
+     * STOPPED) depois de MAX_KICKS tentativas sem sucesso, em vez de
+     * reiniciar pra sempre. */
+    const int64_t STUCK_THRESHOLD_US = 5000000;      /* 5s sem nenhuma escrita real */
+    const int64_t GRACE_AFTER_PLAY_US = 20000000;    /* bem acima do pior caso legitimo do retry interno */
+    const int64_t COOLDOWN_US = 8000000;             /* espaco entre reinicios, da tempo de cada tentativa rodar */
+    const int MAX_KICKS = 2;                         /* depois disso, desiste (STOPPED) em vez de repetir pra sempre */
+    int64_t last_dlna_kick_us = 0;
+    int64_t last_bt_warn_us = 0;
+    int consecutive_kicks = 0;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        int64_t now = esp_timer_get_time();
+        int64_t last_write = audio_codec_last_write_us();
+        int64_t idle_us = (last_write == 0) ? INT64_MAX : (now - last_write);
+
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        dlna_transport_state_t dlna_state = s_transport_state;
+        int64_t playback_start = s_playback_start_us;
+        xSemaphoreGive(s_state_mutex);
+
+        bt_audio_status_t bt;
+        bt_audio_get_status(&bt);
+
+        if (dlna_state != DLNA_STATE_PLAYING || bt.connected) {
+            consecutive_kicks = 0; /* saiu do estado suspeito -- reseta a contagem */
+        }
+
+        if (dlna_state == DLNA_STATE_PLAYING && !bt.connected) {
+            bool past_grace = (now - playback_start) > GRACE_AFTER_PLAY_US;
+            bool past_cooldown = (now - last_dlna_kick_us) > COOLDOWN_US;
+            if (past_grace && past_cooldown && idle_us > STUCK_THRESHOLD_US) {
+                /* Achado ao vivo 2026-08-27: reiniciar via dlna_engine_play()
+                 * sozinho nao adianta nada se a task de busca estiver presa
+                 * DENTRO de uma chamada de rede bloqueante (nunca chegou a
+                 * logar nem "Content-Type") -- notificacao de task so e
+                 * processada quando essa chamada retornar, e ela nao
+                 * retornava sozinha. Forca o fechamento de qualquer busca
+                 * parada ha mais de 6s ANTES de pedir o reinicio, pra
+                 * garantir que a task realmente esteja livre pra pegar a
+                 * geracao nova (ver dlna_force_close_stuck_fetch()). */
+                bool closed_stuck = dlna_force_close_stuck_fetch(6000000);
+                if (consecutive_kicks >= MAX_KICKS) {
+                    logger_log(ESP_LOG_ERROR, TAG,
+                               "watchdog: DLNA continua sem audio real apos %d tentativas -- desistindo (STOPPED) "
+                               "em vez de repetir pra sempre",
+                               consecutive_kicks);
+                    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                    s_playing = false;
+                    s_transport_state = DLNA_STATE_STOPPED;
+                    s_playback_elapsed_base_us = 0;
+                    s_next_uri[0] = '\0';
+                    xSemaphoreGive(s_state_mutex);
+                    audio_codec_set_mute(true);
+                    relay_control_notify_playing(false);
+                    dlna_notify_state_change_async();
+                    consecutive_kicks = 0;
+                    last_dlna_kick_us = now;
+                    continue;
+                }
+                consecutive_kicks++;
+                logger_log(ESP_LOG_ERROR, TAG,
+                           "watchdog: DLNA diz \"playing\" mas sem audio real ha %llds -- reiniciando a faixa "
+                           "atual (tentativa %d/%d%s)",
+                           (long long)(idle_us / 1000000), consecutive_kicks, MAX_KICKS,
+                           closed_stuck ? ", busca presa fechada a forca" : "");
+                last_dlna_kick_us = now;
+                dlna_engine_play();
+            }
+        } else if (bt.connected && bt.playing) {
+            bool past_cooldown = (now - last_bt_warn_us) > COOLDOWN_US;
+            if (past_cooldown && idle_us > STUCK_THRESHOLD_US) {
+                logger_log(ESP_LOG_ERROR, TAG,
+                           "watchdog: Bluetooth diz \"playing\" mas sem audio real ha %llds -- "
+                           "SEM acao automatica (so aviso), avaliar padrao antes de agir",
+                           (long long)(idle_us / 1000000));
+                last_bt_warn_us = now;
+            }
+        }
+    }
+}
+
 static void dlna_engine_init(void)
 {
     /* XML pesado vai pra PSRAM (ver comentario nos #define DLNA_BUF_*). */
@@ -2439,7 +2941,22 @@ static void dlna_engine_init(void)
                      &s_i2s_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "dlna: falha ao criar task de I2S");
     }
-    if (xTaskCreate(dlna_fetch_task, "dlna_fetch", DLNA_FETCH_TASK_STACK, NULL, 5,
+    /* Prioridade 5 -> 10: achado ao vivo 2026-08-27 (log cruzado com o
+     * proprio Music Assistant) que a task de busca/decode do DLNA podia
+     * ficar sem rodar por 20+ segundos com dado real ja disponivel no
+     * socket esperando pra ser lido -- o MA chegou a logar "Ignored
+     * premature client disconnection" porque foi o NOSSO watchdog quem
+     * desistiu e fechou a conexao, nao o servidor que parou de mandar.
+     * Causa: bt_app_task_handler (bt_audio.c) roda com prioridade 10, mais
+     * alta que os antigos 5 daqui -- uma rajada de eventos do Bluetooth
+     * (conectando/desconectando repetido, como no teste que reproduziu
+     * isso) podia monopolizar o processador e nunca deixar esta task
+     * rodar pra consumir o socket. Empatando a prioridade evita fome numa
+     * direcao ou na outra (round-robin do FreeRTOS entre as duas quando
+     * as duas tem trabalho) -- o audio de saida em si continua protegido
+     * por tasks de I2S dedicadas e bem mais prioritarias que as duas
+     * (configMAX_PRIORITIES-3, ver acima e bt_i2s_task_handler). */
+    if (xTaskCreate(dlna_fetch_task, "dlna_fetch", DLNA_FETCH_TASK_STACK, NULL, 10,
                      &s_fetch_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "dlna: falha ao criar task de busca/decode");
     }
@@ -2449,6 +2966,47 @@ static void dlna_engine_init(void)
                      &s_event_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "dlna: falha ao criar task de eventing");
     }
+    if (xTaskCreate(dlna_audio_watchdog_task, "dlna_watchdog", 3072, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "dlna: falha ao criar watchdog de audio");
+    }
+}
+
+void dlna_renderer_on_source_deactivated(void)
+{
+    /* Invalida a busca em andamento (a task de busca ve a geracao nova em
+     * dlna_should_abort e sai sozinha, sem ser destruida) e zera o estado,
+     * avisando o control point que paramos. */
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_target_generation++;
+    s_playing = false;
+    s_transport_state = DLNA_STATE_STOPPED;
+    s_playback_elapsed_base_us = 0;
+    s_next_uri[0] = '\0';
+    s_fetch_paused = false;
+    xSemaphoreGive(s_state_mutex);
+
+    if (s_fetch_resume_sem != NULL) {
+        xSemaphoreGive(s_fetch_resume_sem); /* destrava a task se estava pausada */
+    }
+    dlna_ringbuf_flush();
+    logger_log(ESP_LOG_INFO, TAG, "dlna: fonte trocada para Bluetooth -- reproducao DLNA encerrada");
+    dlna_notify_state_change_async();
+}
+
+void dlna_renderer_on_source_activated(void)
+{
+    /* Comeca sempre do zero: mesmo com o descarte na origem
+     * (dlna_write_ringbuf), esvaziar aqui garante que nada de uma sessao
+     * anterior sobreviva a troca. */
+    dlna_ringbuf_flush();
+    /* CRITICO: voltar pro modo PREFETCHING. O semaforo que acorda a task de
+     * I2S e um sinal de UMA VEZ (dado pelo produtor na transicao
+     * PREFETCHING -> PROCESSING). Se o modo ficasse em PROCESSING de uma
+     * sessao anterior, esse sinal nunca mais seria dado e a task dormiria
+     * pra sempre -- audio mudo ate reiniciar. Zerando aqui, o produtor
+     * refaz a transicao e entrega o sinal de novo. */
+    s_ringbuf_mode = DLNA_RINGBUF_MODE_PREFETCHING;
+    logger_log(ESP_LOG_INFO, TAG, "dlna: fonte ativa -- pronto para receber do control point");
 }
 
 void dlna_renderer_get_status(dlna_status_t *out)

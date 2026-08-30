@@ -1,6 +1,8 @@
 #include "audio_agc.h"
 #include "audio_codec.h"
+#include "audio_source.h"
 #include "bt_audio.h"
+#include "button_diag.h"
 #include "config.h"
 #include "dlna_renderer.h"
 #include "logger.h"
@@ -154,6 +156,11 @@ void app_main(void)
      * todo. Só desmuda quando o A2DP realmente começa a tocar (bt_audio.c). */
     audio_codec_set_mute(true);
 
+    /* Seletor de fonte ANTES de subir BT/DLNA: os dois consultam
+     * audio_source_is_*() nas suas tasks (ver audio_source.h). Sempre comeca
+     * em Bluetooth. */
+    audio_source_init();
+
     pairing_init();
     relay_control_init();
     /* NAO chamar audio_codec_play_test_tone() aqui -- ligar rele + I2S tao
@@ -171,6 +178,7 @@ void app_main(void)
         dlna_renderer_init();
     }
     mqtt_ha_init();
+    button_diag_init();
 
     while (1) {
         /* esp_get_free_heap_size() inclui os 4MB de PSRAM e sempre parece

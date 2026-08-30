@@ -11,14 +11,6 @@
     <h1>Dispositivos Bluetooth</h1>
     <nav><a href="/index.html">&larr; Voltar</a></nav>
 
-    <div class="card" id="pending-pin-card" style="display:none">
-        <span class="label">Pareamento em andamento</span>
-        <p class="track-sub" style="margin:0.3rem 0">Dispositivo <strong id="pending-pin-mac"></strong> — digite este código no celular:</p>
-        <p style="font-size:1.8rem; font-weight:bold; letter-spacing:0.2rem; margin:0">
-            <span id="pending-pin-code"></span>
-        </p>
-    </div>
-
     <div class="card">
         <div class="row">
             <span class="label">Visível para parear</span>
@@ -43,10 +35,40 @@
         </p>
         <div id="device-list">Carregando...</div>
     </div>
+
+    <div class="card">
+        <div class="row">
+            <span class="label">Diagnóstico: desligar Wi-Fi temporariamente</span>
+        </div>
+        <p class="track-sub" style="margin:0.3rem 0 0.6rem">
+            Desliga o rádio Wi-Fi por alguns minutos pra testar se algum ruído no áudio
+            vem dele ou do Bluetooth (os dois dividem o mesmo rádio do chip). Bluetooth,
+            música e o relé continuam funcionando normalmente. <strong>Esta página e o
+            MQTT ficam fora do ar durante a janela</strong> — o dispositivo reinicia
+            sozinho no fim do prazo pra religar tudo automaticamente, sem precisar
+            fazer nada.
+        </p>
+        <button type="button" id="wifi-off-btn">Desligar Wi-Fi por 5 min (só Bluetooth)</button>
+        <div id="wifi-off-msg" class="track-sub" style="margin-top:0.4rem"></div>
+    </div>
 </main>
 
 <script src="/app.js"></script>
 <script>
+document.getElementById("wifi-off-btn").addEventListener("click", async () => {
+    if (!confirm("Desligar o Wi-Fi por 5 minutos? A pagina web e o MQTT ficam fora do ar ate o dispositivo religar sozinho.")) {
+        return;
+    }
+    const msg = document.getElementById("wifi-off-msg");
+    try {
+        await apiPost("/api/wifi/disable_temp", { duration_s: 300 });
+        msg.textContent = "Wi-Fi desligando... volta sozinho em ~5 min.";
+    } catch (e) {
+        /* a resposta pode nao chegar por causa do proprio Wi-Fi caindo -- normal */
+        msg.textContent = "Wi-Fi desligando... volta sozinho em ~5 min.";
+    }
+});
+
 async function pair(mac, action) {
     await apiPost("/api/pair", { mac, action });
     load();
@@ -54,27 +76,19 @@ async function pair(mac, action) {
 
 /* Lógica da janela de pareamento vive em app.js (btPairing), compartilhada
  * com a página inicial -- aqui só ligamos os elementos desta página. */
-btPairing.init("pairing-badge", "pairing-btn", () => refreshPendingPin(), "pairing-aviso");
+btPairing.init("pairing-badge", "pairing-btn", () => refreshPairingStatus(), "pairing-aviso");
 
-async function refreshPendingPin() {
+async function refreshPairingStatus() {
     try {
         const s = await apiGet("/api/status");
-        const card = document.getElementById("pending-pin-card");
-        if (s.pending_pin_code) {
-            card.style.display = "block";
-            document.getElementById("pending-pin-mac").textContent = s.pending_pin_mac;
-            document.getElementById("pending-pin-code").textContent = s.pending_pin_code;
-        } else {
-            card.style.display = "none";
-        }
         /* visível sem prazo = interruptor permanente ligado nas Configurações */
         btPairing.update(s);
     } catch (e) {
         console.error(e);
     }
 }
-refreshPendingPin();
-setInterval(refreshPendingPin, 2000);
+refreshPairingStatus();
+setInterval(refreshPairingStatus, 2000);
 
 async function load() {
     const devices = await apiGet("/api/devices");
@@ -115,24 +129,34 @@ async function load() {
         blockBtn.style.background = "var(--off)";
         blockBtn.onclick = () => pair(d.mac, "block");
 
+        /* Só faz sentido oferecer a ação pra mudar PRA o estado oposto do
+         * atual -- já autorizado não precisa de "Autorizar" (nem já
+         * bloqueado de "Bloquear"). */
+        if (d.allowed) {
+            allowBtn.style.display = "none";
+        } else {
+            blockBtn.style.display = "none";
+        }
+
+        /* Um botao so (pedido explicito do usuario -- "Esquecer" e "Remover
+         * do historico" eram dois botoes fazendo reset parcial e diferente
+         * cada um, confuso). "forget" agora faz o reset completo: desliga o
+         * bond no controlador BT, desconecta se estiver conectado, e limpa
+         * historico + autorizado + bloqueado (ver pairing_clear_device()
+         * em pairing.c) -- pareamento/conexao seguinte comeca do zero,
+         * seguindo a regra de bloqueio atual (ex.: "Controle de
+         * dispositivo" em Configuracoes). */
         const forgetBtn = document.createElement("button");
-        forgetBtn.textContent = "Esquecer (remove o pareamento)";
+        forgetBtn.textContent = "Desparear / remover";
         forgetBtn.style.marginTop = "0";
         forgetBtn.style.background = "var(--off)";
         forgetBtn.onclick = () => {
-            if (confirm("Esquecer " + (d.name || d.mac) + "? Ele vai desconectar e precisar parear de novo pra voltar a usar.")) {
+            if (confirm("Desparear " + (d.name || d.mac) + "? Ele desconecta agora e precisa parear de novo do zero pra voltar a usar.")) {
                 pair(d.mac, "forget");
             }
         };
 
-        const removeBtn = document.createElement("button");
-        removeBtn.textContent = "Remover do historico";
-        removeBtn.style.marginTop = "0";
-        removeBtn.style.background = "transparent";
-        removeBtn.style.border = "1px solid var(--border)";
-        removeBtn.onclick = () => pair(d.mac, "remove");
-
-        actions.append(allowBtn, blockBtn, forgetBtn, removeBtn);
+        actions.append(allowBtn, blockBtn, forgetBtn);
         row.appendChild(actions);
         list.appendChild(row);
     }

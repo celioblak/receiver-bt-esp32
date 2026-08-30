@@ -11,6 +11,21 @@
     <h1 id="device-name">Receiver Bluetooth DIY</h1>
 
     <div class="card">
+        <div class="row">
+            <span class="label">Fonte de áudio</span>
+            <span class="badge on" id="source-badge">Bluetooth</span>
+        </div>
+        <p class="track-sub" style="margin:0.3rem 0 0.6rem">
+            Uma fonte por vez — a inativa fica totalmente parada, sem disputar o áudio.
+            Também alterna pelo botão <strong>KEY1</strong> da placa. Ao reiniciar, volta para Bluetooth.
+        </p>
+        <div class="row" style="gap:0.5rem">
+            <button type="button" id="source-bt" style="margin-top:0; flex:1">Bluetooth</button>
+            <button type="button" id="source-dlna" style="margin-top:0; flex:1">DLNA</button>
+        </div>
+    </div>
+
+    <div class="card">
         <div class="track" id="track">—</div>
         <div class="track-sub" id="artist-album">—</div>
         <div class="row">
@@ -124,6 +139,14 @@ async function refresh() {
         document.getElementById("artist-album").textContent =
             [s.artist, s.album].filter(Boolean).join(" — ") || "—";
 
+        /* Fonte ativa: destaca qual das duas manda agora (ver audio_source.h
+         * no firmware -- uma por vez, sem concorrencia). */
+        const ehDlna = s.audio_source === "dlna";
+        const sourceBadge = document.getElementById("source-badge");
+        sourceBadge.textContent = ehDlna ? "DLNA" : "Bluetooth";
+        document.getElementById("source-bt").disabled = !ehDlna;
+        document.getElementById("source-dlna").disabled = ehDlna;
+
         const btBadge = document.getElementById("bt-badge");
         btBadge.textContent = s.bt_connected ? (s.playing ? "tocando" : "conectado") : "desconectado";
         btBadge.className = "badge " + (s.bt_connected ? "on" : "off");
@@ -217,6 +240,19 @@ document.getElementById("disconnect-btn").addEventListener("click", async (e) =>
         await apiPost("/api/pair", { mac, action: "disconnect" });
     }
 });
+
+/* Troca de fonte -- mesmo efeito do botao fisico KEY1. Atualiza na hora em
+ * vez de esperar o proximo ciclo de atualizacao automatica. */
+async function trocarFonte(fonte) {
+    try {
+        await apiPost("/api/source", { source: fonte });
+    } catch (e) {
+        console.error(e);
+    }
+    refresh();
+}
+document.getElementById("source-bt").addEventListener("click", () => trocarFonte("bluetooth"));
+document.getElementById("source-dlna").addEventListener("click", () => trocarFonte("dlna"));
 
 document.getElementById("media-prev").addEventListener("click", () => apiPost("/api/media", { cmd: "previous" }));
 document.getElementById("media-playpause").addEventListener("click", () => apiPost("/api/media", { cmd: "playpause" }));
