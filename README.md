@@ -8,6 +8,8 @@ Receiver de áudio Bluetooth A2DP baseado no **ESP32 Audio Kit V2.2** (módulo E
 
 **Pós-v1.0.0:** a placa se revelou ter 8MB de PSRAM (apesar da documentação genérica do ESP32-A1S dizer que não tem) — isso resolveu uma classe inteira de crashes por heap fragmentado durante A2DP+Wi-Fi+MQTT simultâneos (ver [Notas](#notas)). Também: volume fino (escala perceptual 0-200, curva linear em dB), AGC ativável, reinício remoto, busca de Wi-Fi pela interface web, exibição do dispositivo Bluetooth conectado, gestão de pareamento (autorizar/bloquear/esquecer/desconectar), pareamento com PIN opcional e visibilidade Bluetooth configurável, controle de mídia (play/pause/próxima/anterior) e integração bidirecional com MQTT/Home Assistant — ver [Volume fino e AGC](#volume-fino-e-agc), [API REST](#api-rest) e [MQTT / Home Assistant](#mqtt--home-assistant).
 
+**Microfone / karaokê validado em hardware (2026-08-30):** entrada correta do codec identificada e corrigida (o firmware lia a diferença entre os dois microfones embutidos em vez do jack — 130× menos sinal), conversor que sobe ruidoso corrigido por corte de MCLK sem reiniciar (28/28 boots utilizáveis), portão trocado por expansor com rampa e latência reduzida de ~70ms para ~35ms. Ver [Entrada de microfone / Karaokê](#entrada-de-microfone--karaokê).
+
 **Limitação conhecida (hardware, não corrigível por firmware):** atividade de rádio (Wi-Fi e/ou Bluetooth, inclusive em idle/scan) acopla um ruído audível de baixo nível no estágio analógico do ES8388 nesta placa — mais perceptível em silêncio/transições do que durante reprodução contínua. Ver [Notas](#notas) para o diagnóstico completo e o que foi testado.
 
 ## Hardware
@@ -99,9 +101,9 @@ Todos os endpoints retornam/aceitam JSON (exceto `/ota`, que recebe o `.bin` bru
 
 | Método | Rota | Descrição |
 |---|---|---|
-| GET | `/api/status` | Estado atual: conexão BT (`bt_remote_mac`/`bt_remote_name`) ou Slimproto/Music Assistant (`slim_connected`/`slim_playing`), faixa/artista/álbum (de qualquer uma das duas fontes — BT tem prioridade), volume (0-200), AGC (`agc_enabled`/`agc_gain`/`agc_target`/`agc_mode`), amplificador, IP, uptime, `bt_discoverable`, `bt_require_pin`, `pending_pin_mac`/`pending_pin_code` (pareamento em andamento — ver [Pareamento](#gestão-de-pareamento-e-visibilidade-bluetooth)), `ma_configured`/`ma_token_valid` (token da API do Music Assistant — ver [`docs/music_assistant_integration.md`](docs/music_assistant_integration.md)) |
+| GET | `/api/status` | Estado atual: conexão BT (`bt_remote_mac`/`bt_remote_name`) ou Slimproto/Music Assistant (`slim_connected`/`slim_playing`), faixa/artista/álbum (de qualquer uma das duas fontes — BT tem prioridade), volume (0-200), AGC (`agc_enabled`/`agc_gain`/`agc_target`/`agc_mode`), amplificador, IP, uptime, `bt_discoverable`, `ma_configured`/`ma_token_valid` (token da API do Music Assistant — ver [`docs/music_assistant_integration.md`](docs/music_assistant_integration.md)) |
 | GET | `/api/config` | Configurações atuais (sem senhas/token) |
-| POST | `/api/config` | Salva configurações (nome, Wi-Fi, timeout do relé, MQTT, `slim_host`, `ma_token`, `bt_discoverable`, `bt_require_pin`) |
+| POST | `/api/config` | Salva configurações (nome, Wi-Fi, timeout do relé, MQTT, `bt_discoverable`, `pairing_lock` e os do microfone: `mic_enabled`, `mic_input`, `mic_gain`, `mic_gate_level`, `mic_auto_gate` — todos aplicam na hora) |
 | POST | `/api/volume` | `{"volume": 0-200}` (escala perceptual — ver [Volume fino e AGC](#volume-fino-e-agc)) |
 | POST | `/api/agc` | `{"enabled": bool, "target": -30 a -6 (dBFS), "mode": 0\|1\|2}` |
 | POST | `/api/media` | `{"cmd": "play"\|"pause"\|"playpause"\|"stop"\|"next"\|"previous"}` — AVRCP passthrough pro celular (se BT conectado) ou protocolo LMS clássico pro Music Assistant (se Slimproto conectado, ver `main/lms_cli.c`) |
@@ -109,16 +111,83 @@ Todos os endpoints retornam/aceitam JSON (exceto `/ota`, que recebe o `.bin` bru
 | GET | `/api/devices` | Histórico de dispositivos Bluetooth pareados (`allowed` = está na lista de autorizados) |
 | POST | `/api/pair` | `{"mac": "...", "action": "allow"\|"block"\|"remove"\|"forget"\|"disconnect"}` — ver [Pareamento](#gestão-de-pareamento-e-visibilidade-bluetooth) |
 | GET | `/api/wifi/scan` | Lista redes Wi-Fi visíveis (`ssid`, `rssi`, `secure`) |
+| POST | `/api/mic/scan` | Varre as 4 entradas analógicas do codec medindo cada uma (~6s) — cante durante o teste, longe da placa |
+| POST | `/api/mic/hardreset` | Corta o MCLK por 500ms e reconstrói I2S + codec (~1,5s) — tira o conversor do estado ruidoso sem reiniciar |
+| GET | `/api/mic/raw` | Amostras cruas do ADC (`?n=`), antes de filtro/portão/ganho — diagnóstico |
+| POST | `/api/mic/reg` | Lê/escreve registrador do ES8388 ao vivo (`{"reg":N}` / `{"reg":N,"val":V}`) — diagnóstico |
 | POST | `/api/system/restart` | Reinicia o dispositivo (responde e reinicia ~500ms depois) |
 | POST | `/ota` | Corpo bruto = novo firmware (`.bin`); reinicia automaticamente |
+| POST | `/ota/spiffs` | Corpo bruto = nova imagem da interface (`spiffs.bin`) — atualiza a web pela rede, sem cabo |
 
 ### Gestão de pareamento e visibilidade Bluetooth
 
 - **Lista de autorizados vazia = aceita qualquer dispositivo** (padrão). Autorizar (`action: "allow"`) pelo menos um MAC restringe pareamento *e* conexão só à lista — a checagem acontece tanto no pareamento inicial (`ESP_BT_GAP_CFM_REQ_EVT`) quanto a cada conexão nova (`ESP_A2D_CONNECTION_STATE_EVT`), porque um dispositivo já pareado antes (com link key salva no controlador BT) reconecta direto sem passar pela confirmação de novo — só checar no pareamento deixava essa brecha aberta.
+- `action: "block"` bloqueia esse MAC de verdade (lista de bloqueados própria, separada da de autorizados) — mesmo com a lista de autorizados vazia. Antes disso existir, "bloquear" só tentava *remover* o MAC da lista de autorizados; como a lista vazia nunca chegava a conter ninguém, a remoção não encontrava nada e o bloqueio não tinha efeito nenhum na prática. `action: "allow"` limpa um bloqueio anterior do mesmo MAC (os dois estados são mutuamente exclusivos).
+- **Controle de dispositivo** (`pairing_lock`, padrão desligado): ligado, o **primeiro** dispositivo que completar um pareamento novo vira automaticamente o único autorizado — a partir daí a lista deixa de estar vazia e passa a restringir todo mundo depois dele (autorize manualmente na página Dispositivos se precisar de mais de um). Desligado (comportamento de sempre): qualquer um que parear fica liberado, sem restrição automática. Só age num pareamento novo de verdade, não numa reconexão de bond já existente.
 - `action: "disconnect"` derruba a conexão atual sem mexer no pareamento — o dispositivo pode reconectar depois normalmente.
 - `action: "forget"` remove o bond no controlador Bluetooth e desconecta agora — o dispositivo precisa parear de novo do zero pra voltar a conectar. Use pra liberar a conexão de vez pra outro dispositivo.
-- **Visibilidade** (`bt_discoverable`, padrão ligado): quando desligado, o receptor não aparece mais na busca de dispositivos Bluetooth de quem ainda não pareou — dispositivos já pareados continuam conectando normalmente (`CONNECTABLE` continua sempre ligado, só `DISCOVERABLE` muda).
-- **PIN de pareamento** (`bt_require_pin`, padrão desligado): ativa o fluxo "Passkey Entry" do Bluetooth (SSP, funciona em celulares modernos — diferente do PIN legado de 4 dígitos, que a maioria dos celulares ignora quando SSP está disponível). Quando alguém novo tenta parear, um código de 6 dígitos gerado na hora aparece em `/api/status` (`pending_pin_mac`/`pending_pin_code`) e na página **Dispositivos** da interface web — a pessoa digita esse código no celular pra completar o pareamento. Não afeta dispositivos já pareados.
+- **Visibilidade** (`bt_discoverable`, padrão **desligado**): quando desligado, o receptor não aparece na busca de dispositivos Bluetooth de quem ainda não pareou — só fica visível numa janela temporária (botão "Permitir pareamento", 3 min por padrão) ou permanentemente se essa opção for ligada. Dispositivos já pareados continuam conectando normalmente em qualquer um dos casos (`CONNECTABLE` continua sempre ligado, só `DISCOVERABLE` muda).
+- **Sem PIN de pareamento**: o pareamento é sempre "Just Works" (sem confirmação manual). Existiu uma opção de exigir um código de 6 dígitos ("Passkey Entry"), removida — na prática, o Bluetooth negociava *Numeric Comparison* com celulares modernos (a capacidade do receiver, sem tela, é `DisplayOnly`), então o receiver só confirmava automaticamente sem comparar nada: o código não adicionava nenhuma segurança real além do Just Works padrão, só uma etapa extra sem efeito. Quem controla o acesso de verdade é a lista de autorizados/bloqueados acima.
+
+## Entrada de microfone / Karaokê
+
+Validado em hardware real (2026-08-30), captando por um receptor de microfone sem fio ligado ao jack de entrada da placa. Desligado por padrão; ligável em Configurações, pela API (`mic_enabled`) ou por MQTT — **aplica na hora**, sem reiniciar. Quando ligado, o áudio do microfone é misturado por cima de qualquer coisa que esteja tocando (Bluetooth ou DLNA) e também sai sozinho quando não há música ("passagem direta").
+
+### A entrada certa: o roteamento herdado do AC101
+
+O ESP32-A1S Audio Kit V2.2 herdou o roteamento de entrada da versão com codec AC101 e **não o adaptou ao ES8388**, que tem menos entradas. O resultado, confirmado no esquemático do módulo e no levantamento de [Phil Schatzmann](https://www.pschatzmann.ch/home/2021/12/15/the-ai-thinker-audiokit-audio-input-bug/):
+
+| pino do módulo | entrada do ES8388 | o que é |
+|---|---|---|
+| `MIC1P` (17) | LIN1 | microfone embutido esquerdo |
+| `MIC2P` (15) | RIN1 | microfone embutido direito |
+| `MIC1N` (18) + `LINEINL` (22) | LIN2 | jack de entrada, esquerdo |
+| `MIC2N` (14) + `LINEINR` (21) | RIN2 | jack de entrada, direito |
+
+Ou seja: os microfones embutidos e o jack estão em **entradas diferentes**, e só dá para ouvir uma de cada vez. O firmware usava o modo diferencial `LIN1−RIN1`, que amplifica a **diferença entre os dois microfones embutidos** — eles captam quase o mesmo som, então a voz era cancelada na subtração e o ruído descorrelacionado de cada um passava inteiro. Era a causa de "voz baixa, tem que cantar colado" e do chiado que só piorava com mais ganho.
+
+Medido com o usuário cantando no microfone de mão, longe da placa:
+
+```
+mic embutido (LIN1/RIN1, single-ended) ......    100
+jack single-ended (0x0A = 0x50) .............     17
+diferencial dos mics (LIN1−RIN1) ............  1.078   <- o que o firmware usava
+diferencial do jack (LIN2−RIN2) ............. 13.064   <- correto
+```
+
+A entrada é selecionável em Configurações e persistida em NVS (`mic_input`, padrão 3 = diferencial do jack). **`POST /api/mic/scan`** varre as quatro em ~6 s medindo cada uma — usar cantando na fonte de verdade, longe da placa; o critério é **reagir à fonte certa**, não ter o número maior.
+
+### O conversor que sobe ruidoso, e o corte de MCLK
+
+O ADC do ES8388 sobe gerando ruído branco em cerca de 1 boot a cada 6. Isso **não é configuração** — foi isolado até o fim: os 54 registradores são idênticos entre um boot bom e um ruim, o ruído não muda com a entrada selecionada nem com o PGA (0 a +21 dB), e cai 15× com o volume digital do ADC, ou seja nasce **dentro do conversor**, entre o PGA e o volume digital. Nada recupera: nem reescrever registradores, nem reset da máquina de estados, nem reset total do chip, nem recriar os canais I2S, nem reprogramar o clock.
+
+O que recupera é **matar o MCLK**: segurar o GPIO do clock mestre em nível zero por 500 ms e reconstruir I2S e codec (`audio_codec_mic_hard_reset()`). Era a única coisa que o reboot do ESP32 fazia de diferente. Leva ~1,5 s contra os ~25 s de um reinício, e `mic_live_task` aplica automaticamente quando detecta o conversor ruim, com teto de tentativas e conferindo o resultado. Medido: **28 de 28 boots com o microfone utilizável**, sendo 4 corrigidos sozinhos.
+
+Também corrigido: **a ordem dos enables do I2S**. O RX precisa ser armado **antes** do TX, porque o ESP32 é o master e o clock só nasce quando o TX sobe — habilitar o RX com o BCLK/WS já correndo o fazia engatar num ponto arbitrário do frame. Isso eliminou o modo de falha "ADC entrega zeros".
+
+### Portão: expansor com rampa
+
+O chiado que restava **não é da placa**: com o receptor desligado o piso é mediana 5 (o fundo do conversor); com ele ligado em silêncio, 1408. É o ruído de fundo do próprio receptor, reproduzido fielmente.
+
+O portão binário anterior errava nas bordas — abria num degrau e segurava aberto ~700 ms depois da voz cair, deixando o piso passar inteiro. Foi trocado por um **expansor com rampa**: envelope amostra a amostra (ataque instantâneo), ganho contínuo com attack ~1,5 ms e release ~250 ms, piso em −30 dB. Entre os dois limiares o ganho é proporcional, não liga/desliga, então sílaba fraca sai mais baixa em vez de picotada.
+
+Três detalhes que importam e não são óbvios:
+
+- a task escreve no I2S **sempre**, inclusive no silêncio (atenuado). Parar de escrever deixava buracos no fluxo, e descontinuidade é estalo — um por palavra;
+- o mute do DAC acompanha o **relé** (~3 s de silêncio), não a palavra: mutar e desmutar por palavra é uma escrita I2C que corta a saída de forma abrupta;
+- a decisão de abrir é tomada por **envelope por amostra**, não pelo pico do bloco — decidir por bloco atrasava a abertura em um bloco inteiro.
+
+### Latência
+
+Com o microfone ligado o caminho é encurtado (`dma_frame_num` 240 → 120, blocos de processamento pela metade): **~70 ms → ~35 ms** entre cantar e ouvir. A folga contra engasgo de coexistência Wi-Fi/BT cai junto — se voltar a picotar na música, `dma_frame_num` em `i2s_init()` é o primeiro número a subir. Sem microfone nada muda: os 12 descritores cheios seguem protegendo Bluetooth e DLNA.
+
+### Armadilhas já pagas
+
+- **Não remover os microfones embutidos.** Eles não captam nada útil na entrada em uso (medido: falar alto a 10 cm não move o nível), mas **sem microfone na placa o ADC não sobe** — com resistor de 1 kΩ e de 10 kΩ no lugar do MIC1 foram 0 boots saudáveis em 18 tentativas. Captar e inicializar são coisas diferentes.
+- PGA `0x88` (+24 dB) **trava** o ADC entregando zeros; o máximo utilizável é `0x77`.
+- `ADCCONTROL6 = 0x10` dá mais sinal mas o ADC passa a subir saturado. Fica no padrão `0x30`.
+- Ganho e limiar do portão são interdependentes — mexer num sem o outro emudece o microfone.
+- O detector de estado do ADC julga pela **mediana** (não pelo pico, que um único estalo distorce) e conta **amostras** (não blocos, que já mudaram de tamanho por baixo dele).
 
 ## MQTT / Home Assistant
 
@@ -136,7 +205,10 @@ O nome do dispositivo na HA (device registry, não o nome de cada entidade) segu
   - `number` Timeout do Amplificador (`cmd/relay_timeout`, 5-600s)
   - `switch` AGC (`cmd/agc_enabled`)
   - `switch` Visibilidade Bluetooth (`cmd/bt_discoverable`)
-  - `switch` Exigir PIN (`cmd/bt_require_pin`)
+  - `switch` Microfone (`cmd/mic_enabled`) e `switch` Detecção de Voz (`cmd/mic_auto_gate`) — ver [Entrada de microfone / Karaokê](#entrada-de-microfone--karaokê). Aplicam na hora, sem reiniciar.
+  - `number` Volume do Microfone (`cmd/mic_gain`, 0-100) e `number` Portão do Microfone (`cmd/mic_gate_level`) — são os dois números que se afina **cantando**, e por MQTT dá pra ajustar do celular sem largar o microfone.
+  - `sensor` Estado do Microfone (`mic_adc`: `saudavel`/`chiando`/`travado`) — fora de `saudavel` o áudio do mic é silenciado de propósito; o firmware corrige sozinho cortando o MCLK, e este sensor conta se algum dia desistir.
+  - `switch` Controle de Dispositivo (`cmd/pairing_lock`) — ver [Pareamento](#gestão-de-pareamento-e-visibilidade-bluetooth).
   - `button` Play / Pause / Próxima / Anterior (`cmd/media`, payloads `play`/`pause`/`next`/`previous` — usa Bluetooth/AVRCP se conectado, senão Music Assistant via Slimproto)
 - Qualquer mudança via MQTT publica o estado atualizado de volta em `homeassistant/sensor/receiver_bt/state` na hora (não espera o heartbeat de 30s).
 - WiFi e MQTT em si ficam de fora das entidades configuráveis por MQTT de propósito — reconfigurar o próprio canal MQTT por ele mesmo é arriscado (um host/senha errado corta o único jeito de corrigir por ali); use a interface web pra isso.
