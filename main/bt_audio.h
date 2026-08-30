@@ -13,6 +13,14 @@
 
 void bt_audio_init(void);
 
+/* Chamados por audio_source.c quando o seletor de fonte troca (ver
+ * audio_source.h). "deactivated": desconecta quem estiver tocando e para de
+ * aceitar conexoes -- a pilha BT continua carregada (troca de volta e
+ * instantanea), mas nenhuma task daqui toca no codec enquanto o DLNA for a
+ * fonte ativa. "activated": volta a aceitar conexoes. */
+void bt_audio_on_source_activated(void);
+void bt_audio_on_source_deactivated(void);
+
 typedef struct {
     bool connected;
     bool playing;
@@ -20,12 +28,6 @@ typedef struct {
     char title[64];
     char artist[64];
     char album[64];
-    /* Preenchido quando bt_audio_set_require_pin(true) e um dispositivo
-     * novo esta no meio do pareamento (Passkey Entry) -- pending_pin_code
-     * vazio ("") = nenhum pareamento pendente. A pessoa digita esse codigo
-     * no celular pra completar o pareamento. */
-    char pending_pin_mac[18];
-    char pending_pin_code[8];
 } bt_audio_status_t;
 
 /* Cópia thread-safe do estado atual (usado por web_server.c em /api/status). */
@@ -83,10 +85,3 @@ uint32_t bt_audio_get_discoverable_remaining_s(void);
 /* Encerra a janela temporaria antes do prazo. Sem efeito se a visibilidade
  * for permanente (aquela vem do NVS e se desliga por bt_audio_set_discoverable). */
 void bt_audio_stop_discoverable_temporary(void);
-
-/* true = novos pareamentos exigem "Passkey Entry": um codigo de 6 digitos
- * gerado na hora e mostrado em /api/status (pending_pin_code), que a
- * pessoa deve digitar no celular. Dispositivos ja pareados nao sao
- * afetados. Aplica na hora, sem precisar reiniciar. */
-void bt_audio_set_require_pin(bool require_pin);
-bool bt_audio_get_require_pin(void);

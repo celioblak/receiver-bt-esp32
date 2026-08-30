@@ -5,7 +5,9 @@
 
 #include "audio_agc.h"
 #include "audio_codec.h"
+#include "audio_source.h"
 #include "config.h"
+#include "dlna_renderer.h"
 #include "logger.h"
 #include "pairing.h"
 #include "relay_control.h"
@@ -54,7 +56,6 @@ static volatile bool s_discoverable_before_temp = false;
  * prazo, e a contagem exibia "0s restantes" enquanto o aparelho ainda estava
  * pareavel. A checagem no loop continua existindo como rede de seguranca. */
 static esp_timer_handle_t s_discoverable_timer = NULL;
-static volatile bool s_require_pin = DEFAULT_BT_REQUIRE_PIN;
 
 /* -------------------------------------------------------------------------
  * Fila de trabalho: os callbacks do Bluedroid rodam na task da pilha BT e
@@ -148,6 +149,12 @@ static size_t write_ringbuf(const uint8_t *data, size_t size)
          * suficiente) — descarta em vez de crashar em xRingbufferSend. */
         return 0;
     }
+    /* Fonte inativa: descarta na origem -- mesmo motivo do dlna_write_ringbuf
+     * (residuo escrito depois do esvaziamento da troca, que se acumulava e
+     * virava chiado ao voltar pra esta fonte). */
+    if (!audio_source_is_bt()) {
+        return 0;
+    }
     if (s_ringbuf_mode == RINGBUF_MODE_DROPPING) {
         size_t used = 0;
         vRingbufferGetInfo(s_ringbuf_i2s, NULL, NULL, NULL, NULL, &used);
@@ -182,6 +189,13 @@ static void bt_i2s_task_handler(void *arg)
 
     for (;;) {
         if (xSemaphoreTake(s_i2s_write_sem, portMAX_DELAY) == pdTRUE) {
+            /* Fonte inativa: nao consome nem escreve nada -- volta a dormir no
+             * semaforo (custo zero de CPU) em vez de disputar o codec com o
+             * DLNA. E a garantia arquitetural de "uma fonte por vez"
+             * (ver audio_source.h). */
+            if (!audio_source_is_bt()) {
+                continue;
+            }
             for (;;) {
                 size_t item_size = 0;
                 uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(
@@ -193,6 +207,25 @@ static void bt_i2s_task_handler(void *arg)
                     s_ringbuf_mode = RINGBUF_MODE_PREFETCHING;
                     break;
                 }
+                /* REVERTIDO 2026-08-28: aqui existiam duas tentativas de
+                 * correcao que PIORARAM o comportamento (relato do usuario:
+                 * "tem horas que nem toca nem via bt") e nao tinham
+                 * evidencia a favor:
+                 *
+                 * 1. Descartar o audio quando bt_connected era falso. Erro
+                 *    real: ha uma corrida no inicio da reproducao -- o audio
+                 *    A2DP pode chegar ANTES de s_status.connected virar
+                 *    true (ver ESP_A2D_AUDIO_STATE_EVT, que ate corrige o
+                 *    estado por conta propria nesse caso), e o descarte
+                 *    jogava fora audio legitimo.
+                 * 2. Laco cedendo enquanto audio_codec_clock_change_pending()
+                 *    -- hipotese de inanicao por prioridade que nao se
+                 *    confirmou, e que so acrescentava atraso no caminho
+                 *    critico do audio.
+                 *
+                 * O que fica: os prazos (timeouts) em audio_codec.c, que tem
+                 * evidencia direta no log (2006ms medidos) e nao alteram o
+                 * caminho feliz. */
                 audio_agc_feed((const int16_t *)data, item_size / sizeof(int16_t));
                 size_t written = 0;
                 audio_codec_write(data, item_size, &written);
@@ -224,21 +257,40 @@ static void bt_audio_prealloc_ring_buffer(void)
     }
 }
 
+/* CAUSA RAIZ do "audio fica mudo depois de desconectar/reconectar, so
+ * reiniciando resolve" -- encontrada 2026-08-28 lendo este trecho com o
+ * conhecimento acumulado da instrumentacao.
+ *
+ * bt_i2s_task_stop() chamava vTaskDelete() na task de I2S. Isso a mata num
+ * ponto ARBITRARIO -- inclusive dentro de audio_codec_write(), ou seja,
+ * SEGURANDO o mutex do codec (s_i2s_mutex). Um mutex cujo dono morreu nunca
+ * mais e liberado: todas as escritas seguintes (do BT reconectado OU do
+ * DLNA) ficam esperando pra sempre por ele.
+ *
+ * Isso explica cada sintoma observado nesta investigacao:
+ *  - so acontece DEPOIS de uma desconexao de BT;
+ *  - e intermitente (depende de a task estar ou nao na secao critica no
+ *    instante exato da morte);
+ *  - o DLNA travava exatamente em audio_codec_reconfigure_clock(), que
+ *    espera o mesmo mutex (medidos 2006ms ate estourar o prazo);
+ *  - depois passou a afetar tambem o proprio BT ao reconectar;
+ *  - so reiniciar resolvia (unica forma de recriar o mutex);
+ *  - rede, decodificacao FLAC e memoria sempre pareciam saudaveis, porque
+ *    de fato estavam -- o problema nunca esteve la.
+ *
+ * Correcao: task PERSISTENTE, criada uma unica vez e nunca destruida --
+ * mesmo padrao que dlna_i2s_task_handler ja usa (e que nunca apresentou
+ * este defeito). Sem BT conectado ela simplesmente fica ociosa, esperando
+ * no semaforo. "start"/"stop" viram apenas gestao do ring buffer. */
 static void bt_i2s_task_start(void)
 {
     if (s_ringbuf_i2s == NULL || s_i2s_write_sem == NULL) {
         return; /* bt_audio_prealloc_ring_buffer() falhou no boot */
     }
-    if (s_i2s_task_handle != NULL) {
-        /* Ja tem uma rodando (ex.: evento de desconexao anterior nao
-         * processado a tempo numa troca rapida de dispositivo) -- criar
-         * outra faria duas tasks brigarem pelo mesmo ring buffer/semaforo.
-         * bt_i2s_task_stop() sempre roda antes de uma nova conexao ser
-         * aceita, entao isso so deveria disparar em cenario de corrida. */
-        ESP_LOGW(TAG, "task de I2S ja estava rodando, nao criando outra");
-        return;
-    }
     s_ringbuf_mode = RINGBUF_MODE_PREFETCHING;
+    if (s_i2s_task_handle != NULL) {
+        return; /* ja existe -- persistente, nao recria */
+    }
     if (xTaskCreate(bt_i2s_task_handler, "bt_i2s_task", 2560, NULL, configMAX_PRIORITIES - 3, &s_i2s_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "falha ao criar task de I2S (heap insuficiente) — sem audio nesta sessao");
     }
@@ -246,12 +298,9 @@ static void bt_i2s_task_start(void)
 
 static void bt_i2s_task_stop(void)
 {
-    if (s_i2s_task_handle) {
-        vTaskDelete(s_i2s_task_handle);
-        s_i2s_task_handle = NULL;
-    }
-    /* Buffer e semaforo continuam vivos (ver bt_audio_prealloc_ring_buffer)
-     * — só descarta qualquer resto de áudio da sessão anterior. */
+    /* NAO destroi a task (ver comentario acima) -- so descarta o audio
+     * residual da sessao anterior. A task fica ociosa sozinha, porque o
+     * ring buffer para de receber dados quando nao ha A2DP tocando. */
     if (s_ringbuf_i2s) {
         size_t item_size;
         void *data;
@@ -275,48 +324,44 @@ static void bt_app_gap_handler(uint16_t event, void *p_param)
             if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
                 logger_log(ESP_LOG_INFO, TAG, "Pareamento OK: %s", param->auth_cmpl.device_name);
                 pairing_record_device(param->auth_cmpl.bda, (const char *)param->auth_cmpl.device_name);
+                /* "Controle de dispositivo" (pairing_get_lock_mode()): so
+                 * age aqui, num pareamento NOVO de verdade -- nao na
+                 * reconexao de bond antigo (ESP_BT_GAP_READ_REMOTE_NAME_EVT
+                 * abaixo, que so atualiza o nome no historico). Com a lista
+                 * ja tendo alguem, nao mexe -- so o PRIMEIRO a parear com o
+                 * controle ligado vira o autorizado. */
+                if (pairing_get_lock_mode() && pairing_get_allowed_count() == 0) {
+                    pairing_set_allowed(param->auth_cmpl.bda, true);
+                    logger_log(ESP_LOG_INFO, TAG,
+                               "Controle de dispositivo: %s autorizado automaticamente (primeiro a parear)",
+                               param->auth_cmpl.device_name);
+                }
             } else {
                 logger_log(ESP_LOG_WARN, TAG, "Falha no pareamento, status=%d", param->auth_cmpl.stat);
             }
-            /* limpa o codigo pendente (ver ESP_BT_GAP_KEY_NOTIF_EVT) --
-             * pareamento terminou, com sucesso ou nao */
-            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-            s_status.pending_pin_mac[0] = '\0';
-            s_status.pending_pin_code[0] = '\0';
-            xSemaphoreGive(s_status_mutex);
             break;
         case ESP_BT_GAP_CFM_REQ_EVT:
-            /* "Just Works": confirma automaticamente, exceto se houver lista de
-             * dispositivos autorizados e este MAC não estiver nela. So
-             * dispara com IO capability NoInputNoOutput (require_pin=false,
-             * ver bt_stack_up) -- com require_pin=true o fluxo e Passkey
-             * Entry (ESP_BT_GAP_KEY_NOTIF_EVT abaixo), sem confirmacao. */
-            if (pairing_is_allowed(param->cfm_req.bda)) {
-                esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
-            } else {
-                logger_log(ESP_LOG_WARN, TAG, "Pareamento rejeitado (dispositivo nao autorizado)");
-                esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, false);
+            /* "Just Works": sempre confirma, mesmo pra mac fora da lista de
+             * autorizados -- a restricao de verdade acontece depois, na
+             * conexao A2DP (ver ESP_A2D_CONNECTION_STATE_EVT abaixo), nao
+             * aqui no pareamento. Antes rejeitar aqui (ssp_confirm_reply
+             * false) fazia o Windows entrar num ciclo de "tentando... falhou"
+             * sem nunca completar o pareamento (SSP falhando repetidas
+             * vezes e visto como erro generico pela pilha do PC, nao como
+             * "recusado por politica") -- pedido explicito do usuario:
+             * "deve parear mas bloquear". Deixando parear de verdade, o
+             * aparelho aparece no historico (via AUTH_CMPL_EVT abaixo) e
+             * fica gerenciavel pela pagina Dispositivos, mesmo bloqueado. */
+            esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+            break;
+        case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
+            /* Resposta do esp_bt_gap_read_remote_name() disparado na conexao
+             * A2DP (ver ESP_A2D_CONNECTION_STATE_EVT acima) -- reusa
+             * pairing_record_device() pra (re)inserir no historico com
+             * nome, cobrindo reconexao de bond antigo sem pareamento novo. */
+            if (param->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS) {
+                pairing_record_device(param->read_rmt_name.bda, (const char *)param->read_rmt_name.rmt_name);
             }
-            break;
-        case ESP_BT_GAP_KEY_NOTIF_EVT: {
-            /* IO capability DisplayOnly (require_pin=true): o stack gerou
-             * um passkey de 6 digitos que PRECISAMOS mostrar pro usuario
-             * (sem tela fisica, mostramos via /api/status) -- a pessoa
-             * digita esse numero no celular pra completar o pareamento.
-             * A lista de autorizados (pairing_is_allowed) continua
-             * valendo depois: ver o recheck em ESP_A2D_CONNECTION_STATE_EVT. */
-            uint8_t *bda = param->key_notif.bda;
-            logger_log(ESP_LOG_INFO, TAG, "Passkey pra parear [%02x:%02x:%02x:%02x:%02x:%02x]: %06" PRIu32,
-                       bda[0], bda[1], bda[2], bda[3], bda[4], bda[5], param->key_notif.passkey);
-            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-            snprintf(s_status.pending_pin_mac, sizeof(s_status.pending_pin_mac),
-                     "%02x:%02x:%02x:%02x:%02x:%02x", bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
-            snprintf(s_status.pending_pin_code, sizeof(s_status.pending_pin_code),
-                     "%06" PRIu32, param->key_notif.passkey);
-            xSemaphoreGive(s_status_mutex);
-            break;
-        }
-        case ESP_BT_GAP_KEY_REQ_EVT:
             break;
         default:
             break;
@@ -352,15 +397,26 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
              * antes (com link key salva no controlador BT) reconecta
              * direto sem passar por ali de novo, ignorando a lista de
              * autorizados. Checar de novo aqui, na conexao, fecha essa
-             * brecha: se nao for mais autorizado, desconecta e remove o
-             * bond pra nao voltar a conectar sozinho. */
+             * brecha: se nao for mais autorizado, so desconecta -- e a
+             * unica barreira de verdade agora que o pareamento em si
+             * sempre confirma (ver ESP_BT_GAP_CFM_REQ_EVT acima). NAO
+             * remove o bond: se remover, autorizar o mac depois (pagina
+             * Dispositivos) exigiria parear tudo de novo do zero; sem
+             * remover, autorizar e suficiente pra reconectar na hora,
+             * sem novo pareamento. */
             if (connected && !pairing_is_allowed(bda)) {
                 logger_log(ESP_LOG_WARN, TAG,
                            "Conexao rejeitada (dispositivo nao autorizado) [%02x:%02x:%02x:%02x:%02x:%02x]",
                            bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
-                esp_bt_gap_remove_bond_device(bda);
                 esp_a2d_sink_disconnect(bda);
-                break;
+                /* Continua pro bloco abaixo tratando como desconectado (nao
+                 * mais "break" direto) -- o break pulava a restauracao do
+                 * scan mode (ESP_BT_GAP_set_scan_mode la embaixo), deixando
+                 * o receiver preso em NON_DISCOVERABLE depois de rejeitar
+                 * uma reconexao, mesmo com a janela de pareamento aberta --
+                 * candidato a explicar o receiver "sumir" do Windows depois
+                 * de um dispositivo bloqueado tentar reconectar. */
+                connected = false;
             }
 
             xSemaphoreTake(s_status_mutex, portMAX_DELAY);
@@ -380,12 +436,30 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
             if (connected) {
                 esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
                 bt_i2s_task_start();
+                /* pairing_record_device() so acontece de verdade em
+                 * ESP_BT_GAP_AUTH_CMPL_EVT (pareamento novo) -- um
+                 * dispositivo que ja tinha bond salvo reconecta direto sem
+                 * passar por ali, entao se o histórico tiver sido apagado
+                 * manualmente (ou nunca populado, ex.: firmware trocado com
+                 * bond antigo no controlador BT) a interface fica so com o
+                 * MAC pra sempre, sem nome. Pedimos o nome ativamente aqui
+                 * (ESP_BT_GAP_READ_REMOTE_NAME_EVT abaixo re-registra no
+                 * historico) pra cobrir esse caso tambem, nao so o
+                 * pareamento inicial. */
+                esp_bt_gap_read_remote_name(bda);
             } else {
                 esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
                                           s_discoverable ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
                 bt_i2s_task_stop();
                 relay_control_notify_playing(false);
-                audio_codec_set_mute(true);
+                /* So mexe no mute se o BT for a fonte ativa. Antes isso era
+                 * incondicional e podia silenciar o DLNA por cima (corrida
+                 * real, diagnosticada 2026-08-27); com o seletor de fonte
+                 * (audio_source.h) a regra fica trivial e sem corrida --
+                 * quem nao e a fonte ativa simplesmente nao toca no codec. */
+                if (audio_source_is_bt()) {
+                    audio_codec_set_mute(true);
+                }
             }
             break;
         }
@@ -418,9 +492,17 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
 
             /* Mudo fora do estado "tocando": evita que ruido digital/RF
              * (WiFi, handshake do proprio Bluetooth) vaze pelo fone entre
-             * faixas ou enquanto so esta conectado sem tocar nada. */
-            audio_codec_set_mute(!playing);
-            relay_control_notify_playing(playing);
+             * faixas ou enquanto so esta conectado sem tocar nada.
+             *
+             * Mesma corrida corrigida acima (ESP_A2D_CONNECTION_STATE_EVT):
+             * BT pausar/parar (playing=false) tambem mutava incondicionalmente,
+             * podendo silenciar o DLNA se ele tiver assumido a reproducao
+             * bem nessa janela -- so muta aqui se o DLNA nao estiver tocando. */
+            /* Idem: so a fonte ativa mexe no codec/rele (ver audio_source.h). */
+            if (audio_source_is_bt()) {
+                audio_codec_set_mute(!playing);
+                relay_control_notify_playing(playing);
+            }
             break;
         }
         case ESP_A2D_AUDIO_CFG_EVT: {
@@ -667,7 +749,11 @@ void bt_audio_forget_device(const uint8_t mac[6])
 {
     logger_log(ESP_LOG_INFO, TAG, "Esquecendo dispositivo [%02x:%02x:%02x:%02x:%02x:%02x]",
                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    pairing_set_allowed(mac, false);
+    /* pairing_clear_device() (nao pairing_set_allowed(mac,false)!) -- ver
+     * comentario em pairing.c: usar "set_allowed(false)" aqui BLOQUEAVA de
+     * verdade o mac esquecido, entao repareamento seguinte era rejeitado
+     * silenciosamente. "Esquecer" deve voltar ao estado neutro. */
+    pairing_clear_device(mac);
     /* esp_a2d_sink_disconnect() em um MAC nao conectado so retorna erro,
      * inofensivo -- mais simples que checar s_status.remote_mac antes. */
     esp_a2d_sink_disconnect((uint8_t *)mac);
@@ -717,6 +803,36 @@ esp_err_t bt_audio_media_control(const char *cmd)
     esp_avrc_ct_send_passthrough_cmd(RC_TL_PASSTHROUGH, key_code, ESP_AVRC_PT_CMD_STATE_PRESSED);
     esp_avrc_ct_send_passthrough_cmd(RC_TL_PASSTHROUGH, key_code, ESP_AVRC_PT_CMD_STATE_RELEASED);
     return ESP_OK;
+}
+
+void bt_audio_on_source_deactivated(void)
+{
+    /* Derruba quem estiver conectado e fecha a porta pra novas conexoes. A
+     * pilha BT segue carregada de proposito (ver audio_source.h): religar o
+     * controlador em runtime e uma operacao delicada, e mante-lo apenas
+     * "invisivel + nao conectavel" ja garante que nenhuma task daqui toque
+     * no codec enquanto o DLNA for a fonte ativa. */
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    bool connected = s_status.connected;
+    uint8_t mac[6];
+    bool have_mac = connected && pairing_parse_mac(s_status.remote_mac, mac);
+    xSemaphoreGive(s_status_mutex);
+
+    if (have_mac) {
+        logger_log(ESP_LOG_INFO, TAG, "Fonte trocada para DLNA -- desconectando o Bluetooth atual");
+        bt_audio_disconnect_device(mac);
+    }
+    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    bt_i2s_task_stop(); /* so descarta o residuo do ring buffer -- nao destroi task */
+}
+
+void bt_audio_on_source_activated(void)
+{
+    bt_i2s_task_stop(); /* aqui so esvazia o ring buffer -- comeca do zero */
+    /* Volta a aceitar conexoes; a visibilidade segue a preferencia salva. */
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
+                              s_discoverable ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+    logger_log(ESP_LOG_INFO, TAG, "Fonte trocada para Bluetooth -- aceitando conexoes de novo");
 }
 
 void bt_audio_set_discoverable(bool discoverable)
@@ -879,20 +995,6 @@ void bt_audio_stop_discoverable_temporary(void)
     discoverable_window_close("manual");
 }
 
-void bt_audio_set_require_pin(bool require_pin)
-{
-    s_require_pin = require_pin;
-    storage_set_i32(NVS_KEY_BT_REQUIRE_PIN, require_pin ? 1 : 0);
-    esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-    esp_bt_io_cap_t iocap = require_pin ? ESP_BT_IO_CAP_OUT : ESP_BT_IO_CAP_NONE;
-    esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
-}
-
-bool bt_audio_get_require_pin(void)
-{
-    return s_require_pin;
-}
-
 /* -------------------------------------------------------------------------
  * Inicialização
  * ------------------------------------------------------------------------- */
@@ -914,21 +1016,41 @@ static void bt_stack_up(uint16_t event, void *p_param)
     esp_bt_gap_set_device_name(device_name);
     esp_bt_gap_register_callback(bt_app_gap_cb);
 
+    /* Class of Device nunca era definida -- o Bluedroid ficava com o valor
+     * default (generico), o que nao aparecia como problema pro Android (a
+     * lista de dispositivos disponiveis do celular mostra qualquer coisa
+     * proxima, sem filtrar por CoD), mas o Windows filtra/categoriza a tela
+     * de "Adicionar dispositivo Bluetooth" pelo Class of Device declarado
+     * no EIR -- sem CoD de audio, o Windows simplesmente nao lista o
+     * receiver como dispositivo pareavel, mesmo descobrivel (confirmado
+     * pelo usuario: celular ve, Windows nao). Major=Audio/Video, minor=
+     * Loudspeaker (0x05, "Bluetooth Assigned Numbers" -- nao tem constante
+     * pronta nesta versao do esp_gap_bt_api.h, so a enum de Peripheral),
+     * service class = Rendering (0x20) | Audio (0x100), igual ao exemplo
+     * a2dp_sink oficial do ESP-IDF. */
+    esp_bt_cod_t cod = {
+        .major = ESP_BT_COD_MAJOR_DEV_AV,
+        .minor = 0x05, /* Loudspeaker */
+        .service = 0x20 | 0x100, /* Rendering | Audio */
+    };
+    esp_bt_gap_set_cod(cod, ESP_BT_INIT_COD);
+
     int32_t v;
     storage_get_i32(NVS_KEY_BT_DISCOVERABLE, &v, DEFAULT_BT_DISCOVERABLE);
     s_discoverable = (v != 0);
-    storage_get_i32(NVS_KEY_BT_REQUIRE_PIN, &v, DEFAULT_BT_REQUIRE_PIN);
-    s_require_pin = (v != 0);
 
-    /* Secure Simple Pairing: "Just Works" (NoInputNoOutput) por padrao --
-     * sem confirmacao manual, so a lista de autorizados (pairing_is_allowed)
-     * decide. Com require_pin=true, DisplayOnly forca o fluxo "Passkey
-     * Entry": o stack gera um codigo de 6 digitos (ESP_BT_GAP_KEY_NOTIF_EVT)
-     * que mostramos em /api/status, e a pessoa digita no celular -- funciona
-     * de verdade em celulares modernos (diferente de PIN legado, que a
-     * maioria ignora quando SSP esta disponivel). */
+    /* Secure Simple Pairing: sempre "Just Works" (NoInputNoOutput) -- sem
+     * confirmacao manual, so a lista de autorizados (pairing_is_allowed)
+     * decide quem conecta de verdade (ver ESP_A2D_CONNECTION_STATE_EVT).
+     * Existiu um modo "Passkey Entry" (require_pin) aqui, removido a
+     * pedido do usuario: na pratica, com o IO capability do receiver
+     * (DisplayOnly) contra o de um celular moderno (DisplayYesNo), o
+     * Bluetooth negocia Numeric Comparison, nao Passkey Entry -- o
+     * receiver (sem tela) so confirma automaticamente sem comparar nada,
+     * entao o "codigo de 6 digitos" nao adicionava nenhuma seguranca real
+     * alem do Just Works padrao, so uma etapa extra sem efeito. */
     esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-    esp_bt_io_cap_t iocap = s_require_pin ? ESP_BT_IO_CAP_OUT : ESP_BT_IO_CAP_NONE;
+    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
     esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
 
     ESP_ERROR_CHECK(esp_avrc_ct_init());
@@ -988,14 +1110,15 @@ void bt_audio_init(void)
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
 
-    /* Potencia de TX do BR/EDR no maximo (+9dBm, era +3dBm o padrao) --
-     * tentativa de reduzir perda de pacote (BT_APPL: Sequence numbers
-     * error) mesmo a curta distancia do celular. So ajuda de forma
-     * indireta (ACKs/controle de fluxo mais fortes), a causa mais provavel
-     * continua sendo disputa WiFi/BT pelo radio unico do ESP32 (ver
-     * README). Precisa ser chamado aqui: depois do controller habilitado,
-     * antes de qualquer transmissao (inquiry, pareamento, conexao). */
-    esp_bredr_tx_power_set(ESP_PWR_LVL_N0, ESP_PWR_LVL_P9);
+    /* TESTE 2026-08-24 -- reduzido de (N0, P9) [0 a +9dBm] pra (N9, N0) [-9 a
+     * 0dBm]: diagnostico ja confirmou que o ruido "rim rim rim"/chiado
+     * persiste mesmo com Wi-Fi desligado e com o mic mudo -- e RF do proprio
+     * radio Bluetooth (qualquer link ativo, nao so no handshake) acoplando
+     * na saida analogica, nao coexistencia nem audio vazando. Testando se
+     * baixar a potencia de TX reduz esse acoplamento. Custo esperado: volta
+     * a perda de pacote/engasgo que o +9dBm tentava evitar (ver historico
+     * abaixo) -- e so um teste, reverter pra (N0, P9) se nao valer a troca. */
+    esp_bredr_tx_power_set(ESP_PWR_LVL_N9, ESP_PWR_LVL_N0);
 
     esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bluedroid_init_with_cfg(&bluedroid_cfg));
