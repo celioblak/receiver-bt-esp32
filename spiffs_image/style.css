@@ -145,3 +145,20 @@ nav a {
     margin-top: 0.5rem;
     min-height: 1.1em;
 }
+
+/* Medidor de nivel do microfone (pagina de configuracoes) -- barra simples
+ * que enche conforme o pico captado; verde quando o portao esta aberto. */
+.meter {
+    height: 8px;
+    background: var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.meter > div {
+    height: 100%;
+    width: 0;
+    background: var(--off);
+    border-radius: 999px;
+    transition: width 0.15s linear, background 0.15s linear;
+}

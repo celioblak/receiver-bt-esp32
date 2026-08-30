@@ -1,13 +1,16 @@
 #include "web_server.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "audio_agc.h"
 #include "audio_codec.h"
+#include "audio_source.h"
 #include "bt_audio.h"
 #include "config.h"
 #include "dlna_renderer.h"
+#include "es8388.h"
 #include "logger.h"
 #include "ota_manager.h"
 #include "pairing.h"
@@ -16,6 +19,7 @@
 #include "wifi_manager.h"
 
 #include "cJSON.h"
+#include "esp_app_desc.h"
 #include "esp_bt_device.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
@@ -128,6 +132,11 @@ static esp_err_t api_status_get(httpd_req_t *req)
     }
 
     cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "audio_source", audio_source_name(audio_source_get()));
+    /* Medidor do mic (pico 0-32767 do ultimo bloco) -- serve pra regular o
+     * ganho/limiar olhando o numero enquanto fala/canta. */
+    cJSON_AddStringToObject(root, "mic_adc", audio_codec_get_mic_adc_estado());
+    cJSON_AddNumberToObject(root, "mic_peak", audio_codec_get_mic_peak());
     cJSON_AddBoolToObject(root, "bt_connected", bt.connected);
     cJSON_AddStringToObject(root, "device_name", device_name);
     cJSON_AddStringToObject(root, "device_mac", own_mac);
@@ -168,13 +177,22 @@ static esp_err_t api_status_get(httpd_req_t *req)
      * significa visibilidade PERMANENTE (nao ha prazo pra contar). */
     cJSON_AddNumberToObject(root, "bt_discoverable_remaining_s",
                             bt_audio_get_discoverable_remaining_s());
-    cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
     /* >0 significa lista de autorizados ativa: SO os dessa lista conseguem
      * parear, entao abrir a janela nao basta pra um aparelho novo (ver
      * pairing_is_allowed). A pagina usa isso pra avisar. */
     cJSON_AddNumberToObject(root, "bt_allowed_count", (double)pairing_get_allowed_count());
-    cJSON_AddStringToObject(root, "pending_pin_mac", bt.pending_pin_mac);
-    cJSON_AddStringToObject(root, "pending_pin_code", bt.pending_pin_code);
+
+    /* SHA256 do ELF em execucao (8 primeiros bytes). E a unica prova confiavel
+     * de QUAL firmware esta rodando depois de um OTA: o auto-reset apos o
+     * upload falha as vezes nesta placa, e "data de compilacao" ja enganou --
+     * bate mesmo quando o binario velho continua ativo. Compare com
+     * `sha256sum .pio/build/esp32-a1s/firmware.elf` (mesmos 16 digitos). */
+    const esp_app_desc_t *desc = esp_app_get_description();
+    char sha[17];
+    for (int i = 0; i < 8; i++) {
+        sprintf(sha + i * 2, "%02x", desc->app_elf_sha256[i]);
+    }
+    cJSON_AddStringToObject(root, "fw_sha", sha);
 
     return send_json(req, root);
 }
@@ -212,7 +230,13 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "mqtt_port", mqtt_port);
     cJSON_AddStringToObject(root, "mqtt_user", mqtt_user);
     cJSON_AddBoolToObject(root, "bt_discoverable", bt_audio_get_discoverable());
-    cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
+    cJSON_AddBoolToObject(root, "mic_enabled", audio_codec_mic_is_enabled());
+    cJSON_AddBoolToObject(root, "mic_auto_gate", audio_codec_get_mic_auto_gate());
+    cJSON_AddNumberToObject(root, "mic_gain", audio_codec_get_mic_gain());
+    cJSON_AddNumberToObject(root, "mic_gate_level", audio_codec_get_mic_gate_threshold());
+    cJSON_AddNumberToObject(root, "mic_input", audio_codec_mic_get_input());
+    cJSON_AddStringToObject(root, "mic_input_nome", audio_codec_mic_get_input_name());
+    cJSON_AddBoolToObject(root, "pairing_lock", pairing_get_lock_mode());
 
     return send_json(req, root);
 }
@@ -266,8 +290,37 @@ static esp_err_t api_config_post(httpd_req_t *req)
     if ((item = cJSON_GetObjectItem(root, "bt_discoverable")) && cJSON_IsBool(item)) {
         bt_audio_set_discoverable(cJSON_IsTrue(item));
     }
-    if ((item = cJSON_GetObjectItem(root, "bt_require_pin")) && cJSON_IsBool(item)) {
-        bt_audio_set_require_pin(cJSON_IsTrue(item));
+    if ((item = cJSON_GetObjectItem(root, "mic_enabled")) && cJSON_IsBool(item)) {
+        /* Aplica NA HORA, sem reiniciar (2026-08-29). Antes so gravava na NVS
+         * e exigia reboot, porque o canal I2S RX so nascia no boot.
+         *
+         * Ligar aqui cria o canal RX neste instante e ja informa em que estado
+         * o ADC subiu (ver mic_adc no /api/status). Como o RX e a unica coisa
+         * que sobe instavel nesta placa, isso muda o jogo: se o microfone
+         * subir travado ou chiando, e so desligar e ligar de novo pra tentar
+         * outra vez -- sem reiniciar o aparelho e sem derrubar a musica.
+         * Antes a unica saida era reiniciar tudo, e chegou a levar 5 reinicios
+         * seguidos. audio_codec_mic_set_enabled() ja persiste na NVS. */
+        audio_codec_mic_set_enabled(cJSON_IsTrue(item));
+    }
+    if ((item = cJSON_GetObjectItem(root, "mic_auto_gate")) && cJSON_IsBool(item)) {
+        audio_codec_set_mic_auto_gate(cJSON_IsTrue(item));
+    }
+    /* Ganho/limiar do mic: aplicam na hora (sem reiniciar) de proposito --
+     * servem justamente pra afinar cantando. */
+    if ((item = cJSON_GetObjectItem(root, "mic_gain")) && cJSON_IsNumber(item)) {
+        audio_codec_set_mic_gain(item->valueint);
+    }
+    if ((item = cJSON_GetObjectItem(root, "mic_gate_level")) && cJSON_IsNumber(item)) {
+        audio_codec_set_mic_gate_threshold(item->valueint);
+    }
+    /* Entrada analogica do codec (indice de es8388_mic_input_t). Aplica na
+     * hora -- e so uma escrita de I2C, o I2S nem e tocado. */
+    if ((item = cJSON_GetObjectItem(root, "mic_input")) && cJSON_IsNumber(item)) {
+        audio_codec_mic_set_input(item->valueint);
+    }
+    if ((item = cJSON_GetObjectItem(root, "pairing_lock")) && cJSON_IsBool(item)) {
+        pairing_set_lock_mode(cJSON_IsTrue(item));
     }
     cJSON_Delete(root);
 
@@ -537,6 +590,40 @@ static esp_err_t api_devices_get(httpd_req_t *req)
         cJSON_AddItemToArray(arr, item);
     }
 
+    /* Um mac autorizado ou bloqueado pode nao ter (ou ter perdido) entrada
+     * no historico -- sem isso ficava invisivel na interface e sem jeito de
+     * desfazer (ver pairing_get_blocked_list() em pairing.c). Mescla aqui,
+     * pulando quem ja apareceu acima pelo historico. */
+    uint8_t extra_macs[PAIRING_MAX_ALLOWED][6];
+    size_t extra_n = pairing_get_allowed_list(extra_macs, PAIRING_MAX_ALLOWED);
+    uint8_t blocked_macs[PAIRING_MAX_ALLOWED][6];
+    size_t blocked_n = pairing_get_blocked_list(blocked_macs, PAIRING_MAX_ALLOWED);
+
+    for (int pass = 0; pass < 2; pass++) {
+        uint8_t (*list)[6] = (pass == 0) ? extra_macs : blocked_macs;
+        size_t list_n = (pass == 0) ? extra_n : blocked_n;
+        for (size_t i = 0; i < list_n; i++) {
+            bool already_listed = false;
+            for (size_t j = 0; j < n; j++) {
+                if (memcmp(history[j].mac, list[i], 6) == 0) {
+                    already_listed = true;
+                    break;
+                }
+            }
+            if (already_listed) {
+                continue;
+            }
+            char mac_str[18];
+            pairing_format_mac(list[i], mac_str, sizeof(mac_str));
+            cJSON *item = cJSON_CreateObject();
+            cJSON_AddStringToObject(item, "mac", mac_str);
+            cJSON_AddStringToObject(item, "name", "");
+            cJSON_AddNumberToObject(item, "last_seen_ms", 0);
+            cJSON_AddBoolToObject(item, "allowed", pairing_is_allowed(list[i]));
+            cJSON_AddItemToArray(arr, item);
+        }
+    }
+
     return send_json(req, arr);
 }
 
@@ -596,6 +683,206 @@ static esp_err_t api_bt_pairing_mode_post(httpd_req_t *req)
     return send_json(req, resp);
 }
 
+/* Desliga o Wi-Fi por um tempo limitado -- diagnostico pra isolar se um
+ * ruido/interferencia no audio vem do radio Wi-Fi ou do Bluetooth (ver
+ * wifi_manager_disable_temporarily()). O dispositivo reinicia sozinho no
+ * fim da janela pra religar tudo -- responder ANTES de desligar, senao a
+ * resposta HTTP nunca sai (o proprio Wi-Fi que levaria ela ja foi). */
+static esp_err_t api_wifi_disable_temp_post(httpd_req_t *req)
+{
+    char buf[64];
+    cJSON *root = recv_json_body(req, buf, sizeof(buf));
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+    uint32_t duration_s = 180;
+    cJSON *item = cJSON_GetObjectItem(root, "duration_s");
+    if (cJSON_IsNumber(item) && item->valueint > 0) {
+        duration_s = (uint32_t)item->valueint;
+    }
+    cJSON_Delete(root);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddNumberToObject(resp, "duration_s", duration_s);
+    esp_err_t err = send_json(req, resp);
+
+    vTaskDelay(pdMS_TO_TICKS(200)); /* da tempo da resposta sair antes do Wi-Fi cair */
+    wifi_manager_disable_temporarily(duration_s);
+    return err;
+}
+
+/* Diagnostico manual -- pedido do usuario 2026-08-27: forca o reenvio de um
+ * NOTIFY (GENA) com o estado atual do DLNA, sem mudar nada, pra testar se o
+ * Music Assistant realmente reage a um evento novo (ver dlna_renderer_
+ * force_notify()). "sent=false" quer dizer que nao ha assinatura ativa
+ * agora -- nesse caso nao existe pra quem mandar, o teste fica inconclusivo
+ * (nao e uma falha do NOTIFY em si). Conferir /api/logs pra ver se o envio
+ * (quando sent=true) recebeu 2xx do lado do Music Assistant. */
+/* Seletor de fonte de audio -- equivalente pela web ao botao fisico KEY1
+ * (ver audio_source.h). Corpo: {"source": "bluetooth"|"dlna"} ou
+ * {"toggle": true}. */
+/* Diagnostico do microfone: escreve ADCCONTROL2 (selecao de entrada do ADC)
+ * e/ou o ganho do PGA ao vivo, pra descobrir a configuracao certa desta
+ * placa sem recompilar. Corpo: {"input": 0-255, "pga": 0-100}. */
+/* GET /api/mic/raw?n=512 -- amostras cruas do ADC, uma por linha.
+ * Diagnostico: permite analisar a FORMA do sinal (media, desvio, cruzamentos
+ * por zero, saturacao) em vez de so o pico, que esconde tudo. */
+static esp_err_t api_mic_raw_get(httpd_req_t *req)
+{
+    size_t n = 512;
+    char query[32];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[12];
+        if (httpd_query_key_value(query, "n", val, sizeof(val)) == ESP_OK) {
+            int q = atoi(val);
+            if (q > 0 && q <= 2048) {
+                n = (size_t)q;
+            }
+        }
+    }
+    int16_t *buf = heap_caps_malloc(n * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (buf == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria");
+        return ESP_FAIL;
+    }
+    size_t lidas = audio_codec_mic_capture_raw(buf, n);
+
+    httpd_resp_set_type(req, "text/plain");
+    char linha[16];
+    for (size_t i = 0; i < lidas; i++) {
+        int len = snprintf(linha, sizeof(linha), "%d\n", (int)buf[i]);
+        httpd_resp_send_chunk(req, linha, len);
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    heap_caps_free(buf);
+    return ESP_OK;
+}
+
+/* POST /api/mic/hardreset -- corta o MCLK por 500ms e reconstroi I2S e codec.
+ * Ver audio_codec_mic_hard_reset(). */
+static esp_err_t api_mic_hardreset_post(httpd_req_t *req)
+{
+    esp_err_t err = audio_codec_mic_hard_reset();
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(resp, "resultado", esp_err_to_name(err));
+    cJSON_AddStringToObject(resp, "mic_adc", audio_codec_get_mic_adc_estado());
+    return send_json(req, resp);
+}
+
+/* POST /api/mic/scan -- varre as entradas analogicas do codec e devolve
+ * quanto cada uma esta captando.
+ *
+ * Esta placa liga os microfones embutidos e o jack de entrada em pares
+ * DIFERENTES do ES8388 (LIN1/RIN1 contra LIN2/RIN2), e nao ha como saber pelo
+ * codigo qual deles tem sinal util -- depende de onde a fonte esta ligada
+ * fisicamente. Descobrir isso por tentativa e erro custou dias; aqui sai em
+ * seis segundos.
+ *
+ * COMO USAR: cante ou fale SEM PARAR no microfone de mao, LONGE da placa, do
+ * comeco ao fim da chamada. O criterio e qual entrada REAGE a fonte certa --
+ * medir com alguem falando perto da placa mede o microfone embutido e ja
+ * produziu tres conclusoes erradas aqui.
+ *
+ * Nao troca a entrada: apenas mede e restaura a que estava. Para gravar a
+ * escolha, POST /api/settings {"mic_input": N}. */
+static esp_err_t api_mic_scan_post(httpd_req_t *req)
+{
+    char *json = malloc(512);
+    if (json == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria");
+        return ESP_FAIL;
+    }
+    json[0] = '\0';
+    audio_codec_mic_scan_inputs(json, 512);
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, json);
+    free(json);
+    return err;
+}
+
+/* Diagnostico: le/escreve registrador do ES8388 ao vivo.
+ * {"reg": N}            -> le e devolve o valor
+ * {"reg": N, "val": V}  -> escreve V e devolve o valor lido de volta */
+static esp_err_t api_mic_reg_post(httpd_req_t *req)
+{
+    char buf[64];
+    cJSON *root = recv_json_body(req, buf, sizeof(buf));
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+    cJSON *reg = cJSON_GetObjectItem(root, "reg");
+    cJSON *val = cJSON_GetObjectItem(root, "val");
+    if (!cJSON_IsNumber(reg)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "informe \"reg\"");
+        return ESP_FAIL;
+    }
+    uint8_t r = (uint8_t)reg->valueint;
+    if (cJSON_IsNumber(val)) {
+        es8388_write_reg_raw(r, (uint8_t)val->valueint);
+    }
+    cJSON_Delete(root);
+
+    uint8_t lido = 0;
+    esp_err_t err = es8388_read_reg_raw(r, &lido);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
+    cJSON_AddNumberToObject(resp, "reg", r);
+    cJSON_AddNumberToObject(resp, "value", lido);
+    return send_json(req, resp);
+}
+
+static esp_err_t api_source_post(httpd_req_t *req)
+{
+    char buf[64];
+    cJSON *root = recv_json_body(req, buf, sizeof(buf));
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+    cJSON *toggle = cJSON_GetObjectItem(root, "toggle");
+    cJSON *src = cJSON_GetObjectItem(root, "source");
+    bool invalido = false;
+    if (cJSON_IsTrue(toggle)) {
+        audio_source_toggle();
+    } else if (cJSON_IsString(src) && src->valuestring != NULL) {
+        if (strcmp(src->valuestring, "bluetooth") == 0) {
+            audio_source_set(AUDIO_SOURCE_BT);
+        } else if (strcmp(src->valuestring, "dlna") == 0) {
+            audio_source_set(AUDIO_SOURCE_DLNA);
+        } else {
+            invalido = true;
+        }
+    } else {
+        invalido = true;
+    }
+    cJSON_Delete(root);
+
+    if (invalido) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "source deve ser \"bluetooth\" ou \"dlna\" (ou toggle: true)");
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddStringToObject(resp, "source", audio_source_name(audio_source_get()));
+    return send_json(req, resp);
+}
+
+static esp_err_t api_dlna_force_notify_post(httpd_req_t *req)
+{
+    bool sent = dlna_renderer_force_notify();
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddBoolToObject(resp, "sent", sent);
+    if (!sent) {
+        cJSON_AddStringToObject(resp, "message", "sem assinatura DLNA ativa agora -- nada pra notificar");
+    }
+    return send_json(req, resp);
+}
+
 static esp_err_t api_pair_post(httpd_req_t *req)
 {
     char buf[256];
@@ -620,8 +907,25 @@ static esp_err_t api_pair_post(httpd_req_t *req)
         pairing_set_allowed(mac, true);
     } else if (strcmp(action, "block") == 0) {
         pairing_set_allowed(mac, false);
+        /* Bloquear so impedia reconexoes FUTURAS -- um dispositivo ja
+         * conectado no momento do clique continuava tocando normalmente
+         * ate desconectar sozinho (confirmado pelo usuario testando).
+         * Derruba agora se for o caso. */
+        bt_audio_status_t bt;
+        bt_audio_get_status(&bt);
+        uint8_t connected_mac[6];
+        if (bt.connected && pairing_parse_mac(bt.remote_mac, connected_mac) &&
+            memcmp(connected_mac, mac, 6) == 0) {
+            bt_audio_disconnect_device(mac);
+        }
     } else if (strcmp(action, "remove") == 0) {
-        pairing_remove_from_history(mac);
+        /* pairing_clear_device() (nao so pairing_remove_from_history()):
+         * "remover" tambem deve zerar autorizado/bloqueado do mac, senao um
+         * bloqueio antigo sobrevive escondido -- reaparece do nada na
+         * proxima vez que esse mac tentar conectar, sem estar visivel em
+         * lugar nenhum da interface (mesma causa raiz do bug em
+         * pairing_clear_device, ver pairing.c). */
+        pairing_clear_device(mac);
     } else if (strcmp(action, "forget") == 0) {
         /* Diferente de "remove": tira o bond no controlador BT e
          * desconecta agora, nao so limpa o historico -- sem isso o
@@ -721,7 +1025,13 @@ void web_server_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.max_uri_handlers = 20; /* 16 rotas hoje -- folga pra novas sem esbarrar no limite de novo */
+    /* 21 rotas hoje. Ja estourou uma vez (2026-08-28): o limite estava em 20
+     * e a rota curinga (a que serve as paginas do SPIFFS) e registrada
+     * POR ULTIMO, entao foi justamente ela que falhou, e a interface inteira
+     * passou a responder 404 ("Nothing matches the given URI") enquanto a API
+     * continuava funcionando. Sintoma confuso pra um limite silencioso.
+     * Folga generosa aqui e barata (cada slot e so um ponteiro). */
+    config.max_uri_handlers = 32;
     config.stack_size = 8192; /* /ota escreve na flash — folga extra de pilha */
     config.recv_wait_timeout = 10;
 
@@ -743,6 +1053,13 @@ void web_server_start(void)
         {.uri = "/api/pair", .method = HTTP_POST, .handler = api_pair_post},
         {.uri = "/api/bt/pairing_mode", .method = HTTP_POST, .handler = api_bt_pairing_mode_post},
         {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = api_wifi_scan_get},
+        {.uri = "/api/wifi/disable_temp", .method = HTTP_POST, .handler = api_wifi_disable_temp_post},
+        {.uri = "/api/dlna/force_notify", .method = HTTP_POST, .handler = api_dlna_force_notify_post},
+        {.uri = "/api/source", .method = HTTP_POST, .handler = api_source_post},
+        {.uri = "/api/mic/raw", .method = HTTP_GET, .handler = api_mic_raw_get},
+        {.uri = "/api/mic/reg", .method = HTTP_POST, .handler = api_mic_reg_post},
+        {.uri = "/api/mic/scan", .method = HTTP_POST, .handler = api_mic_scan_post},
+        {.uri = "/api/mic/hardreset", .method = HTTP_POST, .handler = api_mic_hardreset_post},
         {.uri = "/api/system/restart", .method = HTTP_POST, .handler = api_system_restart_post},
         {.uri = "/api/system/beep", .method = HTTP_POST, .handler = api_system_beep_post},
         /* GET tambem, de proposito -- diagnostico pra acionar direto da
@@ -750,6 +1067,7 @@ void web_server_start(void)
          * de curl/Postman a mao). */
         {.uri = "/api/system/beep", .method = HTTP_GET, .handler = api_system_beep_post},
         {.uri = "/ota", .method = HTTP_POST, .handler = ota_manager_upload_handler},
+        {.uri = "/ota/spiffs", .method = HTTP_POST, .handler = ota_manager_spiffs_upload_handler},
         {.uri = "/*", .method = HTTP_GET, .handler = static_file_get},
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

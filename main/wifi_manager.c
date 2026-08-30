@@ -1,5 +1,6 @@
 #include "wifi_manager.h"
 
+#include <inttypes.h>
 #include <string.h>
 
 #include "config.h"
@@ -9,6 +10,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "mdns.h"
 
@@ -171,6 +173,21 @@ static void start_sta_and_wait(const char *ssid, const char *pass)
      * energia (irrelevante, fonte externa). */
     esp_wifi_set_ps(WIFI_PS_NONE);
 
+    /* Potencia de TX do WiFi reduzida (era o maximo do driver, ~19.5dBm) --
+     * relato do usuario 2026-08-22: ruido de RF acoplando na saida analogica
+     * ("rim rim rim") persiste mesmo com o audio mudo. WiFi e Bluetooth
+     * dividem a MESMA antena/front-end de RF neste chip combo, entao menos
+     * potencia de transmissao do WiFi reduz a energia de RF total irradiada
+     * perto da trilha de audio. 40 (unidade de 0.25dBm = 10dBm) corta quase
+     * pela metade, com boa folga de sinal neste ambiente (RSSI tipico
+     * -40dBm, longe do limite de queda de conexao) -- ajustar se o WiFi
+     * ficar instavel ou se nao reduzir o ruido o suficiente. Nao mexe na
+     * potencia de TX do Bluetooth (esp_bredr_tx_power_set em bt_audio.c),
+     * que foi propositalmente aumentada para reduzir perda de pacote A2DP;
+     * reduzi-la de volta traria o mesmo tipo de ganho de ruido, mas ao custo
+     * de mais engasgo de audio -- nao mexido aqui, decisao separada. */
+    esp_wifi_set_max_tx_power(40);
+
     logger_log(ESP_LOG_INFO, TAG, "Conectando ao Wi-Fi \"%s\"...", ssid);
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE,
@@ -281,4 +298,126 @@ bool wifi_manager_get_gateway_ip(uint32_t *out_addr)
     }
     *out_addr = s_ip_info.gw.addr;
     return true;
+}
+
+/* -------------------------------------------------------------------------
+ * Desligar temporariamente (diagnostico de ruido/interferencia)
+ * ------------------------------------------------------------------------- */
+
+static esp_timer_handle_t s_wifi_disable_timer = NULL;
+static uint32_t s_wifi_disable_started_at_s = 0;
+static uint32_t s_wifi_disable_duration_s = 0;
+
+static void wifi_disable_timer_cb(void *arg)
+{
+    (void)arg;
+    /* Reiniciar e nao so re-chamar wifi_manager_init() e proposital: o
+     * relogio da janela some, e o boot normal ja faz toda a sequencia certa
+     * de netif/eventos/mDNS/servidor web/MQTT do zero -- reusar isso em vez
+     * de duplicar a logica de "religar Wi-Fi no meio da execucao", que este
+     * modulo nunca precisou suportar ate agora. */
+    logger_log(ESP_LOG_INFO, TAG, "Janela de Wi-Fi desligado terminou -- reiniciando para religar");
+    esp_restart();
+}
+
+void wifi_manager_disable_temporarily(uint32_t duration_s)
+{
+    logger_log(ESP_LOG_WARN, TAG,
+               "Desligando Wi-Fi por %" PRIu32 "s (diagnostico) -- HTTP/MQTT ficam fora do ar ate reiniciar sozinho",
+               duration_s);
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    s_connected = false;
+
+    s_wifi_disable_started_at_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    s_wifi_disable_duration_s = duration_s;
+
+    if (s_wifi_disable_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = wifi_disable_timer_cb,
+            .name = "wifi_disable",
+        };
+        esp_timer_create(&args, &s_wifi_disable_timer);
+    }
+    if (s_wifi_disable_timer != NULL) {
+        esp_timer_stop(s_wifi_disable_timer); /* sem efeito se nao estiver armado */
+        esp_timer_start_once(s_wifi_disable_timer, (uint64_t)duration_s * 1000000ULL);
+    }
+}
+
+uint32_t wifi_manager_disable_remaining_s(void)
+{
+    if (s_wifi_disable_duration_s == 0) {
+        return 0;
+    }
+    uint32_t elapsed = (uint32_t)(esp_timer_get_time() / 1000000ULL) - s_wifi_disable_started_at_s;
+    if (elapsed >= s_wifi_disable_duration_s) {
+        return 0;
+    }
+    return s_wifi_disable_duration_s - elapsed;
+}
+
+/* -------------------------------------------------------------------------
+ * Liga/desliga manual (botao fisico KEY1)
+ * ------------------------------------------------------------------------- */
+
+/* Rede de seguranca caso ninguem aperte o KEY1 de novo pra religar (ex.:
+ * esqueceram, ou o botao falhou) -- sem Wi-Fi nao ha outro jeito remoto de
+ * trazer o dispositivo de volta, entao um prazo bem mais longo que a janela
+ * de diagnostico (wifi_manager_disable_temporarily) evita ficar preso pra
+ * sempre sem travar um teste real de alguns minutos ouvindo audio. */
+#define WIFI_RADIO_OFF_SAFETY_S (30 * 60)
+
+static esp_timer_handle_t s_radio_off_safety_timer = NULL;
+static bool s_radio_manually_off = false;
+
+static void radio_off_safety_cb(void *arg)
+{
+    (void)arg;
+    logger_log(ESP_LOG_WARN, TAG,
+               "KEY1 desligou o Wi-Fi ha %ds e ninguem apertou de novo -- reiniciando por seguranca",
+               WIFI_RADIO_OFF_SAFETY_S);
+    esp_restart();
+}
+
+void wifi_manager_radio_toggle(void)
+{
+    if (!s_radio_manually_off) {
+        logger_log(ESP_LOG_WARN, TAG,
+                   "KEY1: desligando Wi-Fi -- so Bluetooth ativo. Aperte de novo pra religar "
+                   "(ou aguarde %ds pra religar sozinho por seguranca).",
+                   WIFI_RADIO_OFF_SAFETY_S);
+        esp_wifi_disconnect();
+        esp_wifi_stop();
+        s_connected = false;
+        s_radio_manually_off = true;
+
+        if (s_radio_off_safety_timer == NULL) {
+            const esp_timer_create_args_t args = {
+                .callback = radio_off_safety_cb,
+                .name = "wifi_radio_off",
+            };
+            esp_timer_create(&args, &s_radio_off_safety_timer);
+        }
+        if (s_radio_off_safety_timer != NULL) {
+            esp_timer_stop(s_radio_off_safety_timer);
+            esp_timer_start_once(s_radio_off_safety_timer, (uint64_t)WIFI_RADIO_OFF_SAFETY_S * 1000000ULL);
+        }
+    } else {
+        logger_log(ESP_LOG_WARN, TAG, "KEY1: religando Wi-Fi");
+        if (s_radio_off_safety_timer != NULL) {
+            esp_timer_stop(s_radio_off_safety_timer);
+        }
+        /* esp_wifi_stop() nao apaga a configuracao (SSID/senha) nem exige
+         * esp_wifi_set_config de novo -- so reinicia o radio. O handler de
+         * WIFI_EVENT_STA_START ja existente chama esp_wifi_connect()
+         * sozinho, mesmo caminho do boot normal. */
+        esp_wifi_start();
+        s_radio_manually_off = false;
+    }
+}
+
+bool wifi_manager_radio_is_off(void)
+{
+    return s_radio_manually_off;
 }

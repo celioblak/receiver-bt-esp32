@@ -31,7 +31,15 @@ static const char *TAG = "mqtt_ha";
 #define TOPIC_CMD_AGC_ENABLED   "homeassistant/receiver_bt/cmd/agc_enabled"
 #define TOPIC_CMD_DISCOVERABLE  "homeassistant/receiver_bt/cmd/bt_discoverable"
 #define TOPIC_CMD_PAIRING_MODE  "homeassistant/receiver_bt/cmd/bt_pairing_mode"
-#define TOPIC_CMD_REQUIRE_PIN   "homeassistant/receiver_bt/cmd/bt_require_pin"
+#define TOPIC_CMD_MIC_ENABLED   "homeassistant/receiver_bt/cmd/mic_enabled"
+#define TOPIC_CMD_MIC_AUTO_GATE "homeassistant/receiver_bt/cmd/mic_auto_gate"
+/* Ganho e portao do microfone tambem pelo MQTT: sao os dois numeros que se
+ * afina CANTANDO, e ate agora so davam para mexer pela pagina web. Ter no
+ * Home Assistant permite ajustar do celular, no meio do karaoke, sem largar o
+ * microfone. */
+#define TOPIC_CMD_MIC_GAIN      "homeassistant/receiver_bt/cmd/mic_gain"
+#define TOPIC_CMD_MIC_GATE      "homeassistant/receiver_bt/cmd/mic_gate_level"
+#define TOPIC_CMD_PAIRING_LOCK  "homeassistant/receiver_bt/cmd/pairing_lock"
 #define TOPIC_CMD_DISCONNECT    "homeassistant/receiver_bt/cmd/disconnect"
 #define TOPIC_CMD_RELAY_TIMEOUT "homeassistant/receiver_bt/cmd/relay_timeout"
 #define TOPIC_CMD_PAIR          "homeassistant/receiver_bt/cmd/pair"
@@ -99,8 +107,22 @@ static void add_common_device_fields(cJSON *root, const char *unique_id, const c
     cJSON_AddItemToObject(root, "device", device);
 }
 
+/* entity_category (NULL, "config" ou "diagnostic") separa a entidade do
+ * card principal ("controles") da HA -- pedido explicito do usuario: os
+ * toggles de ajuste (visibilidade BT, PIN, mic, timeout etc.) viviam
+ * misturados com os controles de uso direto (play/pause/volume), lotando o
+ * card principal do dispositivo. NULL = comportamento de antes (aparece
+ * como controle principal); "config" joga pra dentro da seção
+ * "Configuração" (recolhida por padrão) do card do dispositivo na HA. */
+static void add_entity_category(cJSON *root, const char *entity_category)
+{
+    if (entity_category != NULL) {
+        cJSON_AddStringToObject(root, "entity_category", entity_category);
+    }
+}
+
 static void publish_switch_discovery(const char *object_id, const char *name, const char *cmd_topic,
-                                      const char *value_template)
+                                      const char *value_template, const char *entity_category)
 {
     char config_topic[80];
     snprintf(config_topic, sizeof(config_topic), "homeassistant/switch/%s/config", object_id);
@@ -115,6 +137,7 @@ static void publish_switch_discovery(const char *object_id, const char *name, co
     cJSON_AddStringToObject(root, "state_on", "1");
     cJSON_AddStringToObject(root, "state_off", "0");
     cJSON_AddNumberToObject(root, "qos", 1); /* ver comentario em publish_button_discovery */
+    add_entity_category(root, entity_category);
 
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
@@ -123,7 +146,8 @@ static void publish_switch_discovery(const char *object_id, const char *name, co
 }
 
 static void publish_number_discovery(const char *object_id, const char *name, const char *cmd_topic,
-                                      const char *value_template, int min, int max)
+                                      const char *value_template, int min, int max,
+                                      const char *entity_category)
 {
     char config_topic[80];
     snprintf(config_topic, sizeof(config_topic), "homeassistant/number/%s/config", object_id);
@@ -137,6 +161,7 @@ static void publish_number_discovery(const char *object_id, const char *name, co
     cJSON_AddNumberToObject(root, "max", max);
     cJSON_AddNumberToObject(root, "step", 1);
     cJSON_AddNumberToObject(root, "qos", 1); /* ver comentario em publish_button_discovery */
+    add_entity_category(root, entity_category);
 
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
@@ -145,7 +170,7 @@ static void publish_number_discovery(const char *object_id, const char *name, co
 }
 
 static void publish_button_discovery(const char *object_id, const char *name, const char *cmd_topic,
-                                      const char *payload_press)
+                                      const char *payload_press, const char *entity_category)
 {
     char config_topic[80];
     snprintf(config_topic, sizeof(config_topic), "homeassistant/button/%s/config", object_id);
@@ -161,6 +186,7 @@ static void publish_button_discovery(const char *object_id, const char *name, co
      * tudo (backend, protocolo LMS) confirmado correto. QoS 1 pede
      * confirmacao de entrega (PUBACK) e retransmite se nao vier. */
     cJSON_AddNumberToObject(root, "qos", 1);
+    add_entity_category(root, entity_category);
 
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
@@ -169,7 +195,7 @@ static void publish_button_discovery(const char *object_id, const char *name, co
 }
 
 static void publish_generic_sensor_discovery(const char *object_id, const char *name,
-                                              const char *value_template)
+                                              const char *value_template, const char *entity_category)
 {
     char config_topic[80];
     snprintf(config_topic, sizeof(config_topic), "homeassistant/sensor/%s/config", object_id);
@@ -179,6 +205,7 @@ static void publish_generic_sensor_discovery(const char *object_id, const char *
     cJSON_AddStringToObject(root, "state_topic", TOPIC_STATE);
     cJSON_AddStringToObject(root, "value_template", value_template);
     cJSON_AddStringToObject(root, "json_attributes_topic", TOPIC_STATE);
+    add_entity_category(root, entity_category);
 
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
@@ -238,6 +265,7 @@ static void publish_pair_switch_discovery(const char *mac_str, const char *name)
     cJSON_AddStringToObject(root, "state_on", "1");
     cJSON_AddStringToObject(root, "state_off", "0");
     cJSON_AddNumberToObject(root, "qos", 1); /* ver comentario em publish_button_discovery */
+    add_entity_category(root, "config"); /* gerenciar pareamento e config, nao controle de uso direto */
 
     char *payload = cJSON_PrintUnformatted(root);
     esp_mqtt_client_publish(s_client, config_topic, payload, 0, 1, true);
@@ -245,19 +273,33 @@ static void publish_pair_switch_discovery(const char *mac_str, const char *name)
     cJSON_Delete(root);
 }
 
+/* Discovery da HA e retido no broker -- parar de publicar uma entidade nao
+ * some sozinha, fica "lixo" no broker (e na HA) pra sempre. Publicar
+ * payload vazio retido no mesmo topico apaga o registro. So precisa disso
+ * pra entidades removidas de verdade (ex.: "Exigir PIN", removida a pedido
+ * do usuario por nao agregar seguranca real -- ver comentario em
+ * bt_stack_up() em bt_audio.c). */
+static void remove_stale_discovery_configs(void)
+{
+    esp_mqtt_client_publish(s_client, "homeassistant/switch/receiver_bt_require_pin/config", "", 0, 1, true);
+}
+
 static void publish_all_discovery_configs(void)
 {
+    remove_stale_discovery_configs();
     publish_sensor_discovery();
 
     /* Pedido explicito do usuario: o "dispositivo conectado" e a lista de
      * "dispositivos pareados" so apareciam como atributos json enterrados
      * no sensor de diagnostico -- viram entidades proprias aqui, mais
-     * visiveis/usaveis em automacoes e no card do dispositivo na HA. */
+     * visiveis/usaveis em automacoes e no card do dispositivo na HA.
+     * entity_category="diagnostic": informativas, nao controles nem config. */
     publish_generic_sensor_discovery("receiver_bt_connected_device", "Receiver BT Dispositivo Conectado",
-                                      "{{ value_json.connected_device }}");
+                                      "{{ value_json.connected_device }}", "diagnostic");
     publish_generic_sensor_discovery("receiver_bt_paired_count", "Receiver BT Dispositivos Pareados",
-                                      "{{ value_json.paired_count }}");
-    publish_button_discovery("receiver_bt_disconnect", "Receiver BT Desconectar", TOPIC_CMD_DISCONNECT, "disconnect");
+                                      "{{ value_json.paired_count }}", "diagnostic");
+    publish_button_discovery("receiver_bt_disconnect", "Receiver BT Desconectar", TOPIC_CMD_DISCONNECT, "disconnect",
+                              "config"); /* acao administrativa, nao controle de reproducao do dia a dia */
     /* Os switches de cada dispositivo pareado (publish_pair_switch_discovery)
      * NAO sao publicados aqui -- ver mqtt_ha_publish_state(), que roda logo
      * em seguida e a cada 30s dali pra frente, cobrindo tanto o boot quanto
@@ -269,35 +311,68 @@ static void publish_all_discovery_configs(void)
      * mudar errado, o dispositivo perde a conexao MQTT e fica sem como
      * corrigir por ali). Esses continuam so na interface web/API REST. */
     publish_number_discovery("receiver_bt_relay_timeout", "Receiver BT Timeout do Amplificador",
-                              TOPIC_CMD_RELAY_TIMEOUT, "{{ value_json.relay_timeout_s }}", 5, 600);
+                              TOPIC_CMD_RELAY_TIMEOUT, "{{ value_json.relay_timeout_s }}", 5, 600, "config");
 
     /* Escala 0-100 pro usuario (Home Assistant), nao 0-VOLUME_STEPS (200) --
      * mesma logica do web_server.c: a granularidade fina de 200 e so um
-     * detalhe interno da curva de audio_codec.c. */
+     * detalhe interno da curva de audio_codec.c. Volume e os botoes de
+     * midia abaixo ficam SEM entity_category -- sao os controles de uso
+     * direto, o motivo de existir esse card. Todo o resto desta funcao e
+     * "config": ajustes de comportamento, nao algo que se mexe toda hora
+     * tocando musica (pedido explicito do usuario pra separar os dois). */
     publish_number_discovery("receiver_bt_volume", "Receiver BT Volume", TOPIC_CMD_VOLUME,
-                              "{{ value_json.volume }}", 0, 100);
+                              "{{ value_json.volume }}", 0, 100, NULL);
     publish_switch_discovery("receiver_bt_agc", "Receiver BT AGC", TOPIC_CMD_AGC_ENABLED,
-                              "{{ '1' if value_json.agc_enabled else '0' }}");
+                              "{{ '1' if value_json.agc_enabled else '0' }}", "config");
     publish_switch_discovery("receiver_bt_discoverable", "Receiver BT Visivel", TOPIC_CMD_DISCOVERABLE,
-                              "{{ '1' if value_json.bt_discoverable else '0' }}");
-    publish_switch_discovery("receiver_bt_require_pin", "Receiver BT Exigir PIN", TOPIC_CMD_REQUIRE_PIN,
-                              "{{ '1' if value_json.bt_require_pin else '0' }}");
+                              "{{ '1' if value_json.bt_discoverable else '0' }}", "config");
+    /* Reflete o estado REAL (audio_codec_mic_is_enabled(), decidido no
+     * ultimo boot), nao a preferencia gravada na NVS -- se alguem ligar via
+     * MQTT e nao reiniciar, o switch continua mostrando desligado ate
+     * reiniciar de verdade, igual a interface web (ver comentario em
+     * config.h sobre DEFAULT_MIC_ENABLED). */
+    publish_switch_discovery("receiver_bt_mic_enabled", "Receiver BT Microfone", TOPIC_CMD_MIC_ENABLED,
+                              "{{ '1' if value_json.mic_enabled else '0' }}", "config");
+    /* Ao contrario do switch acima, aplica na hora (nao precisa reiniciar) --
+     * ver audio_codec_set_mic_auto_gate(). */
+    publish_switch_discovery("receiver_bt_mic_auto_gate", "Receiver BT Deteccao de Voz",
+                              TOPIC_CMD_MIC_AUTO_GATE, "{{ '1' if value_json.mic_auto_gate else '0' }}", "config");
+    /* Pedido explicito do usuario: ligado, o primeiro dispositivo a parear
+     * vira automaticamente o unico autorizado (ver pairing_get_lock_mode()
+     * em pairing.c). */
+    publish_switch_discovery("receiver_bt_pairing_lock", "Receiver BT Controle de Dispositivo",
+                              TOPIC_CMD_PAIRING_LOCK, "{{ '1' if value_json.pairing_lock else '0' }}", "config");
 
-    publish_button_discovery("receiver_bt_play", "Receiver BT Play", TOPIC_CMD_MEDIA, "play");
-    publish_button_discovery("receiver_bt_pause", "Receiver BT Pause", TOPIC_CMD_MEDIA, "pause");
-    publish_button_discovery("receiver_bt_next", "Receiver BT Proxima", TOPIC_CMD_MEDIA, "next");
-    publish_button_discovery("receiver_bt_previous", "Receiver BT Anterior", TOPIC_CMD_MEDIA, "previous");
+    publish_button_discovery("receiver_bt_play", "Receiver BT Play", TOPIC_CMD_MEDIA, "play", NULL);
+    publish_button_discovery("receiver_bt_pause", "Receiver BT Pause", TOPIC_CMD_MEDIA, "pause", NULL);
+    publish_button_discovery("receiver_bt_next", "Receiver BT Proxima", TOPIC_CMD_MEDIA, "next", NULL);
+    publish_button_discovery("receiver_bt_previous", "Receiver BT Anterior", TOPIC_CMD_MEDIA, "previous", NULL);
 
     /* Janela de pareamento: o Bluetooth deixou de ficar visivel o tempo todo
      * (ver DEFAULT_BT_DISCOVERABLE em config.h), entao o Home Assistant
      * precisa de um jeito de abrir a janela e de ver quanto tempo resta. */
     publish_button_discovery("receiver_bt_pairing", "Receiver BT Permitir Pareamento",
-                              TOPIC_CMD_PAIRING_MODE, "start");
+                              TOPIC_CMD_PAIRING_MODE, "start", "config");
     publish_button_discovery("receiver_bt_pairing_stop", "Receiver BT Encerrar Pareamento",
-                              TOPIC_CMD_PAIRING_MODE, "stop");
+                              TOPIC_CMD_PAIRING_MODE, "stop", "config");
+    /* Estado em que o conversor do microfone subiu ("saudavel", "chiando" ou
+     * "travado"). Fora de "saudavel" o audio do microfone e silenciado de
+     * proposito, entao sem isto o microfone simplesmente nao funcionava e nao
+     * havia como saber por que sem abrir a interface. O firmware corrige
+     * sozinho cortando o MCLK (ver audio_codec_mic_hard_reset), mas se algum
+     * dia desistir, e este sensor que conta. */
+    publish_number_discovery("receiver_bt_mic_gain", "Receiver BT Volume do Microfone",
+                              TOPIC_CMD_MIC_GAIN, "{{ value_json.mic_gain }}", 0, 100, "config");
+    /* O maximo acompanha o slider da pagina web. Acima do piso de ruido da
+     * fonte o portao fecha; abaixo dele, o chiado passa. Ver
+     * MIC_GATE_THRESHOLD em audio_codec.c. */
+    publish_number_discovery("receiver_bt_mic_gate", "Receiver BT Portao do Microfone",
+                              TOPIC_CMD_MIC_GATE, "{{ value_json.mic_gate_level }}", 0, 20000, "config");
+    publish_generic_sensor_discovery("receiver_bt_mic_adc", "Receiver BT Estado do Microfone",
+                                      "{{ value_json.mic_adc }}", "diagnostic");
     publish_generic_sensor_discovery("receiver_bt_pairing_remaining",
                                       "Receiver BT Pareamento Restante",
-                                      "{{ value_json.bt_discoverable_remaining_s }}");
+                                      "{{ value_json.bt_discoverable_remaining_s }}", "diagnostic");
 }
 
 static void subscribe_commands(void)
@@ -314,9 +389,13 @@ static void subscribe_commands(void)
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_AGC_ENABLED, 1);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCOVERABLE, 1);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_PAIRING_MODE, 1);
-    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_REQUIRE_PIN, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_MIC_ENABLED, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_MIC_AUTO_GATE, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_PAIRING_LOCK, 1);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_DISCONNECT, 1);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_RELAY_TIMEOUT, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_MIC_GAIN, 1);
+    esp_mqtt_client_subscribe(s_client, TOPIC_CMD_MIC_GATE, 1);
     esp_mqtt_client_subscribe(s_client, TOPIC_CMD_PAIR, 1);
 }
 
@@ -386,8 +465,24 @@ static void handle_command(esp_mqtt_event_handle_t event)
         }
     } else if (topic_is(event, TOPIC_CMD_DISCOVERABLE)) {
         bt_audio_set_discoverable(strcmp(payload, "1") == 0);
-    } else if (topic_is(event, TOPIC_CMD_REQUIRE_PIN)) {
-        bt_audio_set_require_pin(strcmp(payload, "1") == 0);
+    } else if (topic_is(event, TOPIC_CMD_MIC_ENABLED)) {
+        /* APLICA NA HORA. Este ramo ficou para tras: ele so gravava a
+         * preferencia na NVS e dizia "precisa reiniciar", copiando um
+         * comportamento do POST /api/config que mudou em 2026-08-29 e nunca
+         * foi refletido aqui. Quem ligava o microfone pelo Home Assistant nao
+         * via efeito nenhum ate reiniciar o aparelho, sem motivo --
+         * audio_codec_mic_set_enabled() cria o canal RX na hora e ja persiste
+         * na NVS por conta propria. */
+        audio_codec_mic_set_enabled(strcmp(payload, "1") == 0);
+        logger_log(ESP_LOG_INFO, TAG, "mic_enabled via MQTT: %s", payload);
+    } else if (topic_is(event, TOPIC_CMD_MIC_AUTO_GATE)) {
+        audio_codec_set_mic_auto_gate(strcmp(payload, "1") == 0);
+    } else if (topic_is(event, TOPIC_CMD_MIC_GAIN)) {
+        audio_codec_set_mic_gain(atoi(payload));
+    } else if (topic_is(event, TOPIC_CMD_MIC_GATE)) {
+        audio_codec_set_mic_gate_threshold(atoi(payload));
+    } else if (topic_is(event, TOPIC_CMD_PAIRING_LOCK)) {
+        pairing_set_lock_mode(strcmp(payload, "1") == 0);
     } else if (topic_is(event, TOPIC_CMD_DISCONNECT)) {
         bt_audio_status_t bt;
         bt_audio_get_status(&bt);
@@ -405,7 +500,19 @@ static void handle_command(esp_mqtt_event_handle_t event)
             uint8_t mac[6];
             if (cJSON_IsString(mac_item) && cJSON_IsString(action_item) &&
                 pairing_parse_mac(mac_item->valuestring, mac)) {
-                pairing_set_allowed(mac, strcmp(action_item->valuestring, "allow") == 0);
+                bool allow = strcmp(action_item->valuestring, "allow") == 0;
+                pairing_set_allowed(mac, allow);
+                /* Mesma correcao do web_server.c: bloquear um mac ja
+                 * conectado no momento nao derrubava a conexao sozinho. */
+                if (!allow) {
+                    bt_audio_status_t bt;
+                    bt_audio_get_status(&bt);
+                    uint8_t connected_mac[6];
+                    if (bt.connected && pairing_parse_mac(bt.remote_mac, connected_mac) &&
+                        memcmp(connected_mac, mac, 6) == 0) {
+                        bt_audio_disconnect_device(mac);
+                    }
+                }
             }
             cJSON_Delete(cmd);
         }
@@ -561,15 +668,16 @@ void mqtt_ha_publish_state(void)
      * visibilidade permanente) -- alimenta o sensor "Pareamento Restante". */
     cJSON_AddNumberToObject(root, "bt_discoverable_remaining_s",
                             bt_audio_get_discoverable_remaining_s());
-    cJSON_AddBoolToObject(root, "bt_require_pin", bt_audio_get_require_pin());
+    cJSON_AddBoolToObject(root, "mic_enabled", audio_codec_mic_is_enabled());
+    cJSON_AddBoolToObject(root, "mic_auto_gate", audio_codec_get_mic_auto_gate());
+    cJSON_AddStringToObject(root, "mic_adc", audio_codec_get_mic_adc_estado());
+    cJSON_AddNumberToObject(root, "mic_gain", audio_codec_get_mic_gain());
+    cJSON_AddNumberToObject(root, "mic_gate_level", audio_codec_get_mic_gate_threshold());
+    cJSON_AddBoolToObject(root, "pairing_lock", pairing_get_lock_mode());
     cJSON_AddStringToObject(root, "connected_device", connected_device);
     cJSON_AddNumberToObject(root, "paired_count", (double)paired_count);
     cJSON_AddStringToObject(root, "paired_names", paired_names);
     cJSON_AddNumberToObject(root, "relay_timeout_s", relay_timeout);
-    if (bt.pending_pin_code[0] != '\0') {
-        cJSON_AddStringToObject(root, "pending_pin_mac", bt.pending_pin_mac);
-        cJSON_AddStringToObject(root, "pending_pin_code", bt.pending_pin_code);
-    }
 
     /* "paired_devices": array com mac/nome/autorizado -- e o que os
      * switches por dispositivo (publish_pair_switch_discovery) leem via

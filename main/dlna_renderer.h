@@ -20,6 +20,14 @@
 
 void dlna_renderer_init(void);
 
+/* Chamados por audio_source.c na troca de fonte (ver audio_source.h).
+ * "deactivated": aborta qualquer busca/reproducao em andamento e passa a
+ * recusar Play do control point. As tasks continuam vivas, apenas ociosas --
+ * nunca destruidas (destruir task no meio de uma escrita foi exatamente a
+ * causa raiz do mutex orfao corrigido em bt_audio.c). */
+void dlna_renderer_on_source_activated(void);
+void dlna_renderer_on_source_deactivated(void);
+
 typedef struct {
     bool playing;
     char track[64];
@@ -64,3 +72,11 @@ void dlna_renderer_get_status(dlna_status_t *out);
  *
  * Devolve ESP_ERR_INVALID_STATE se não há nada carregado/tocando via DLNA. */
 esp_err_t dlna_renderer_media_control(const char *cmd);
+
+/* Diagnostico manual (pedido do usuario 2026-08-27): forca o reenvio de um
+ * NOTIFY (GENA) com o estado atual, sem mudar nada -- serve pra testar se o
+ * control point (Music Assistant) realmente reage a um NOTIFY novo, ou se a
+ * tela dele fica presa independente disso. Retorna false sem mandar nada se
+ * nao houver assinatura ativa agora (nesse caso nao existe pra quem
+ * notificar -- o teste fica inconclusivo, nao "falhou"). */
+bool dlna_renderer_force_notify(void);
