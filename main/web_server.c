@@ -9,6 +9,8 @@
 #include "audio_source.h"
 #include "bt_audio.h"
 #include "config.h"
+
+#include "driver/gpio.h"
 #include "dlna_renderer.h"
 #include "es8388.h"
 #include "logger.h"
@@ -771,6 +773,59 @@ static esp_err_t api_mic_hardreset_post(httpd_req_t *req)
     return send_json(req, resp);
 }
 
+/* POST /api/led/test {"gpio":N} -- pisca um GPIO por ~6s.
+ *
+ * Nasceu para descobrir onde ficavam os LEDs da placa (as referencias de
+ * terceiros divergiam: GPIO19 aparecia como LED D5 numa e como KEY3/botao
+ * noutra). Em vez de escolher no palpite, pisca e alguem olha -- foi assim que
+ * o D5 foi confirmado em 2026-08-30.
+ *
+ * FICA como ferramenta: o plano e trocar os LEDs onboard por externos, ja que
+ * dentro de uma caixa os da placa nao servem para nada, e este endpoint e o
+ * jeito de conferir a ligacao de cada LED novo sem recompilar. Recusa o GPIO
+ * do rele e o PA_ENABLE, que nao sao LED e teriam efeito real. */
+static esp_err_t api_led_test_post(httpd_req_t *req)
+{
+    char buf[48];
+    cJSON *root = recv_json_body(req, buf, sizeof(buf));
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+    cJSON *g = cJSON_GetObjectItem(root, "gpio");
+    int gpio = cJSON_IsNumber(g) ? g->valueint : -1;
+    cJSON_Delete(root);
+    if (gpio < 0 || gpio > 39) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "informe \"gpio\"");
+        return ESP_FAIL;
+    }
+    /* Nunca mexer no rele/LED verde por aqui: ligaria o amplificador. */
+    if (gpio == PIN_RELAY_CONTROL || gpio == PIN_PA_ENABLE_DO_NOT_USE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "GPIO reservado");
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddNumberToObject(resp, "gpio", gpio);
+    esp_err_t err = send_json(req, resp);
+
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << gpio,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    for (int i = 0; i < 12; i++) {
+        gpio_set_level((gpio_num_t)gpio, i % 2);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    /* Devolve o pino ao estado neutro -- se for botao, volta a ser entrada. */
+    gpio_reset_pin((gpio_num_t)gpio);
+    return err;
+}
+
 /* POST /api/mic/scan -- varre as entradas analogicas do codec e devolve
  * quanto cada uma esta captando.
  *
@@ -1059,6 +1114,7 @@ void web_server_start(void)
         {.uri = "/api/mic/raw", .method = HTTP_GET, .handler = api_mic_raw_get},
         {.uri = "/api/mic/reg", .method = HTTP_POST, .handler = api_mic_reg_post},
         {.uri = "/api/mic/scan", .method = HTTP_POST, .handler = api_mic_scan_post},
+        {.uri = "/api/led/test", .method = HTTP_POST, .handler = api_led_test_post},
         {.uri = "/api/mic/hardreset", .method = HTTP_POST, .handler = api_mic_hardreset_post},
         {.uri = "/api/system/restart", .method = HTTP_POST, .handler = api_system_restart_post},
         {.uri = "/api/system/beep", .method = HTTP_POST, .handler = api_system_beep_post},

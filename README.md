@@ -32,7 +32,9 @@ Confirmada de forma independente pelo projeto [squeezelite-esp32](https://github
 | I2S DOUT (para codec) | GPIO26 |
 | I2S DIN (do codec) | GPIO35 |
 | PA_ENABLE (amp onboard — **não usar**) | GPIO21 |
-| Controle do relé do amplificador externo (também liga o LED onboard — cosmético) | GPIO22 |
+| Controle do relé do amplificador externo — **é também o LED D4**, ver [Sinalização por LED](#sinalização-por-led) | GPIO22 |
+| LED D5 (vermelho, ao lado do jack de fone) — diagnóstico | GPIO19 |
+| KEY1 (alterna a fonte de áudio) | GPIO36 (ADC1_CH0) |
 
 ## Arquitetura de áudio/Bluetooth
 
@@ -115,6 +117,7 @@ Todos os endpoints retornam/aceitam JSON (exceto `/ota`, que recebe o `.bin` bru
 | POST | `/api/mic/hardreset` | Corta o MCLK por 500ms e reconstrói I2S + codec (~1,5s) — tira o conversor do estado ruidoso sem reiniciar |
 | GET | `/api/mic/raw` | Amostras cruas do ADC (`?n=`), antes de filtro/portão/ganho — diagnóstico |
 | POST | `/api/mic/reg` | Lê/escreve registrador do ES8388 ao vivo (`{"reg":N}` / `{"reg":N,"val":V}`) — diagnóstico |
+| POST | `/api/led/test` | `{"gpio":N}` — pisca um GPIO por ~6s, para conferir a ligação de um LED sem recompilar (recusa o GPIO do relé e o `PA_ENABLE`) |
 | POST | `/api/system/restart` | Reinicia o dispositivo (responde e reinicia ~500ms depois) |
 | POST | `/ota` | Corpo bruto = novo firmware (`.bin`); reinicia automaticamente |
 | POST | `/ota/spiffs` | Corpo bruto = nova imagem da interface (`spiffs.bin`) — atualiza a web pela rede, sem cabo |
@@ -188,6 +191,48 @@ Com o microfone ligado o caminho é encurtado (`dma_frame_num` 240 → 120, bloc
 - `ADCCONTROL6 = 0x10` dá mais sinal mas o ADC passa a subir saturado. Fica no padrão `0x30`.
 - Ganho e limiar do portão são interdependentes — mexer num sem o outro emudece o microfone.
 - O detector de estado do ADC julga pela **mediana** (não pelo pico, que um único estalo distorce) e conta **amostras** (não blocos, que já mudaram de tamanho por baixo dele).
+
+## Sinalização por LED
+
+A placa tem dois LEDs onboard, e até 2026-08-30 nenhum dos dois tinha significado documentado — um deles inclusive já sinalizava algo por efeito colateral, sem ninguém saber. O mapeamento abaixo foi confirmado **no hardware**, piscando os pinos e observando a placa, porque as referências de terceiros divergiam (uma lista GPIO19 como LED D5, outra como KEY3/botão).
+
+| LED | GPIO | controlado por | o que significa |
+|---|---|---|---|
+| **D4** | 22 | `relay_control.c` (é o `PIN_RELAY_CONTROL`) | **aceso = amplificador ligado.** Acompanha o relé: acende quando há áudio tocando ou voz passando pelo microfone, apaga depois do timeout de silêncio |
+| **D5** (vermelho, ao lado do jack de fone) | 19 | `status_led.c` | diagnóstico — ver os padrões abaixo |
+
+**O D4 não pode ser reaproveitado.** Ele está fisicamente no mesmo GPIO do relé, então piscá-lo ligaria e desligaria o amplificador de verdade.
+
+### Padrões do D5
+
+Um padrão de cada vez, o mais grave ganha. Apagado significa que não há nada a reportar.
+
+| padrão | significado | por quê |
+|---|---|---|
+| apagado | tudo normal | — |
+| pisca rápido (100ms) | **sem Wi-Fi** | o aparelho fica inacessível pela interface e pela API; é o único jeito de saber que o problema é ele, e não a rede de quem está procurando |
+| duas piscadas curtas + pausa | **microfone com problema** | o conversor subiu ruidoso e o áudio do microfone está silenciado de propósito. O firmware corrige sozinho cortando o MCLK — se o padrão persistir, é porque as tentativas se esgotaram |
+| pisca lento (0,5s aceso) | **janela de pareamento aberta** | o aparelho está visível para qualquer um, por tempo limitado |
+
+O padrão do microfone existe por uma queixa concreta: até então, se o conversor subisse ruim o microfone ficava mudo e só dava para descobrir **tentando cantar**.
+
+### Trocar para LEDs externos
+
+Dentro de uma caixa os LEDs da placa não servem para nada. `status_led.c` não depende do LED onboard — basta apontar `PIN_STATUS_LED` (em `main/config.h`) para o pino do LED externo. Nada mais muda.
+
+GPIOs disponíveis no header da placa, e o que já ocupa cada um:
+
+| GPIO | situação |
+|---|---|
+| 0 | **ocupado** — MCLK do I2S |
+| 5, 18, 23 | livres (são KEY6/KEY5/KEY4, botões que este firmware não usa) |
+| 19 | LED D5 — um LED externo em paralelo funciona sem mudar nada |
+| 21 | **não usar** — `PA_ENABLE` do amplificador onboard |
+| 22 | **ocupado** — relé/amplificador (e o LED D4) |
+
+Ao ocupar um GPIO que `button_diag.c` monitora como candidato a botão, remova-o da lista `s_candidate_gpios` — senão os dois brigam pelo pino (foi o que aconteceu com o GPIO19).
+
+Se um LED externo aparecer invertido (aceso quando deveria estar apagado), troque `LED_ACESO` em `status_led.c` para `0`.
 
 ## MQTT / Home Assistant
 

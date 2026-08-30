@@ -3,6 +3,7 @@
 #include "audio_source.h"
 #include "bt_audio.h"
 #include "button_diag.h"
+#include "status_led.h"
 #include "config.h"
 #include "dlna_renderer.h"
 #include "logger.h"
@@ -179,6 +180,9 @@ void app_main(void)
     }
     mqtt_ha_init();
     button_diag_init();
+    /* LED vermelho D5: sinaliza sem Wi-Fi, microfone com problema e janela de
+     * pareamento aberta. Ver status_led.h. */
+    status_led_init();
 
     while (1) {
         /* esp_get_free_heap_size() inclui os 4MB de PSRAM e sempre parece

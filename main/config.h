@@ -35,6 +35,15 @@
  * vai piscar/acender junto com o relé. É cosmético, não um conflito real. */
 #define PIN_RELAY_CONTROL  22
 
+/* LED VERMELHO onboard (D5), o que fica ao lado do jack de fone -- confirmado
+ * ao vivo pelo Celio em 2026-08-30, piscando o pino e olhando a placa. As
+ * referencias de terceiros divergiam: uma lista GPIO19 como LED D5, outra como
+ * KEY3 (botao). Nesta placa e LED.
+ *
+ * O LED VERDE (D4) nao entra aqui: ele nao e controlavel por este firmware.
+ * Ver a secao "Sinalizacao por LED" do README. */
+#define PIN_STATUS_LED     19
+
 /* -------------------------------------------------------------------------
  * NVS — namespace e chaves
  * ------------------------------------------------------------------------- */

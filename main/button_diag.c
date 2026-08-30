@@ -30,7 +30,10 @@ static const char *TAG = "button_diag";
  * ja usados neste firmware (I2C 32/33, I2S 0/25/26/27/35, rele 22, PA_ENABLE
  * 21 -- ver config.h). */
 static const gpio_num_t s_candidate_gpios[] = {
-    GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_13, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_23,
+    /* GPIO19 saiu da lista: confirmado como LED D5 desta placa (nao botao) e
+     * agora usado como SAIDA por status_led.c -- monitora-lo como entrada
+     * brigaria pelo pino. */
+    GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_13, GPIO_NUM_18, GPIO_NUM_23,
 };
 #define NUM_CANDIDATES (sizeof(s_candidate_gpios) / sizeof(s_candidate_gpios[0]))
 
