@@ -105,7 +105,7 @@ Todos os endpoints retornam/aceitam JSON (exceto `/ota`, que recebe o `.bin` bru
 |---|---|---|
 | GET | `/api/status` | Estado atual: conexão BT (`bt_remote_mac`/`bt_remote_name`) ou Slimproto/Music Assistant (`slim_connected`/`slim_playing`), faixa/artista/álbum (de qualquer uma das duas fontes — BT tem prioridade), volume (0-200), AGC (`agc_enabled`/`agc_gain`/`agc_target`/`agc_mode`), amplificador, IP, uptime, `bt_discoverable`, `ma_configured`/`ma_token_valid` (token da API do Music Assistant — ver [`docs/music_assistant_integration.md`](docs/music_assistant_integration.md)) |
 | GET | `/api/config` | Configurações atuais (sem senhas/token) |
-| POST | `/api/config` | Salva configurações (nome, Wi-Fi, timeout do relé, MQTT, `bt_discoverable`, `pairing_lock` e os do microfone: `mic_enabled`, `mic_input`, `mic_gain`, `mic_gate_level`, `mic_auto_gate` — todos aplicam na hora) |
+| POST | `/api/config` | Salva configurações (nome, Wi-Fi, timeout do relé, `relay_active_low`, `relay_open_drain`, MQTT, `bt_discoverable`, `pairing_lock` e os do microfone: `mic_enabled`, `mic_input`, `mic_gain`, `mic_gate_level`, `mic_auto_gate` — todos aplicam na hora) |
 | POST | `/api/volume` | `{"volume": 0-200}` (escala perceptual — ver [Volume fino e AGC](#volume-fino-e-agc)) |
 | POST | `/api/agc` | `{"enabled": bool, "target": -30 a -6 (dBFS), "mode": 0\|1\|2}` |
 | POST | `/api/media` | `{"cmd": "play"\|"pause"\|"playpause"\|"stop"\|"next"\|"previous"}` — AVRCP passthrough pro celular (se BT conectado) ou protocolo LMS clássico pro Music Assistant (se Slimproto conectado, ver `main/lms_cli.c`) |
@@ -117,6 +117,7 @@ Todos os endpoints retornam/aceitam JSON (exceto `/ota`, que recebe o `.bin` bru
 | POST | `/api/mic/hardreset` | Corta o MCLK por 500ms e reconstrói I2S + codec (~1,5s) — tira o conversor do estado ruidoso sem reiniciar |
 | GET | `/api/mic/raw` | Amostras cruas do ADC (`?n=`), antes de filtro/portão/ganho — diagnóstico |
 | POST | `/api/mic/reg` | Lê/escreve registrador do ES8388 ao vivo (`{"reg":N}` / `{"reg":N,"val":V}`) — diagnóstico |
+| POST | `/api/amp` | `{"on":bool}` — força o estado do relé do amplificador, sem depender de áudio nem do timeout (ferramenta de instalação) |
 | POST | `/api/led/test` | `{"gpio":N}` — pisca um GPIO por ~6s, para conferir a ligação de um LED sem recompilar (recusa o GPIO do relé e o `PA_ENABLE`) |
 | POST | `/api/system/restart` | Reinicia o dispositivo (responde e reinicia ~500ms depois) |
 | POST | `/ota` | Corpo bruto = novo firmware (`.bin`); reinicia automaticamente |
@@ -192,14 +193,65 @@ Com o microfone ligado o caminho é encurtado (`dma_frame_num` 240 → 120, bloc
 - Ganho e limiar do portão são interdependentes — mexer num sem o outro emudece o microfone.
 - O detector de estado do ADC julga pela **mediana** (não pelo pico, que um único estalo distorce) e conta **amostras** (não blocos, que já mudaram de tamanho por baixo dele).
 
+## Relé do amplificador externo
+
+Controle no **GPIO22** (`IO22` no header), que também é o LED D4 — ver [Sinalização por LED](#sinalização-por-led).
+
+| pino do módulo | onde ligar |
+|---|---|
+| `IN` / `SIG` | IO22 |
+| `GND` | GND do header **e** GND da fonte (precisa ser comum — é a referência do sinal) |
+| `VCC` | 5V da fonte (a bobina puxa ~70 mA; não tire do 3V3 da placa) |
+
+Do outro lado, contatos `NO` + `COM` no **REM/trigger** do amplificador, para que ele fique desligado quando o ESP32 estiver sem energia. O relé desliga sozinho após `relay_timeout_s` sem áudio e liga assim que houver música ou voz no microfone.
+
+### Módulo de 5V que não desliga (dreno aberto)
+
+Sintoma medido na instalação: o relé ficava **acionado o tempo todo** e nada alternava — mas o LED D4 piscava normalmente, e **remover o fio do `IN` desligava o relé**.
+
+Essa última observação é o diagnóstico inteiro: o relé *consegue* desligar (não é fiação nem GND), desliga com o `IN` em alta impedância, e não desliga com 3,3 V. É o caso clássico do módulo de 5 V com optoacoplador — para desligar ele precisa ver o `IN` perto de **5 V**, e o ESP32 entrega no máximo 3,3 V; a diferença de 1,7 V sobre o LED do optoacoplador basta para mantê-lo conduzindo.
+
+A correção é **só de firmware**: pôr o GPIO em **dreno aberto**. Para acionar, puxa para GND; para desligar, fica em alta impedância — eletricamente igual ao fio removido, deixando o pull-up de 5 V do próprio módulo agir.
+
+Duas chaves em `/api/config`, aplicam na hora e ficam gravadas (dependem do módulo instalado, então não são fixas no código):
+
+| chave | quando usar |
+|---|---|
+| `relay_active_low` | módulo *low trigger* — a maioria dos que têm optoacoplador |
+| `relay_open_drain` | módulo de 5 V que não desliga com 3,3 V. Só faz sentido junto com `relay_active_low`, porque em dreno aberto o pino não impõe nível alto |
+
+Para o módulo usado neste projeto, **os dois em `true`**:
+
+```
+curl -X POST -H "Content-Type: application/json"      -d '{"relay_active_low":true,"relay_open_drain":true}'      http://<ip>/api/config
+```
+
+Se nem isso bastar, o caminho é alimentar o **lado lógico** do módulo com 3,3 V: remover o jumper `JD-VCC`, ligar `VCC` no 3V3 da placa e `JD-VCC` no 5 V da fonte, com GND comum.
+
+### Testar a ligação
+
+`POST /api/amp {"on":true|false}` força o estado sem depender de áudio tocando nem de esperar o timeout — que é o que se precisa com as mãos dentro da caixa.
+
+Para ouvir o relé alternando em loop, há `tools/testa_rele.ps1`:
+
+```
+powershell -ExecutionPolicy Bypass -File .	ools	esta_rele.ps1 -Intervalo 5
+```
+
+(o `-ExecutionPolicy Bypass` contorna o bloqueio padrão do Windows apenas nessa execução)
+
 ## Sinalização por LED
 
 A placa tem dois LEDs onboard, e até 2026-08-30 nenhum dos dois tinha significado documentado — um deles inclusive já sinalizava algo por efeito colateral, sem ninguém saber. O mapeamento abaixo foi confirmado **no hardware**, piscando os pinos e observando a placa, porque as referências de terceiros divergiam (uma lista GPIO19 como LED D5, outra como KEY3/botão).
 
 | LED | GPIO | controlado por | o que significa |
 |---|---|---|---|
-| **D4** | 22 | `relay_control.c` (é o `PIN_RELAY_CONTROL`) | **aceso = amplificador ligado.** Acompanha o relé: acende quando há áudio tocando ou voz passando pelo microfone, apaga depois do timeout de silêncio |
+| D1, D3 | — | nada (ligados à alimentação) | sempre acesos — indicam que a placa está energizada |
+| D2 | — | nada | apagado com o aparelho na fonte; provavelmente carga de bateria |
+| **D4** | 22 | `relay_control.c` (é o `PIN_RELAY_CONTROL`) | **apagado = amplificador LIGADO**, aceso = desligado. Confirmado ao vivo: apaga quando a música começa a tocar |
 | **D5** (vermelho, ao lado do jack de fone) | 19 | `status_led.c` | diagnóstico — ver os padrões abaixo |
+
+**Os dois LEDs controláveis são ativos em nível BAIXO** — nível 0 acende. Isso vale para o D4 (por isso ele acende com o amplificador desligado, que é o estado de repouso do relé) e é o valor de `LED_ACESO` em `status_led.c`. Só D4 e D5 dependem de GPIO; D1, D2 e D3 estão fora do alcance do firmware.
 
 **O D4 não pode ser reaproveitado.** Ele está fisicamente no mesmo GPIO do relé, então piscá-lo ligaria e desligaria o amplificador de verdade.
 

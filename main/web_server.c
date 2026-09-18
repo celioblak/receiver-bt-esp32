@@ -236,6 +236,8 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "mic_auto_gate", audio_codec_get_mic_auto_gate());
     cJSON_AddNumberToObject(root, "mic_gain", audio_codec_get_mic_gain());
     cJSON_AddNumberToObject(root, "mic_gate_level", audio_codec_get_mic_gate_threshold());
+    cJSON_AddBoolToObject(root, "relay_active_low", relay_control_get_active_low());
+    cJSON_AddBoolToObject(root, "relay_open_drain", relay_control_get_open_drain());
     cJSON_AddNumberToObject(root, "mic_input", audio_codec_mic_get_input());
     cJSON_AddStringToObject(root, "mic_input_nome", audio_codec_mic_get_input_name());
     cJSON_AddBoolToObject(root, "pairing_lock", pairing_get_lock_mode());
@@ -320,6 +322,13 @@ static esp_err_t api_config_post(httpd_req_t *req)
      * hora -- e so uma escrita de I2C, o I2S nem e tocado. */
     if ((item = cJSON_GetObjectItem(root, "mic_input")) && cJSON_IsNumber(item)) {
         audio_codec_mic_set_input(item->valueint);
+    }
+    /* Polaridade do modulo de rele -- aplica na hora, sem reiniciar. */
+    if ((item = cJSON_GetObjectItem(root, "relay_active_low")) && cJSON_IsBool(item)) {
+        relay_control_set_active_low(cJSON_IsTrue(item));
+    }
+    if ((item = cJSON_GetObjectItem(root, "relay_open_drain")) && cJSON_IsBool(item)) {
+        relay_control_set_open_drain(cJSON_IsTrue(item));
     }
     if ((item = cJSON_GetObjectItem(root, "pairing_lock")) && cJSON_IsBool(item)) {
         pairing_set_lock_mode(cJSON_IsTrue(item));
@@ -773,6 +782,40 @@ static esp_err_t api_mic_hardreset_post(httpd_req_t *req)
     return send_json(req, resp);
 }
 
+/* POST /api/amp {"on":true|false} -- força o estado do relé do amplificador.
+ *
+ * Ferramenta de INSTALAÇÃO: sem ela, testar a ligação do relé exige áudio
+ * tocando e esperar o timeout, o que é péssimo com as mãos dentro da caixa.
+ * Ligar aqui cancela o timer; qualquer áudio novo volta a mandar normalmente.
+ *
+ * Isto existiu antes como diagnóstico e foi removido na limpeza de 2026-08-30,
+ * por eu julgar que o problema do relé estava resolvido. No mesmo dia o Célio
+ * foi instalar o relé de verdade e precisou exatamente disto. Fica. */
+static esp_err_t api_amp_post(httpd_req_t *req)
+{
+    char buf[48];
+    cJSON *root = recv_json_body(req, buf, sizeof(buf));
+    if (root == NULL) {
+        return ESP_FAIL;
+    }
+    cJSON *on = cJSON_GetObjectItem(root, "on");
+    bool ligar = cJSON_IsTrue(on);
+    cJSON_Delete(root);
+
+    if (ligar) {
+        relay_control_force_on();
+    } else {
+        relay_control_force_off();
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddBoolToObject(resp, "amplifier", relay_control_is_on());
+    cJSON_AddBoolToObject(resp, "relay_active_low", relay_control_get_active_low());
+    cJSON_AddBoolToObject(resp, "relay_open_drain", relay_control_get_open_drain());
+    return send_json(req, resp);
+}
+
 /* POST /api/led/test {"gpio":N} -- pisca um GPIO por ~6s.
  *
  * Nasceu para descobrir onde ficavam os LEDs da placa (as referencias de
@@ -1115,6 +1158,7 @@ void web_server_start(void)
         {.uri = "/api/mic/reg", .method = HTTP_POST, .handler = api_mic_reg_post},
         {.uri = "/api/mic/scan", .method = HTTP_POST, .handler = api_mic_scan_post},
         {.uri = "/api/led/test", .method = HTTP_POST, .handler = api_led_test_post},
+        {.uri = "/api/amp", .method = HTTP_POST, .handler = api_amp_post},
         {.uri = "/api/mic/hardreset", .method = HTTP_POST, .handler = api_mic_hardreset_post},
         {.uri = "/api/system/restart", .method = HTTP_POST, .handler = api_system_restart_post},
         {.uri = "/api/system/beep", .method = HTTP_POST, .handler = api_system_beep_post},

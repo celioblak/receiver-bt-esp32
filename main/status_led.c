@@ -25,9 +25,14 @@ static const char *TAG = "status_led";
 #define PAD_MIC_RUIM     "1010000000000"      /* duas piscadas curtas + pausa ~1s */
 #define PAD_PAREAMENTO   "11111000000000000"  /* lento: 0,5s aceso, 1,2s apagado */
 
-/* Nivel do GPIO que ACENDE o LED. Se o LED aparecer invertido (aceso quando
- * deveria estar apagado), e so trocar para 0. */
-#define LED_ACESO 1
+/* Nivel do GPIO que ACENDE o LED.
+ *
+ * ZERO: os LEDs desta placa sao ATIVOS EM NIVEL BAIXO -- confirmado ao vivo
+ * (2026-08-30). Com LED_ACESO=1 o D5 ficava aceso justamente no estado
+ * "apagado" (nivel 0), ou seja, o LED de diagnostico vivia ligado dizendo que
+ * estava tudo bem. Se trocar por um LED externo com a outra polaridade, e so
+ * voltar para 1. */
+#define LED_ACESO 0
 
 static const char *padrao_atual(void)
 {

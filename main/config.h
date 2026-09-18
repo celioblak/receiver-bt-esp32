@@ -33,6 +33,10 @@
  * Este GPIO também está ligado ao LED onboard do kit (ativo em nível baixo,
  * confirmado de forma independente pelo projeto squeezelite-esp32) — o LED
  * vai piscar/acender junto com o relé. É cosmético, não um conflito real. */
+/* Tambem e o LED D4 da placa, ATIVO EM NIVEL BAIXO: com o rele desligado
+ * (nivel 0, o estado de repouso) o LED fica ACESO, e ele apaga quando o
+ * amplificador liga. Confirmado ao vivo em 2026-08-30 tocando musica e
+ * olhando a placa -- a documentacao dizia o contrario. */
 #define PIN_RELAY_CONTROL  22
 
 /* LED VERMELHO onboard (D5), o que fica ao lado do jack de fone -- confirmado
@@ -70,12 +74,49 @@
 #define NVS_KEY_MIC_GAIN        "mic_gain"
 #define NVS_KEY_MIC_GATE_LEVEL  "mic_gate_lvl"
 #define NVS_KEY_MIC_INPUT       "mic_input"
+#define NVS_KEY_RELAY_ACTIVE_LOW "relay_act_lo"
+#define NVS_KEY_RELAY_OPEN_DRAIN "relay_od"
 
 /* -------------------------------------------------------------------------
  * Valores padrão
  * ------------------------------------------------------------------------- */
 
 #define DEFAULT_RELAY_TIMEOUT_S 30      /* segundos sem PLAYING até desligar o ampli */
+
+/* Polaridade do módulo de relé. 0 = aciona em nível ALTO (o que este firmware
+ * sempre assumiu); 1 = aciona em nível BAIXO.
+ *
+ * A maioria dos módulos de relé com optoacoplador é **low trigger**, e com eles
+ * a lógica fica invertida: em repouso o GPIO está em nível 0, o relé fica
+ * ACIONADO e o amplificador nunca desliga. Sintoma exato relatado pelo Célio ao
+ * instalar (2026-08-30): "liguei o dispositivo, nada em reprodução, o relay já
+ * fica ativo".
+ *
+ * Configurável em vez de fixo porque depende do módulo que estiver instalado, e
+ * trocar módulo não deveria exigir recompilar. Ajustável em `/api/config`
+ * (`relay_active_low`) e testável com `POST /api/amp`. */
+#define DEFAULT_RELAY_ACTIVE_LOW 0
+
+/* DRENO ABERTO no pino do relé. 0 = saída normal (push-pull); 1 = dreno aberto.
+ *
+ * Existe por um caso medido na instalação (2026-08-30): módulo de relé de 5V
+ * com optoacoplador, ligado ao IO22. O relé ficava ACIONADO nos dois níveis e
+ * só soltava quando o Célio REMOVIA o fio do IN.
+ *
+ * A causa é de nível: para DESLIGAR, esse módulo precisa ver o IN perto de 5V,
+ * e o ESP32 entrega no máximo 3,3V -- sobra tensão suficiente sobre o
+ * optoacoplador para mantê-lo conduzindo. Com o fio fora, o pull-up interno do
+ * módulo leva o IN a 5V e ele solta.
+ *
+ * Dreno aberto reproduz exatamente isso: para acionar, o pino puxa para GND;
+ * para desligar, fica em alta impedância -- eletricamente igual ao fio
+ * removido, deixando o pull-up de 5V do módulo agir. Resolve sem transistor
+ * nem conversor de nível.
+ *
+ * Só faz sentido junto com relay_active_low: em dreno aberto o pino não
+ * consegue impor nível alto, então um módulo high trigger precisa de saída
+ * normal (ou de um pull-up externo para 3,3V). */
+#define DEFAULT_RELAY_OPEN_DRAIN 0
 #define RELAY_SILENCE_DEBOUNCE_S 2      /* ignora pausas curtas entre faixas */
 
 /* 0 = NÃO aparece na busca de aparelhos novos por padrão; para parear, abre-se
