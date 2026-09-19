@@ -53,6 +53,11 @@ void bt_audio_get_status(bt_audio_status_t *out);
  * controlador -- não adianta perguntar mais rápido do que o rádio responde. */
 void bt_audio_request_rssi(void);
 
+/* Intervalo entre consultas de sinal, em segundos. 0 desliga.
+ * Ver DEFAULT_BT_RSSI_INTERVAL_S. */
+void bt_audio_set_rssi_interval(int segundos);
+int bt_audio_get_rssi_interval(void);
+
 /* Chamar sempre que o volume local mudar por uma ação explícita do usuário
  * (web UI), nunca pelos ajustes contínuos do AGC — sincroniza o slider de
  * volume do celular via AVRCP (absolute volume), só se ele tiver pedido

@@ -76,6 +76,7 @@
 #define NVS_KEY_MIC_INPUT       "mic_input"
 #define NVS_KEY_RELAY_ACTIVE_LOW "relay_act_lo"
 #define NVS_KEY_RELAY_OPEN_DRAIN "relay_od"
+#define NVS_KEY_BT_RSSI_INTERVAL "bt_rssi_s"
 
 /* -------------------------------------------------------------------------
  * Valores padrão
@@ -117,6 +118,22 @@
  * consegue impor nível alto, então um módulo high trigger precisa de saída
  * normal (ou de um pull-up externo para 3,3V). */
 #define DEFAULT_RELAY_OPEN_DRAIN 0
+
+/* Intervalo, em segundos, entre consultas de qualidade do enlace Bluetooth.
+ * 0 = DESLIGADO.
+ *
+ * Existe configurável porque a primeira tentativa de medir isso deixou o
+ * aparelho instável com um celular conectado, e "instável" não é diagnóstico:
+ * sem poder ligar e desligar a consulta em runtime, não dá para saber se a
+ * culpa é dela ou de outra coisa, nem a partir de que frequência ela incomoda.
+ *
+ * Começa em 0 para o aparelho subir estável; sobe-se a partir daí, medindo. */
+/* 1 segundo. Começou em 0 (desligado) enquanto se investigava se a medição
+ * era a causa de o aparelho engasgar com um celular conectado. NÃO ERA: o
+ * isolamento com este mesmo interruptor mediu 25/25 respostas em 0s, 30s, 5s e
+ * 1s, sem nenhuma degradação. A instabilidade era falta de RAM interna, e o
+ * servidor HTTP recusando conexões em vez de reciclá-las. */
+#define DEFAULT_BT_RSSI_INTERVAL_S 1
 #define RELAY_SILENCE_DEBOUNCE_S 2      /* ignora pausas curtas entre faixas */
 
 /* 0 = NÃO aparece na busca de aparelhos novos por padrão; para parear, abre-se

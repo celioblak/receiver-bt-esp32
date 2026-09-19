@@ -278,7 +278,13 @@ async function refresh() {
             elBtSinal.textContent = barras(d, -30, 0) + "  " + q + " (" + sinal + " dB da faixa ideal)";
             elBtSinalRow.style.display = "";
         } else if (s.bt_connected) {
-            elBtSinal.textContent = "medindo…";
+            /* Sem valor pode ser duas coisas MUITO diferentes, e dizer
+               "medindo…" nas duas é mentir: ou a medição está desligada (e
+               então nunca vai chegar valor nenhum), ou ela está ligada e a
+               primeira resposta do rádio ainda não voltou. */
+            elBtSinal.textContent = (s.bt_rssi_interval_s === 0)
+                ? "medição desligada"
+                : "medindo…";
             elBtSinalRow.style.display = "";
         } else {
             elBtSinalRow.style.display = "none";

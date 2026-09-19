@@ -255,6 +255,30 @@ As frequências são diferentes de propósito: o aparelho fica parado, então o 
 
 A leitura do Bluetooth é **assíncrona** — o pedido vai num comando e a resposta chega num evento do GAP, aparecendo na leitura de status seguinte. Por isso o campo só é publicado depois da primeira medição (a interface mostra "medindo…" até lá): melhor ausente que mentindo zero, já que zero é justamente o melhor valor possível.
 
+### Interface travando com Bluetooth conectado
+
+Sintoma medido em 2026-09-19: com um celular conectado a **interface web travava**, mas `curl` em `/api/status` respondia **25 de 25**. Essa diferença é o diagnóstico — uma requisição isolada passa; o navegador, que abre várias em paralelo (HTML, CSS e o polling), não.
+
+Duas causas somadas:
+
+1. **RAM interna esgotada.** Com Bluetooth conectado *e* microfone ligado sobravam ~10 KB (já esteve em 25,5 KB); o stack Bluetooth sozinho consome ~11 KB.
+2. **O servidor HTTP recusava** conexões novas quando os sockets acabavam, em vez de reciclar a mais antiga.
+
+```c
+config.lru_purge_enable = true;   /* recicla a conexão mais antiga */
+config.max_open_sockets = 4;      /* era 7; cada socket custa RAM interna */
+```
+
+Mais stacks enxutos nas tasks auxiliares (`status_led` 2048→1280, `button_diag` 3072→2048).
+
+| | antes | depois |
+|---|---|---|
+| RAM interna livre (com BT) | 10.255 B | 13.3 KB |
+| maior bloco | 8.192 B | 14.848 B |
+| 5 conexões paralelas | travava | **50/50 com áudio A2DP tocando** |
+
+**Armadilha registrada:** a culpa foi atribuída à medição de RSSI recém-adicionada, e ela quase foi removida sem nenhuma medição isolando a causa. O interruptor `bt_rssi_interval_s` (0 desliga) foi criado para isolar, e mostrou **25/25 em 0 s, 30 s, 5 s e 1 s** — a medição não degradava nada. Instrumento antes de conclusão.
+
 ### Isso já rendeu na prática
 
 Na primeira hora de uso o indicador mostrou o Wi-Fi em **−84 dBm** — e um envio de firmware por OTA foi interrompido no meio, exigindo reinício manual do aparelho. Com uma antena instalada o sinal foi para **−41 dBm** (43 dB de ganho), e firmware e interface passaram a subir de primeira, com 20/20 requisições respondidas.

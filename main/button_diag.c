@@ -131,5 +131,7 @@ static void button_diag_task(void *arg)
 
 void button_diag_init(void)
 {
-    xTaskCreate(button_diag_task, "button_diag", 3072, NULL, 3, NULL);
+    /* 2048: a task le GPIOs e um canal de ADC, sem nada de pilha profunda.
+     * RAM interna e o recurso critico deste firmware. */
+    xTaskCreate(button_diag_task, "button_diag", 2048, NULL, 3, NULL);
 }

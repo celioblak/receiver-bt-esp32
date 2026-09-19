@@ -39,6 +39,10 @@
             </div>
             <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Ligado: o primeiro dispositivo a parear vira automaticamente o único autorizado (os seguintes são bloqueados, autorize manualmente na página Dispositivos se precisar). Desligado: qualquer um que parear fica liberado, sem restrição automática.</div>
 
+            <label for="bt_rssi_interval_s">Medir sinal do Bluetooth (segundos entre leituras)</label>
+            <input type="number" id="bt_rssi_interval_s" min="0" max="300">
+            <div class="track-sub" style="margin:-0.2rem 0 0.6rem"><strong>0 desliga.</strong> Mede a qualidade do enlace com o celular e mostra na página principal. Consulta o rádio, então vale deixar em 1&nbsp;s só se estiver estável no seu uso &mdash; aqui foi medido sem degradação, mas o rádio é o mesmo que transporta o áudio.</div>
+
             <div class="row">
                 <span class="label">Entrada de microfone (karaokê)</span>
                 <input type="checkbox" id="mic_enabled">
@@ -223,6 +227,7 @@ async function load() {
     document.getElementById("device_name").value = c.device_name;
     document.getElementById("wifi_ssid").value = c.wifi_ssid;
     document.getElementById("relay_timeout_s").value = c.relay_timeout_s;
+    if (c.bt_rssi_interval_s !== undefined) document.getElementById("bt_rssi_interval_s").value = c.bt_rssi_interval_s;
     if (c.relay_active_low !== undefined) document.getElementById("relay_active_low").checked = c.relay_active_low;
     if (c.relay_open_drain !== undefined) document.getElementById("relay_open_drain").checked = c.relay_open_drain;
     document.getElementById("mqtt_host").value = c.mqtt_host;
@@ -428,6 +433,7 @@ document.getElementById("config-form").addEventListener("submit", async (e) => {
         device_name: document.getElementById("device_name").value,
         wifi_ssid: document.getElementById("wifi_ssid").value,
         relay_timeout_s: parseInt(document.getElementById("relay_timeout_s").value, 10),
+        bt_rssi_interval_s: parseInt(document.getElementById("bt_rssi_interval_s").value, 10),
         relay_active_low: document.getElementById("relay_active_low").checked,
         relay_open_drain: document.getElementById("relay_open_drain").checked,
         mqtt_host: document.getElementById("mqtt_host").value,

@@ -93,7 +93,10 @@ void status_led_init(void)
     gpio_config(&cfg);
     gpio_set_level(PIN_STATUS_LED, !LED_ACESO);
 
-    if (xTaskCreate(status_led_task, "status_led", 2048, NULL, 2, NULL) != pdPASS) {
+    /* 1280 bytes: a task so le tres flags e escreve num GPIO. Era 2048, e num
+     * aparelho com ~10KB de RAM interna livre (Bluetooth conectado + microfone
+     * ligado) isso era 20%% do que restava -- caro demais para piscar um LED. */
+    if (xTaskCreate(status_led_task, "status_led", 1280, NULL, 2, NULL) != pdPASS) {
         logger_log(ESP_LOG_WARN, TAG, "nao foi possivel criar a task do LED de status");
         return;
     }

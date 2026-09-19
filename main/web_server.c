@@ -150,6 +150,7 @@ cJSON_AddStringToObject(root, "mic_adc", audio_codec_get_mic_adc_estado());
     if (bt.connected && bt.rssi_valido) {
         cJSON_AddNumberToObject(root, "bt_rssi_delta", bt.rssi_delta);
     }
+    cJSON_AddNumberToObject(root, "bt_rssi_interval_s", bt_audio_get_rssi_interval());
     int wifi_rssi = 0;
     if (wifi_manager_get_rssi(&wifi_rssi)) {
         cJSON_AddNumberToObject(root, "wifi_rssi", wifi_rssi);
@@ -252,6 +253,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "mic_gate_level", audio_codec_get_mic_gate_threshold());
     cJSON_AddBoolToObject(root, "relay_active_low", relay_control_get_active_low());
     cJSON_AddBoolToObject(root, "relay_open_drain", relay_control_get_open_drain());
+    cJSON_AddNumberToObject(root, "bt_rssi_interval_s", bt_audio_get_rssi_interval());
     cJSON_AddNumberToObject(root, "mic_input", audio_codec_mic_get_input());
     cJSON_AddStringToObject(root, "mic_input_nome", audio_codec_mic_get_input_name());
     cJSON_AddBoolToObject(root, "pairing_lock", pairing_get_lock_mode());
@@ -343,6 +345,13 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
     if ((item = cJSON_GetObjectItem(root, "relay_open_drain")) && cJSON_IsBool(item)) {
         relay_control_set_open_drain(cJSON_IsTrue(item));
+    }
+    /* Intervalo da medicao de sinal do BT, em segundos (0 desliga). Existe
+     * para ISOLAR: a medicao deixou o aparelho instavel com um celular
+     * conectado, e sem poder liga-la e desliga-la em runtime nao da para
+     * saber se a culpa e dela nem a partir de que frequencia incomoda. */
+    if ((item = cJSON_GetObjectItem(root, "bt_rssi_interval_s")) && cJSON_IsNumber(item)) {
+        bt_audio_set_rssi_interval(item->valueint);
     }
     if ((item = cJSON_GetObjectItem(root, "pairing_lock")) && cJSON_IsBool(item)) {
         pairing_set_lock_mode(cJSON_IsTrue(item));
@@ -1146,6 +1155,26 @@ void web_server_start(void)
     config.max_uri_handlers = 32;
     config.stack_size = 8192; /* /ota escreve na flash — folga extra de pilha */
     config.recv_wait_timeout = 10;
+    /* RECICLA A CONEXAO MAIS ANTIGA em vez de RECUSAR a nova (2026-09-19).
+     *
+     * Sem isto, quando os sockets acabam o servidor simplesmente nega conexoes
+     * novas -- e o navegador, que abre varias em paralelo (HTML, CSS e o
+     * polling de status), encontra a porta fechada. Da interface travada,
+     * enquanto uma requisicao solitaria por curl continua respondendo
+     * normalmente. Foi exatamente esse o sintoma relatado pelo Celio com o
+     * Bluetooth conectado: `/api/status` respondendo 25 de 25 pelo terminal e
+     * a pagina parada no navegador.
+     *
+     * A causa de fundo e a RAM interna, que com Bluetooth conectado E
+     * microfone ligado cai para ~10KB (ja esteve em 25,5KB) -- o Bluetooth
+     * sozinho consome ~11KB, e isso e problema conhecido deste projeto. Menos
+     * sockets, cada um com o seu buffer, e purga do mais antigo em vez de
+     * recusa: a pagina passa a carregar mesmo no aperto. */
+    config.lru_purge_enable = true;
+    /* Menos sockets simultaneos, porem sempre atendidos. O default (7) e
+     * generoso para um servidor que atende uma pagina por vez, e cada socket
+     * custa buffer de RAM interna -- justamente o que falta. */
+    config.max_open_sockets = 4;
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {

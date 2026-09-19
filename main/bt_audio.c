@@ -1093,10 +1093,61 @@ static void bt_stack_up(uint16_t event, void *p_param)
     logger_log(ESP_LOG_INFO, TAG, "Bluetooth pronto, nome: %s", device_name);
 }
 
+/* Executa a consulta de RSSI JÁ NA TASK DE TRABALHO DO BLUETOOTH.
+ *
+ * É isso que a separação entre pedir e medir existe para garantir. Ver
+ * bt_audio_request_rssi(). */
+static void bt_app_rssi_handler(uint16_t event, void *p_param)
+{
+    (void)event;
+    (void)p_param;
+    if (s_status.connected) {
+        esp_bt_gap_read_rssi_delta(s_peer_bda);
+    }
+}
+
+/* Segundos entre consultas; 0 desliga. Ver DEFAULT_BT_RSSI_INTERVAL_S. */
+static int s_rssi_interval_s = DEFAULT_BT_RSSI_INTERVAL_S;
+
+void bt_audio_set_rssi_interval(int segundos)
+{
+    if (segundos < 0) {
+        segundos = 0;
+    } else if (segundos > 300) {
+        segundos = 300;
+    }
+    s_rssi_interval_s = segundos;
+    storage_set_i32(NVS_KEY_BT_RSSI_INTERVAL, segundos);
+    logger_log(ESP_LOG_INFO, TAG, "medicao de sinal do BT: %s",
+               segundos > 0 ? "ligada" : "desligada");
+}
+
+int bt_audio_get_rssi_interval(void)
+{
+    return s_rssi_interval_s;
+}
+
 void bt_audio_request_rssi(void)
 {
-    /* Sem conexão não há enlace para medir, e zerar aqui evita mostrar o
-     * último valor de uma sessão que já acabou. */
+    /* NUNCA chamar a API do Bluetooth daqui direto.
+     *
+     * Esta função é invocada pelo handler de /api/status, ou seja, pela task do
+     * servidor HTTP. A primeira versão chamava esp_bt_gap_read_rssi_delta()
+     * ali mesmo, e o resultado foi o aparelho ficar INSTÁVEL assim que um
+     * celular conectava: o HTTP respondia algumas vezes e falhava na seguinte
+     * (medido em 2026-09-19, relato do Célio de que "travou" logo após a
+     * primeira medição).
+     *
+     * O projeto já tinha esse mesmo aprendizado registrado em outro lugar:
+     * disparar o bipe de teste pela API enquanto o A2DP toca travava o
+     * dispositivo, e a defesa foi recusar o bipe nesse cenário. Aqui a defesa
+     * certa é outra -- despachar para a fila de trabalho do Bluetooth, que é o
+     * contexto em que todo o resto deste arquivo fala com o stack. Nenhum
+     * comando HCI sai da task do HTTP.
+     *
+     * A fila tem prazo de 10ms e descarta se estiver cheia, o que é o
+     * comportamento desejado: perder uma medição de sinal é irrelevante, travar
+     * a interface não. */
     if (!s_status.connected) {
         if (s_status_mutex != NULL &&
             xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -1106,23 +1157,21 @@ void bt_audio_request_rssi(void)
         }
         return;
     }
-    /* Uma consulta por segundo, acompanhando o ritmo da interface.
-     *
-     * Diferente do Wi-Fi, este valor MUDA o tempo todo: o aparelho fica parado,
-     * mas quem segura o celular (ou o microfone) anda pela casa -- observação do
-     * Célio, e é o que justifica atualizar rápido aqui e devagar lá.
-     *
-     * Não mais que isso, porém: martelar o controlador de rádio com pedidos HCI
-     * enquanto ele transporta áudio A2DP é exatamente o tipo de disputa que este
-     * projeto já pagou caro (ver as notas sobre coexistência Wi-Fi/BT no
-     * README). */
+
+    /* Uma consulta por segundo. Diferente do Wi-Fi, este valor MUDA o tempo
+     * todo: o aparelho fica parado, mas quem segura o celular (ou o microfone)
+     * anda pela casa -- observação do Célio. Não mais que isso, porém: é um
+     * comando HCI no mesmo rádio que transporta o áudio A2DP. */
+    if (s_rssi_interval_s <= 0) {
+        return; /* medicao desligada */
+    }
     static int64_t ultimo_us;
     int64_t agora = esp_timer_get_time();
-    if (ultimo_us != 0 && (agora - ultimo_us) < 1000000) {
+    if (ultimo_us != 0 && (agora - ultimo_us) < (int64_t)s_rssi_interval_s * 1000000LL) {
         return;
     }
     ultimo_us = agora;
-    esp_bt_gap_read_rssi_delta(s_peer_bda);
+    bt_app_work_dispatch(bt_app_rssi_handler, 0, NULL, 0);
 }
 
 void bt_audio_get_status(bt_audio_status_t *out)
@@ -1137,6 +1186,14 @@ void bt_audio_get_status(bt_audio_status_t *out)
 
 void bt_audio_init(void)
 {
+    {
+        /* Intervalo da medicao de sinal, do NVS. Ver
+         * DEFAULT_BT_RSSI_INTERVAL_S em config.h. */
+        int32_t iv = DEFAULT_BT_RSSI_INTERVAL_S;
+        storage_get_i32(NVS_KEY_BT_RSSI_INTERVAL, &iv, DEFAULT_BT_RSSI_INTERVAL_S);
+        s_rssi_interval_s = (int)iv;
+    }
+
     bt_audio_prealloc_ring_buffer();
 
     s_status_mutex = xSemaphoreCreateMutex();
