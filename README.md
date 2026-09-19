@@ -103,7 +103,7 @@ Todos os endpoints retornam/aceitam JSON (exceto `/ota`, que recebe o `.bin` bru
 
 | Método | Rota | Descrição |
 |---|---|---|
-| GET | `/api/status` | Estado atual: conexão BT (`bt_remote_mac`/`bt_remote_name`) ou Slimproto/Music Assistant (`slim_connected`/`slim_playing`), faixa/artista/álbum (de qualquer uma das duas fontes — BT tem prioridade), volume (0-200), AGC (`agc_enabled`/`agc_gain`/`agc_target`/`agc_mode`), amplificador, IP, uptime, `bt_discoverable`, `ma_configured`/`ma_token_valid` (token da API do Music Assistant — ver [`docs/music_assistant_integration.md`](docs/music_assistant_integration.md)) |
+| GET | `/api/status` | Estado atual: `wifi_rssi` (dBm) e `bt_rssi_delta` (desvio da faixa ideal, só com BT conectado e após a primeira medição), conexão BT (`bt_remote_mac`/`bt_remote_name`) ou Slimproto/Music Assistant (`slim_connected`/`slim_playing`), faixa/artista/álbum (de qualquer uma das duas fontes — BT tem prioridade), volume (0-200), AGC (`agc_enabled`/`agc_gain`/`agc_target`/`agc_mode`), amplificador, IP, uptime, `bt_discoverable`, `ma_configured`/`ma_token_valid` (token da API do Music Assistant — ver [`docs/music_assistant_integration.md`](docs/music_assistant_integration.md)) |
 | GET | `/api/config` | Configurações atuais (sem senhas/token) |
 | POST | `/api/config` | Salva configurações (nome, Wi-Fi, timeout do relé, `relay_active_low`, `relay_open_drain`, MQTT, `bt_discoverable`, `pairing_lock` e os do microfone: `mic_enabled`, `mic_input`, `mic_gain`, `mic_gate_level`, `mic_auto_gate` — todos aplicam na hora) |
 | POST | `/api/volume` | `{"volume": 0-200}` (escala perceptual — ver [Volume fino e AGC](#volume-fino-e-agc)) |
@@ -239,6 +239,25 @@ powershell -ExecutionPolicy Bypass -File .	ools	esta_rele.ps1 -Intervalo 5
 ```
 
 (o `-ExecutionPolicy Bypass` contorna o bloqueio padrão do Windows apenas nessa execução)
+
+## Qualidade dos enlaces de rádio
+
+A página principal mostra a potência dos dois enlaces. São métricas **diferentes**, e isso está no rótulo de propósito:
+
+| | o que é | atualização |
+|---|---|---|
+| **Wi-Fi** | **dBm de verdade** (`esp_wifi_sta_get_ap_info`). −50 ótimo, −65 bom, −75 aceitável, −85 no limite | junto com o status — leitura local, sem custo de rádio |
+| **Bluetooth** | **não é dBm**: é o desvio em dB da *Golden Receive Power Range*, a faixa em que o receptor trabalha melhor. **Zero é o melhor caso**; negativo é o quanto falta de sinal | **1× por segundo** |
+
+O ESP-IDF 5.5.3 só expõe a métrica delta para Bluetooth clássico (`esp_bt_gap_read_rssi_delta`); o RSSI absoluto (`esp_bt_gap_read_acl_real_rssi`) só existe em versões mais novas. Chamar o delta de "dBm" seria mentira, então a interface diz o que ele é.
+
+As frequências são diferentes de propósito: o aparelho fica parado, então o Wi-Fi quase não muda — mas **quem segura o celular anda pela casa**, então o Bluetooth muda o tempo todo. Não mais que 1 s no Bluetooth, porém: é um comando HCI no mesmo rádio que transporta o A2DP, e disputa de rádio é um problema conhecido deste projeto.
+
+A leitura do Bluetooth é **assíncrona** — o pedido vai num comando e a resposta chega num evento do GAP, aparecendo na leitura de status seguinte. Por isso o campo só é publicado depois da primeira medição (a interface mostra "medindo…" até lá): melhor ausente que mentindo zero, já que zero é justamente o melhor valor possível.
+
+### Isso já rendeu na prática
+
+Na primeira hora de uso o indicador mostrou o Wi-Fi em **−84 dBm** — e um envio de firmware por OTA foi interrompido no meio, exigindo reinício manual do aparelho. Com uma antena instalada o sinal foi para **−41 dBm** (43 dB de ganho), e firmware e interface passaram a subir de primeira, com 20/20 requisições respondidas.
 
 ## Sinalização por LED
 

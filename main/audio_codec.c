@@ -554,11 +554,6 @@ static bool aplicar_expansor(int16_t *buf, size_t amostras, int32_t peak)
 {
     (void)peak; /* a decisao nao usa mais o pico do bloco -- ver abaixo */
 
-    if (!s_mic_auto_gate) {
-        s_mic_gate_gain = MIC_GATE_ESCALA;
-        return true;
-    }
-
     const int32_t abrir = s_mic_gate_threshold;
     const int32_t fechar = abrir / 2; /* histerese */
     const int32_t faixa = (abrir > fechar) ? (abrir - fechar) : 1;
@@ -579,7 +574,12 @@ static bool aplicar_expansor(int16_t *buf, size_t amostras, int32_t peak)
         }
 
         int32_t alvo;
-        if (env >= abrir) {
+        if (!s_mic_auto_gate) {
+            /* Detecção automática desligada: o áudio passa inteiro, sem
+             * atenuação. O envelope continua sendo calculado acima, porque
+             * quem decide sobre o amplificador é ele -- ver o retorno. */
+            alvo = MIC_GATE_ESCALA;
+        } else if (env >= abrir) {
             alvo = MIC_GATE_ESCALA;
         } else if (env <= fechar) {
             alvo = MIC_GATE_GANHO_MIN;
@@ -609,7 +609,23 @@ static bool aplicar_expansor(int16_t *buf, size_t amostras, int32_t peak)
 
     s_mic_gate_gain = g;
     s_mic_envelope = env;
-    return g > (MIC_GATE_GANHO_MIN * 2);
+
+    /* "HA VOZ" SE MEDE PELO ENVELOPE, NAO PELO GANHO.
+     *
+     * Este retorno responde "ligo o amplificador?", e quem o consome tambem
+     * decide o mute do DAC. Ele vinha do GANHO aplicado, o que parecia
+     * equivalente e nao e: com a deteccao automatica de voz DESLIGADA o ganho
+     * fica cravado no maximo de proposito (o usuario pediu para nao cortar o
+     * microfone), e o retorno virava `true` para sempre -- o amplificador
+     * ligava sozinho depois do boot e nunca mais desligava, com o microfone em
+     * silencio absoluto. Foi o que o Celio mediu em 2026-08-30: pico 4 no ADC,
+     * rele acionado, timeout de 50s passando varias vezes sem cair.
+     *
+     * Desligar a deteccao de voz quer dizer "nao corte meu microfone", nao
+     * "mantenha o amplificador ligado eternamente". Sao perguntas diferentes e
+     * agora tem respostas diferentes: a atenuacao obedece a s_mic_auto_gate, o
+     * amplificador obedece ao nivel real do sinal, sempre. */
+    return env >= fechar;
 }
 
 static void mic_live_task(void *arg);

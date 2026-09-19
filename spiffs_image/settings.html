@@ -86,6 +86,28 @@
 
             <label for="relay_timeout_s">Timeout do amplificador (segundos sem tocar)</label>
             <input type="number" id="relay_timeout_s" min="5" max="600">
+            <div class="track-sub" style="margin:-0.2rem 0 0.6rem">Quanto tempo sem áudio até o relé desligar o amplificador. Pausas entre faixas não devem chegar perto disso.</div>
+
+            <div class="row">
+                <span class="label">Relé aciona em nível baixo</span>
+                <input type="checkbox" id="relay_active_low">
+            </div>
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Ligue se o seu módulo de relé for <strong>low trigger</strong> &mdash; a maioria dos que têm optoacoplador é. Sintoma de estar errado: o relé fica acionado com o aparelho parado.</div>
+
+            <div class="row">
+                <span class="label">Saída em dreno aberto</span>
+                <input type="checkbox" id="relay_open_drain">
+            </div>
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Ligue se o relé <strong>nunca desliga</strong>, mesmo com a opção acima. É o caso de módulos de 5V: eles precisam ver ~5V para desligar, e a placa só entrega 3,3V. Em dreno aberto a saída fica solta para desligar &mdash; o mesmo efeito de desconectar o fio do IN. Só funciona junto com "aciona em nível baixo".</div>
+
+            <div class="row">
+                <span class="label">Testar o relé agora</span>
+                <span>
+                    <button type="button" id="amp-on" class="secondary">Ligar</button>
+                    <button type="button" id="amp-off" class="secondary">Desligar</button>
+                </span>
+            </div>
+            <div class="track-sub" id="amp-result" style="margin:0.3rem 0 0.8rem">Força o estado do relé sem depender de áudio tocando nem de esperar o timeout &mdash; útil para conferir a ligação. Qualquer áudio novo volta a mandar no relé normalmente.</div>
 
             <label for="mqtt_host">Broker MQTT (Home Assistant) — endereço</label>
             <input type="text" id="mqtt_host" maxlength="63" placeholder="deixe em branco para desativar">
@@ -201,6 +223,8 @@ async function load() {
     document.getElementById("device_name").value = c.device_name;
     document.getElementById("wifi_ssid").value = c.wifi_ssid;
     document.getElementById("relay_timeout_s").value = c.relay_timeout_s;
+    if (c.relay_active_low !== undefined) document.getElementById("relay_active_low").checked = c.relay_active_low;
+    if (c.relay_open_drain !== undefined) document.getElementById("relay_open_drain").checked = c.relay_open_drain;
     document.getElementById("mqtt_host").value = c.mqtt_host;
     document.getElementById("mqtt_port").value = c.mqtt_port;
     document.getElementById("mqtt_user").value = c.mqtt_user;
@@ -255,6 +279,32 @@ micGain.addEventListener("input", () => {
 micGain.addEventListener("change", async () => {
     await apiPost("/api/config", { mic_gain: parseInt(micGain.value, 10) });
 });
+
+/* Polaridade e dreno aberto aplicam NA HORA: sao ajustes que se acerta
+   testando o rele, entao esperar o "Salvar" tornaria o teste inutil. */
+["relay_active_low", "relay_open_drain"].forEach(id => {
+    document.getElementById(id).addEventListener("change", async (ev) => {
+        await apiPost("/api/config", { [id]: ev.target.checked });
+    });
+});
+
+const ampResult = document.getElementById("amp-result");
+async function forcarAmp(ligar) {
+    try {
+        const r = await fetch("/api/amp", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ on: ligar })
+        });
+        const d = await r.json();
+        ampResult.textContent = "Relé " + (d.amplifier ? "LIGADO" : "DESLIGADO") +
+            " — se não ouviu o clique, ajuste as duas opções acima.";
+    } catch (e) {
+        ampResult.textContent = "Falhou: " + e;
+    }
+}
+document.getElementById("amp-on").addEventListener("click", () => forcarAmp(true));
+document.getElementById("amp-off").addEventListener("click", () => forcarAmp(false));
 
 const micInput = document.getElementById("mic_input");
 micInput.addEventListener("change", async () => {
@@ -378,6 +428,8 @@ document.getElementById("config-form").addEventListener("submit", async (e) => {
         device_name: document.getElementById("device_name").value,
         wifi_ssid: document.getElementById("wifi_ssid").value,
         relay_timeout_s: parseInt(document.getElementById("relay_timeout_s").value, 10),
+        relay_active_low: document.getElementById("relay_active_low").checked,
+        relay_open_drain: document.getElementById("relay_open_drain").checked,
         mqtt_host: document.getElementById("mqtt_host").value,
         mqtt_port: parseInt(document.getElementById("mqtt_port").value, 10) || 1883,
         mqtt_user: document.getElementById("mqtt_user").value,

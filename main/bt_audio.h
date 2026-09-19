@@ -24,6 +24,18 @@ void bt_audio_on_source_deactivated(void);
 typedef struct {
     bool connected;
     bool playing;
+    /* Qualidade do enlace, em dB de DESVIO da "Golden Receive Power Range" do
+     * Bluetooth -- a faixa de potência em que o receptor trabalha melhor.
+     *
+     * NÃO é dBm. Zero significa "dentro da faixa ideal"; negativo é quanto
+     * falta de sinal; positivo é sinal acima do necessário. O IDF 5.5.3 só
+     * expõe esta métrica para BR/EDR (`esp_bt_gap_read_rssi_delta`) -- o RSSI
+     * absoluto (`read_acl_real_rssi`) só existe em versões mais novas.
+     *
+     * Como zero é um valor VÁLIDO (e justamente o melhor), `rssi_valido` diz
+     * se já houve medição. */
+    int8_t rssi_delta;
+    bool rssi_valido;
     char remote_mac[18];
     char title[64];
     char artist[64];
@@ -32,6 +44,14 @@ typedef struct {
 
 /* Cópia thread-safe do estado atual (usado por web_server.c em /api/status). */
 void bt_audio_get_status(bt_audio_status_t *out);
+
+/* Pede ao controlador a potência do enlace com o dispositivo conectado.
+ *
+ * É ASSÍNCRONO: o valor chega depois, num evento do GAP, e aparece em
+ * `rssi_dbm` na leitura de status seguinte. Chamar isto a cada leitura de
+ * status é barato, e a própria função limita a frequência das consultas ao
+ * controlador -- não adianta perguntar mais rápido do que o rádio responde. */
+void bt_audio_request_rssi(void);
 
 /* Chamar sempre que o volume local mudar por uma ação explícita do usuário
  * (web UI), nunca pelos ajustes contínuos do AGC — sincroniza o slider de

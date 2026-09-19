@@ -137,9 +137,23 @@ static esp_err_t api_status_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "audio_source", audio_source_name(audio_source_get()));
     /* Medidor do mic (pico 0-32767 do ultimo bloco) -- serve pra regular o
      * ganho/limiar olhando o numero enquanto fala/canta. */
-    cJSON_AddStringToObject(root, "mic_adc", audio_codec_get_mic_adc_estado());
+cJSON_AddStringToObject(root, "mic_adc", audio_codec_get_mic_adc_estado());
     cJSON_AddNumberToObject(root, "mic_peak", audio_codec_get_mic_peak());
     cJSON_AddBoolToObject(root, "bt_connected", bt.connected);
+    /* Qualidade dos dois enlaces de radio.
+     *
+     * O pedido do BT e ASSINCRONO: a resposta chega num evento do GAP e
+     * aparece na leitura de status seguinte, entao logo depois de conectar a
+     * primeira costuma vir sem valor. Por isso o campo so e publicado quando
+     * ja houve medicao -- melhor ausente que mentindo zero. */
+    bt_audio_request_rssi();
+    if (bt.connected && bt.rssi_valido) {
+        cJSON_AddNumberToObject(root, "bt_rssi_delta", bt.rssi_delta);
+    }
+    int wifi_rssi = 0;
+    if (wifi_manager_get_rssi(&wifi_rssi)) {
+        cJSON_AddNumberToObject(root, "wifi_rssi", wifi_rssi);
+    }
     cJSON_AddStringToObject(root, "device_name", device_name);
     cJSON_AddStringToObject(root, "device_mac", own_mac);
     cJSON_AddStringToObject(root, "bt_remote_mac", bt.remote_mac);

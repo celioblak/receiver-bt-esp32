@@ -14,6 +14,11 @@ void wifi_manager_init(void);
 
 bool wifi_manager_is_connected(void);
 
+/* Potência do sinal do Wi-Fi em dBm (negativo; quanto mais perto de zero,
+ * melhor). Devolve false se não houver conexão. Referência prática:
+ * -50 ótimo, -60 bom, -70 aceitável, -80 no limite, abaixo disso instável. */
+bool wifi_manager_get_rssi(int *rssi_dbm);
+
 typedef struct {
     char ssid[33];
     int8_t rssi;

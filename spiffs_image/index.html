@@ -36,6 +36,10 @@
             <span class="label">Dispositivo</span>
             <span id="bt-device-name">—</span>
         </div>
+        <div class="row" id="bt-sinal-row" style="display:none">
+            <span class="label">Sinal Bluetooth</span>
+            <span id="bt-sinal">—</span>
+        </div>
         <div class="row">
             <span class="label">Visível para parear</span>
             <span class="badge off" id="pairing-badge">desligado</span>
@@ -76,6 +80,7 @@
 
     <div class="card">
         <div class="row"><span class="label">IP</span><span id="wifi-ip">—</span></div>
+        <div class="row"><span class="label">Sinal Wi-Fi</span><span id="wifi-sinal">—</span></div>
         <div class="row"><span class="label">MAC Bluetooth</span><span id="device-mac">—</span></div>
         <div class="row"><span class="label">Uptime</span><span id="uptime">—</span></div>
     </div>
@@ -130,6 +135,16 @@ setInterval(() => {
         renderDlnaPosition();
     }
 }, 1000);
+
+/* Cinco blocos preenchidos conforme o valor caminha de `pior` até `melhor`.
+   Texto puro de propósito: a página é lida no celular, e um indicador que
+   depende de CSS ou fonte de ícone é um jeito de não aparecer nada. */
+function barras(valor, pior, melhor) {
+    let n = Math.round(((valor - pior) / (melhor - pior)) * 5);
+    if (n < 0) n = 0;
+    if (n > 5) n = 5;
+    return "█".repeat(n) + "░".repeat(5 - n);
+}
 
 async function refresh() {
     try {
@@ -227,6 +242,47 @@ async function refresh() {
         }
         btPairing.update(s);
         document.getElementById("wifi-ip").textContent = s.wifi_ip || "sem rede";
+
+        /* SINAL WI-FI -- dBm de verdade. Faixas práticas para 2,4GHz:
+           -50 ótimo, -60 bom, -70 aceitável, -80 no limite. */
+        const elWifiSinal = document.getElementById("wifi-sinal");
+        if (s.wifi_rssi === undefined) {
+            elWifiSinal.textContent = "—";
+        } else {
+            const r = s.wifi_rssi;
+            let q;
+            if (r >= -55)      q = "excelente";
+            else if (r >= -65) q = "bom";
+            else if (r >= -75) q = "aceitável";
+            else if (r >= -85) q = "fraco";
+            else               q = "muito fraco";
+            elWifiSinal.textContent = barras(r, -90, -50) + "  " + r + " dBm (" + q + ")";
+        }
+
+        /* SINAL BLUETOOTH -- atenção: NÃO é dBm.
+           O ESP-IDF 5.5.3 só expõe, para Bluetooth clássico, o desvio em dB em
+           relação à "faixa ideal de recepção" do rádio. Zero é o melhor caso
+           (dentro da faixa); negativo é o quanto falta de sinal. Mostrar isso
+           como "dBm" seria mentir, então o rótulo diz o que é. */
+        const elBtSinalRow = document.getElementById("bt-sinal-row");
+        const elBtSinal = document.getElementById("bt-sinal");
+        if (s.bt_connected && s.bt_rssi_delta !== undefined) {
+            const d = s.bt_rssi_delta;
+            let q;
+            if (d >= 0)       q = "excelente";
+            else if (d >= -6) q = "bom";
+            else if (d >= -15) q = "aceitável";
+            else if (d >= -25) q = "fraco";
+            else               q = "muito fraco";
+            const sinal = (d > 0 ? "+" : "") + d;
+            elBtSinal.textContent = barras(d, -30, 0) + "  " + q + " (" + sinal + " dB da faixa ideal)";
+            elBtSinalRow.style.display = "";
+        } else if (s.bt_connected) {
+            elBtSinal.textContent = "medindo…";
+            elBtSinalRow.style.display = "";
+        } else {
+            elBtSinalRow.style.display = "none";
+        }
         document.getElementById("device-mac").textContent = s.device_mac;
         document.getElementById("uptime").textContent = fmtUptime(s.uptime_s);
     } catch (e) {

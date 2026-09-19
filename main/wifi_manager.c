@@ -221,6 +221,19 @@ void wifi_manager_init(void)
     start_sta_and_wait(ssid, pass);
 }
 
+bool wifi_manager_get_rssi(int *rssi_dbm)
+{
+    if (rssi_dbm == NULL || !wifi_manager_is_connected()) {
+        return false;
+    }
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return false;
+    }
+    *rssi_dbm = ap.rssi;
+    return true;
+}
+
 bool wifi_manager_is_connected(void)
 {
     return s_connected;

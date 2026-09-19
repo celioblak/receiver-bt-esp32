@@ -37,6 +37,10 @@ static const char *TAG = "bt_audio";
 
 static SemaphoreHandle_t s_status_mutex = NULL;
 static bt_audio_status_t s_status = {0};
+/* Endereço do dispositivo conectado, guardado para poder consultar a potência
+ * do enlace -- a API do GAP pede o endereço, e o status só guarda a versão em
+ * texto. Válido enquanto s_status.connected for true. */
+static esp_bd_addr_t s_peer_bda = {0};
 static volatile bool s_discoverable = DEFAULT_BT_DISCOVERABLE;
 /* 0 = nenhuma janela temporaria de descobrivel ativa. Ver bt_audio_enable_
  * discoverable_temporary()/bt_audio_check_discoverable_timeout(). */
@@ -354,6 +358,18 @@ static void bt_app_gap_handler(uint16_t event, void *p_param)
              * fica gerenciavel pela pagina Dispositivos, mesmo bloqueado. */
             esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
             break;
+        case ESP_BT_GAP_READ_RSSI_DELTA_EVT:
+            /* Resposta de bt_audio_request_rssi(). Chega quando o controlador
+             * responde -- por isso o pedido e a leitura sao separados. */
+            if (param->read_rssi_delta.stat == ESP_BT_STATUS_SUCCESS &&
+                s_status_mutex != NULL &&
+                xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                s_status.rssi_delta = param->read_rssi_delta.rssi_delta;
+                s_status.rssi_valido = true;
+                xSemaphoreGive(s_status_mutex);
+            }
+            break;
+
         case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
             /* Resposta do esp_bt_gap_read_remote_name() disparado na conexao
              * A2DP (ver ESP_A2D_CONNECTION_STATE_EVT acima) -- reusa
@@ -391,6 +407,9 @@ static void bt_app_a2d_handler(uint16_t event, void *p_param)
                        bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
 
             bool connected = (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED);
+            if (connected) {
+                memcpy(s_peer_bda, bda, sizeof(esp_bd_addr_t));
+            }
 
             /* pairing_is_allowed() so e checado no pareamento inicial
              * (ESP_BT_GAP_CFM_REQ_EVT) -- um dispositivo que ja pareou
@@ -1072,6 +1091,38 @@ static void bt_stack_up(uint16_t event, void *p_param)
                               s_discoverable ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
 
     logger_log(ESP_LOG_INFO, TAG, "Bluetooth pronto, nome: %s", device_name);
+}
+
+void bt_audio_request_rssi(void)
+{
+    /* Sem conexão não há enlace para medir, e zerar aqui evita mostrar o
+     * último valor de uma sessão que já acabou. */
+    if (!s_status.connected) {
+        if (s_status_mutex != NULL &&
+            xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            s_status.rssi_delta = 0;
+            s_status.rssi_valido = false;
+            xSemaphoreGive(s_status_mutex);
+        }
+        return;
+    }
+    /* Uma consulta por segundo, acompanhando o ritmo da interface.
+     *
+     * Diferente do Wi-Fi, este valor MUDA o tempo todo: o aparelho fica parado,
+     * mas quem segura o celular (ou o microfone) anda pela casa -- observação do
+     * Célio, e é o que justifica atualizar rápido aqui e devagar lá.
+     *
+     * Não mais que isso, porém: martelar o controlador de rádio com pedidos HCI
+     * enquanto ele transporta áudio A2DP é exatamente o tipo de disputa que este
+     * projeto já pagou caro (ver as notas sobre coexistência Wi-Fi/BT no
+     * README). */
+    static int64_t ultimo_us;
+    int64_t agora = esp_timer_get_time();
+    if (ultimo_us != 0 && (agora - ultimo_us) < 1000000) {
+        return;
+    }
+    ultimo_us = agora;
+    esp_bt_gap_read_rssi_delta(s_peer_bda);
 }
 
 void bt_audio_get_status(bt_audio_status_t *out)
