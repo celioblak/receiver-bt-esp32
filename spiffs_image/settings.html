@@ -58,13 +58,15 @@
 
             <label for="mic_input">De onde vem o som do microfone</label>
             <select id="mic_input">
-                <option value="4">Cabo no jack &mdash; canal direito (recomendado)</option>
-                <option value="3">Cabo no jack &mdash; balanceado</option>
-                <option value="1">Cabo no jack &mdash; simples</option>
+                <option value="4">Cabo mono no jack &mdash; sinal no ANEL (atual)</option>
+                <option value="1">Cabo mono no jack &mdash; sinal na PONTA</option>
+                <option value="3">Cabo estéreo ou balanceado no jack</option>
                 <option value="0">Microfones da própria placa</option>
                 <option value="2">Microfones da placa &mdash; balanceado</option>
             </select>
-            <div class="track-sub" style="margin:-0.2rem 0 0.6rem"><strong>Normalmente não precisa mexer aqui.</strong> Esta placa liga o jack e os microfones embutidos em <strong>entradas diferentes</strong> do conversor, e só dá para ouvir uma de cada vez &mdash; a opção recomendada é a que foi medida como certa para este aparelho. Plugues de 2 faixas (P10/P2 comuns de microfone) aterram um dos canais do jack, e ler o canal com sinal diretamente dá ~8&nbsp;dB a mais de agudos que recuperá-lo por subtração. Mexa apenas se trocar de receptor ou de cabo.</div>
+            <div class="track-sub" style="margin:-0.2rem 0 0.6rem"><strong>Se trocar o cabo, o adaptador ou o microfone, pode ser preciso mudar aqui.</strong><br>
+                Um plugue <strong>mono</strong> (2 faixas, o comum em microfone) encaixado num jack estéreo aterra um dos canais &mdash; e o sinal fica no outro. Qual deles depende do adaptador, por isso há duas opções de cabo mono. Se o som <strong>sumir ou ficar muito fraco</strong> depois de trocar algo, é quase sempre isto.<br><br>
+                <strong>Como descobrir:</strong> escolha uma opção, cante, e olhe o <em>Nível captado agora</em>, no fim desta seção. A opção certa é a que faz o número <strong>subir bastante</strong> quando você canta e cair no silêncio. Teste as duas de cabo mono primeiro.</div>
             <div class="row">
                 <span class="label">Detecção automática de voz (mic)</span>
                 <input type="checkbox" id="mic_auto_gate">

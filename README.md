@@ -213,6 +213,26 @@ Daí o modo `ES8388_IN_LIN2_SE_DIR`, que lê o canal direito direto.
 
 **3. O ganho digital estourava a saída.** `mic_gain` em 100 (4×) sobre sinal cru de ~3.000 dava pico de **34.014** numa escala que termina em 32.767. Saturação achata a onda e o ouvido lê isso como **abafado, não como alto** — o que leva a subir o ganho ainda mais. Círculo vicioso.
 
+### Trocar o cabo, o adaptador ou o microfone
+
+Essa é a mudança mais provável de quebrar a captação no futuro, e o sintoma é confuso: **o som some ou fica muito fraco**, sem nenhum erro no log.
+
+A causa é mecânica. Um plugue **mono** (2 faixas — o comum em microfone) encaixado num jack estéreo tem o corpo encostando no anel *e* no terra: **um dos canais fica aterrado**, e o sinal aparece só no outro. Qual deles depende de como o adaptador foi montado, e não há padrão confiável entre fabricantes.
+
+Por isso a entrada é selecionável em Configurações, com as opções descritas pela **situação física** e não pela eletrônica:
+
+| opção | quando usar | registradores |
+|---|---|---|
+| **Cabo mono no jack — sinal no ANEL** | padrão atual desta montagem | `0x0A=0x50`, lê canal direito |
+| **Cabo mono no jack — sinal na PONTA** | se a de cima não captar | `0x0A=0x50`, lê canal esquerdo |
+| Cabo estéreo ou balanceado no jack | fonte realmente balanceada | `0x0A=0xF0`, `0x0B=0x82` |
+| Microfones da própria placa | sem cabo, captação pelos embutidos | `0x0A=0x00` |
+| Microfones da placa — balanceado | diferencial entre os dois embutidos | `0x0A=0xF0`, `0x0B=0x02` |
+
+**Como escolher sem instrumento:** troque a opção, cante, e olhe o **Nível captado agora** no fim da seção. A certa é a que faz o número subir bastante na voz e cair no silêncio. Comece pelas duas de cabo mono.
+
+Existiu uma varredura automática (`/api/mic/scan`) que media as quatro sozinha — foi ela que descobriu a entrada correta originalmente. Removida em 2026-09-19 por travar: fazia leitura pesada dentro do handler HTTP com pouca RAM interna livre. O medidor ao vivo resolve o mesmo problema sem esse risco.
+
 ### Medir a SAÍDA, não só a entrada
 
 `GET /api/mic/raw` captura **antes** de todo o processamento. Isso achou as causas 1 e 2, mas deixou o fim da cadeia invisível — e foi lá que estava a causa 3.
