@@ -250,6 +250,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "mic_enabled", audio_codec_mic_is_enabled());
     cJSON_AddBoolToObject(root, "mic_auto_gate", audio_codec_get_mic_auto_gate());
     cJSON_AddNumberToObject(root, "mic_gain", audio_codec_get_mic_gain());
+    cJSON_AddNumberToObject(root, "mic_treble", audio_codec_get_mic_treble());
     cJSON_AddNumberToObject(root, "mic_gate_level", audio_codec_get_mic_gate_threshold());
     cJSON_AddBoolToObject(root, "relay_active_low", relay_control_get_active_low());
     cJSON_AddBoolToObject(root, "relay_open_drain", relay_control_get_open_drain());
@@ -330,6 +331,9 @@ static esp_err_t api_config_post(httpd_req_t *req)
      * servem justamente pra afinar cantando. */
     if ((item = cJSON_GetObjectItem(root, "mic_gain")) && cJSON_IsNumber(item)) {
         audio_codec_set_mic_gain(item->valueint);
+    }
+    if ((item = cJSON_GetObjectItem(root, "mic_treble")) && cJSON_IsNumber(item)) {
+        audio_codec_set_mic_treble(item->valueint);
     }
     if ((item = cJSON_GetObjectItem(root, "mic_gate_level")) && cJSON_IsNumber(item)) {
         audio_codec_set_mic_gate_threshold(item->valueint);
@@ -762,8 +766,28 @@ static esp_err_t api_wifi_disable_temp_post(httpd_req_t *req)
 /* GET /api/mic/raw?n=512 -- amostras cruas do ADC, uma por linha.
  * Diagnostico: permite analisar a FORMA do sinal (media, desvio, cruzamentos
  * por zero, saturacao) em vez de so o pico, que esconde tudo. */
+/* true = /api/mic/raw devolve o sinal DEPOIS do processamento. */
+static bool s_raw_da_saida = false;
+
 static esp_err_t api_mic_raw_get(httpd_req_t *req)
 {
+    /* ?ch=r captura o canal DIREITO do conversor (padrao: esquerdo, que e o
+     * que o caminho de audio usa). Existe porque o adaptador do microfone
+     * pode por o sinal no anel do jack, e ai o sinal chega no direito. */
+    {
+        char q[32];
+        char ch[4] = "";
+        if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+            httpd_query_key_value(q, "ch", ch, sizeof(ch));
+        }
+        audio_codec_mic_raw_set_canal(ch[0] == 'r' || ch[0] == 'R');
+        char st[8] = "";
+        if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+            httpd_query_key_value(q, "stage", st, sizeof(st));
+        }
+        s_raw_da_saida = (st[0] == 'o' || st[0] == 'O');
+    }
+
     size_t n = 512;
     char query[32];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
@@ -780,7 +804,7 @@ static esp_err_t api_mic_raw_get(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria");
         return ESP_FAIL;
     }
-    size_t lidas = audio_codec_mic_capture_raw(buf, n);
+    size_t lidas = (s_raw_da_saida ? audio_codec_mic_capture_saida : audio_codec_mic_capture_raw)(buf, n);
 
     httpd_resp_set_type(req, "text/plain");
     char linha[16];
@@ -889,37 +913,6 @@ static esp_err_t api_led_test_post(httpd_req_t *req)
     }
     /* Devolve o pino ao estado neutro -- se for botao, volta a ser entrada. */
     gpio_reset_pin((gpio_num_t)gpio);
-    return err;
-}
-
-/* POST /api/mic/scan -- varre as entradas analogicas do codec e devolve
- * quanto cada uma esta captando.
- *
- * Esta placa liga os microfones embutidos e o jack de entrada em pares
- * DIFERENTES do ES8388 (LIN1/RIN1 contra LIN2/RIN2), e nao ha como saber pelo
- * codigo qual deles tem sinal util -- depende de onde a fonte esta ligada
- * fisicamente. Descobrir isso por tentativa e erro custou dias; aqui sai em
- * seis segundos.
- *
- * COMO USAR: cante ou fale SEM PARAR no microfone de mao, LONGE da placa, do
- * comeco ao fim da chamada. O criterio e qual entrada REAGE a fonte certa --
- * medir com alguem falando perto da placa mede o microfone embutido e ja
- * produziu tres conclusoes erradas aqui.
- *
- * Nao troca a entrada: apenas mede e restaura a que estava. Para gravar a
- * escolha, POST /api/settings {"mic_input": N}. */
-static esp_err_t api_mic_scan_post(httpd_req_t *req)
-{
-    char *json = malloc(512);
-    if (json == NULL) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria");
-        return ESP_FAIL;
-    }
-    json[0] = '\0';
-    audio_codec_mic_scan_inputs(json, 512);
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t err = httpd_resp_sendstr(req, json);
-    free(json);
     return err;
 }
 
@@ -1199,7 +1192,6 @@ void web_server_start(void)
         {.uri = "/api/source", .method = HTTP_POST, .handler = api_source_post},
         {.uri = "/api/mic/raw", .method = HTTP_GET, .handler = api_mic_raw_get},
         {.uri = "/api/mic/reg", .method = HTTP_POST, .handler = api_mic_reg_post},
-        {.uri = "/api/mic/scan", .method = HTTP_POST, .handler = api_mic_scan_post},
         {.uri = "/api/led/test", .method = HTTP_POST, .handler = api_led_test_post},
         {.uri = "/api/amp", .method = HTTP_POST, .handler = api_amp_post},
         {.uri = "/api/mic/hardreset", .method = HTTP_POST, .handler = api_mic_hardreset_post},

@@ -81,11 +81,30 @@ esp_err_t es8388_mic_config_end(void);
  * ganho: voz baixa (obriga a cantar colado) e chiado alto. */
 typedef enum {
     ES8388_IN_LIN1_SE = 0, /* 0x0A=0x00: LINPUT1/RINPUT1 -- microfones embutidos */
-    ES8388_IN_LIN2_SE,     /* 0x0A=0x50: LINPUT2/RINPUT2 -- JACK DE ENTRADA */
+    ES8388_IN_LIN2_SE,     /* 0x0A=0x50: LINPUT2/RINPUT2 -- jack, canal ESQUERDO */
     ES8388_IN_DIFF_MIC1,   /* 0x0A=0xF0 0x0B=0x02: diferencial LIN1-RIN1 */
     ES8388_IN_DIFF_MIC2,   /* 0x0A=0xF0 0x0B=0x82: diferencial LIN2-RIN2 */
+    /* 0x0A=0x50 lendo o canal DIREITO do conversor.
+     *
+     * E o modo certo para um microfone com plugue de 2 faixas (TS) ligado por
+     * adaptador: o corpo do plugue encosta no anel E no terra do jack, entao
+     * um canal fica curto-circuitado ao terra e o sinal fica no outro. Medido
+     * nesta montagem (2026-09-22): canal esquerdo pico 51 (nada), diferencial
+     * 8045, canal direito 3077.
+     *
+     * O diferencial "funciona" por acidente -- recupera o sinal como 0 menos
+     * sinal -- mas paga caro: o capacitor de acoplamento do canal aterrado
+     * fica em curto e forma um filtro que come os agudos. Medido lado a lado,
+     * ler o canal direto da +8dB em 2-3kHz e +7,7dB em 4-6kHz, e a relacao
+     * graves/agudos cai de 487x para 117x. Era a causa do "parece caixa
+     * antiga". */
+    ES8388_IN_LIN2_SE_DIR,
     ES8388_IN_COUNT
 } es8388_mic_input_t;
+
+/* true se o modo escolhido le o canal DIREITO do conversor. O caminho de audio
+ * usa isto para saber qual amostra do par estereo pegar. */
+bool es8388_mic_input_usa_canal_direito(void);
 
 /* Seleciona a entrada e a memoriza -- es8388_mic_config_begin() reaplica o
  * ultimo valor escolhido, para que uma troca feita em runtime sobreviva a uma

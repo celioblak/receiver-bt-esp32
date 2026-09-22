@@ -185,6 +185,40 @@ Três detalhes que importam e não são óbvios:
 
 Com o microfone ligado o caminho é encurtado (`dma_frame_num` 240 → 120, blocos de processamento pela metade): **~70 ms → ~35 ms** entre cantar e ouvir. A folga contra engasgo de coexistência Wi-Fi/BT cai junto — se voltar a picotar na música, `dma_frame_num` em `i2s_init()` é o primeiro número a subir. Sem microfone nada muda: os 12 descritores cheios seguem protegendo Bluetooth e DLNA.
 
+### Por que o som saía abafado — três causas somadas
+
+O microfone passou a captar bem, mas o som soava "abafado, como caixa antiga". Não era regressão: o elogio anterior era sobre **captar a voz**, não sobre qualidade. O abafamento sempre esteve lá e só ficou visível quando o problema maior saiu da frente.
+
+**1. O PGA saturava no analógico.** Estava em `0x77` (+21 dB), herdado da época da entrada errada. Medido cantando:
+
+| PGA | mediana | pico | fator de crista |
+|---|---|---|---|
+| +21 dB | 16.952 | 29.106 | **1,7:1** |
+| +9 dB | 3.540 | 12.465 | 3,5:1 |
+| 0 dB | 860 | 2.345 | 2,7:1 |
+
+Crista de 1,7:1 é sinal esmagado (voz natural fica entre 4:1 e 10:1) — e **nenhuma amostra batia em 32.767**, ou seja não era clipe digital: era saturação analógica no próprio PGA. Hoje `0x33` (+9 dB).
+
+**2. O adaptador do microfone aterra um canal do jack.** O plugue de 2 faixas (TS) tem o corpo encostando no anel *e* no terra, então um canal fica em curto e o sinal aparece só no outro. Medido: canal esquerdo pico 51, diferencial 8.045, **canal direito 3.077**.
+
+O modo diferencial "funcionava" recuperando o sinal como `0 − sinal`, mas o capacitor de acoplamento do canal aterrado ficava em curto, formando um filtro que comia os agudos:
+
+| faixa | diferencial | canal direto |
+|---|---|---|
+| 2-3 kHz | −25,9 dB | **−17,7 dB** |
+| 4-6 kHz | −28,7 dB | **−21,0 dB** |
+| graves/agudos | 487× | **117×** |
+
+Daí o modo `ES8388_IN_LIN2_SE_DIR`, que lê o canal direito direto.
+
+**3. O ganho digital estourava a saída.** `mic_gain` em 100 (4×) sobre sinal cru de ~3.000 dava pico de **34.014** numa escala que termina em 32.767. Saturação achata a onda e o ouvido lê isso como **abafado, não como alto** — o que leva a subir o ganho ainda mais. Círculo vicioso.
+
+### Medir a SAÍDA, não só a entrada
+
+`GET /api/mic/raw` captura **antes** de todo o processamento. Isso achou as causas 1 e 2, mas deixou o fim da cadeia invisível — e foi lá que estava a causa 3.
+
+**`GET /api/mic/raw?stage=out`** devolve o sinal **já processado** (canal, filtros, realce, portão e ganho): é o que de fato vai para o alto-falante. Ao investigar qualquer queixa de timbre ou volume, comparar os dois pontos antes de mexer em parâmetro.
+
 ### Armadilhas já pagas
 
 - **Não remover os microfones embutidos.** Eles não captam nada útil na entrada em uso (medido: falar alto a 10 cm não move o nível), mas **sem microfone na placa o ADC não sobe** — com resistor de 1 kΩ e de 10 kΩ no lugar do MIC1 foram 0 boots saudáveis em 18 tentativas. Captar e inicializar são coisas diferentes.

@@ -139,18 +139,36 @@ static int s_current_volume = DEFAULT_VOLUME_USER;
  * depois cortar seco, o ganho escorrega ate o piso. */
 #define MIC_GATE_RELEASE_PASSO 6
 
-/* FILTRO PASSA-BAIXA do audio do microfone (2026-08-29, pedido do Celio:
- * "ainda ha um chiado, acredito que precisa ser filtrada").
+/* Passa-baixa do microfone, IIR de 1 polo em ponto fixo: y += (x - y) * K/256.
  *
- * O chiado desta montagem e ruido de banda larga, concentrado nas altas --
- * a voz cantada vive abaixo de ~4kHz. Um passa-baixa de 1 polo em ~5kHz
- * derruba boa parte do chiado e quase nao toca na voz.
+ * ERA 106 (corte em ~3,75kHz) e DEIXAVA A VOZ ABAFADA -- relato do Celio em
+ * 2026-09-19: "o som do microfone esta muuuito abafado". A conta estava certa
+ * para o que ele foi feito; o problema e que o motivo deixou de existir.
  *
- * IIR de primeira ordem em ponto fixo: y += (x - y) * K / 256.
- * K = 256 * (2*pi*fc/fs) / (1 + 2*pi*fc/fs), com fc=5kHz e fs=44,1kHz -> ~106.
- * Barato (uma multiplicacao e um shift por amostra) e roda no mesmo laco que
- * ja converte pra mono. */
-#define MIC_LPF_K 106
+ * Ele nasceu para conter o chiado de banda larga da epoca em que o firmware
+ * lia a ENTRADA ERRADA do codec (a diferenca entre os dois microfones
+ * embutidos), quando o piso de ruido em silencio era ~800. Com a entrada
+ * correta o piso caiu para ~5, e cortar tudo acima de 3,75kHz passou a ser so
+ * prejuizo: a inteligibilidade da voz vive ate 6-8kHz, e e justamente ali que
+ * moram as consoantes.
+ *
+ * 230 poe o corte em ~16kHz, ou seja, praticamente transparente -- o filtro
+ * continua existindo apenas como rede de seguranca contra ruido ultrassonico
+ * do conversor, sem tocar na voz. Se algum dia voltar chiado agudo, baixar
+ * este numero e o ajuste; mas medir o piso antes, porque abaixo de ~180 ja
+ * comeca a abafar de forma audivel.
+ *
+ * K = 256 * a, onde a = 1 - exp(-2*pi*fc/fs). Com fs=44,1kHz:
+ *   K=106 -> fc ~3,7kHz (abafado)   K=180 -> fc ~8kHz
+ *   K=230 -> fc ~16kHz (atual)      K=256 -> filtro desligado
+ */
+#define MIC_LPF_K 230
+
+/* Corte do filtro que separa o que o realce de agudos vai levantar: tudo
+ * ACIMA de ~2kHz. Mesma forma do passa-baixa acima (IIR de 1 polo), mas com o
+ * resultado usado ao contrário -- `x - lpf` é a parte aguda do sinal.
+ * K = 256 * (1 - exp(-2*pi*2000/44100)) ~= 65. */
+#define MIC_SHELF_K 65
 
 /* SUPRESSOR DE IMPULSO (filtro de mediana de 3 pontos), 2026-08-29.
  *
@@ -218,6 +236,28 @@ static volatile bool s_mic_auto_gate = DEFAULT_MIC_AUTO_GATE;
 /* Ajustaveis em tempo real (ver audio_codec_set_mic_gain/threshold) -- a
  * ideia e o usuario cantar e regular na hora, sem recompilar. */
 static volatile int32_t s_mic_digital_gain_x100 = DEFAULT_MIC_GAIN;      /* 100 = 1.0x */
+/* Realce de agudos, 0-100. Ver DEFAULT_MIC_TREBLE em config.h. */
+static volatile int32_t s_mic_treble = DEFAULT_MIC_TREBLE;
+
+/* Ultimo bloco depois de TODO o processamento (canal, filtros, realce,
+ * expansor e ganho) -- e o que realmente vai para o alto-falante.
+ *
+ * Existe porque /api/mic/raw captura ANTES de tudo isso, e sem um ponto de
+ * medicao na saida nao da para conferir se um ajuste teve efeito: foi
+ * exatamente o que aconteceu com o realce de agudos, que o Celio relatou nao
+ * mudar nada ao mover o controle. Sem instrumento, a alternativa seria
+ * adivinhar. */
+#define MIC_SAIDA_AMOSTRAS 1024
+static int16_t s_mic_saida[MIC_SAIDA_AMOSTRAS];
+static volatile size_t s_mic_saida_n = 0;
+static volatile size_t s_mic_saida_pos = 0;
+
+/* Deslocamento dentro do par estereo do I2S: 0 = canal esquerdo, 1 = direito.
+ * Depende da entrada selecionada -- ver ES8388_IN_LIN2_SE_DIR em es8388.h. */
+static inline size_t mic_canal_offset(void)
+{
+    return es8388_mic_input_usa_canal_direito() ? 1u : 0u;
+}
 static volatile int32_t s_mic_gate_threshold = MIC_GATE_THRESHOLD;
 /* Ganho corrente do expansor, em MIC_GATE_ESCALA. Preservado entre blocos --
  * e justamente a continuidade dele que elimina o estalo de borda. */
@@ -233,6 +273,22 @@ static volatile int16_t s_mic_peak = 0;
  * e mesmo assim nao sai som. min ~= max denuncia isso na hora. */
 static volatile int16_t s_mic_min = 0;
 static volatile int16_t s_mic_max = 0;
+void audio_codec_set_mic_treble(int nivel_0_to_100)
+{
+    if (nivel_0_to_100 < 0) {
+        nivel_0_to_100 = 0;
+    } else if (nivel_0_to_100 > 100) {
+        nivel_0_to_100 = 100;
+    }
+    s_mic_treble = nivel_0_to_100;
+    storage_set_i32(NVS_KEY_MIC_TREBLE, nivel_0_to_100);
+}
+
+int audio_codec_get_mic_treble(void)
+{
+    return (int)s_mic_treble;
+}
+
 void audio_codec_set_mic_gain(int gain_0_to_100)
 {
     if (gain_0_to_100 < 0) {
@@ -241,6 +297,12 @@ void audio_codec_set_mic_gain(int gain_0_to_100)
         gain_0_to_100 = 100;
     }
     /* 0-100 -> 0..400 (ate 4x). Acima disso o ruido do mic onboard domina. */
+    /* 0-100 -> 0..4x. CUIDADO: 100 (4x) SATURA com a entrada atual -- medido
+     * em 2026-09-22, pico de saida batendo em 32767 com o sinal cru em ~3000.
+     * Saturacao achata a forma de onda e o ouvido lê isso como ABAFADO, nao
+     * como alto, o que leva a subir o ganho ainda mais. Se faltar volume, o
+     * lugar de buscar e o PGA (es8388.c) ou o volume do amplificador -- nao
+     * aqui. Ver o ponto de medicao em /api/mic/raw?stage=out. */
     s_mic_digital_gain_x100 = gain_0_to_100 * 4;
     storage_set_i32(NVS_KEY_MIC_GAIN, gain_0_to_100);
 }
@@ -273,6 +335,27 @@ int audio_codec_get_mic_gate_threshold(void)
  * (conversor? entrada analogica? processamento?) em vez de adivinhar.
  *
  * Escreve ate max_amostras int16 em `dest` e devolve quantas escreveu. */
+/* Qual canal do conversor audio_codec_mic_capture_raw() devolve. Diagnostico:
+ * ver GET /api/mic/raw?ch=r. */
+static volatile bool s_raw_canal_direito = false;
+
+void audio_codec_mic_raw_set_canal(bool direito)
+{
+    s_raw_canal_direito = direito;
+}
+
+size_t audio_codec_mic_capture_saida(int16_t *dest, size_t max_amostras)
+{
+    size_t n = s_mic_saida_n;
+    if (n > max_amostras) {
+        n = max_amostras;
+    }
+    for (size_t i = 0; i < n; i++) {
+        dest[i] = s_mic_saida[i];
+    }
+    return n;
+}
+
 size_t audio_codec_mic_capture_raw(int16_t *dest, size_t max_amostras)
 {
     if (dest == NULL || max_amostras == 0 || s_rx_handle == NULL) {
@@ -289,9 +372,14 @@ size_t audio_codec_mic_capture_raw(int16_t *dest, size_t max_amostras)
                              pdMS_TO_TICKS(200)) != ESP_OK || lidos < 4) {
             break;
         }
-        /* So o canal esquerdo (o unico com sinal nesta placa, ver es8388.c). */
+        /* Canal selecionavel: o caminho de audio usa sempre o esquerdo, mas o
+         * DIREITO precisou ser inspecionavel quando se descobriu que o
+         * adaptador P10->P2 do Celio poe o sinal no ANEL do jack e aterra a
+         * ponta -- ou seja, o sinal chega no canal direito do conversor.
+         * Sem poder olhar o direito, nao havia como comparar. */
         for (size_t i = 0; i + 1 < lidos / sizeof(int16_t) && escritas < max_amostras; i += 2) {
-            dest[escritas++] = tmp[i];
+            size_t off = s_raw_canal_direito ? 1u : mic_canal_offset();
+            dest[escritas++] = tmp[i + off];
         }
     }
     heap_caps_free(tmp);
@@ -497,8 +585,9 @@ esp_err_t audio_codec_mic_set_enabled(bool on)
                 break;
             }
             medidas += lidos / sizeof(int16_t);
+            const size_t ch = mic_canal_offset();
             for (size_t i = 0; i + 1 < lidos / sizeof(int16_t); i += 2) {
-                int32_t v = amostra[i] < 0 ? -(int32_t)amostra[i] : (int32_t)amostra[i];
+                int32_t v = amostra[i + ch] < 0 ? -(int32_t)amostra[i + ch] : (int32_t)amostra[i + ch];
                 if (v > pico_bruto) {
                     pico_bruto = v;
                 }
@@ -550,6 +639,51 @@ esp_err_t audio_codec_mic_set_enabled(bool on)
  * passagem direta. Ja custou dois testes perdidos aplicar tratamento so num
  * deles: o Celio testava sem musica, entao o audio vinha pela passagem direta
  * e nada do que eu mexia na mixagem aparecia. */
+static inline int16_t clamp_s16(int32_t v)
+{
+    if (v > INT16_MAX) {
+        return INT16_MAX;
+    }
+    if (v < INT16_MIN) {
+        return INT16_MIN;
+    }
+    return (int16_t)v;
+}
+
+/* Realce de agudos, in-place.
+ *
+ * Levanta o que está acima de ~2kHz sem tocar nos graves: separa a parte aguda
+ * como `x - passa-baixa(x)` e a soma de volta com ganho. É um high-shelf de
+ * primeira ordem feito com uma subtração e uma multiplicação por amostra --
+ * barato o bastante para rodar no mesmo laço que já converte para mono.
+ *
+ * A razão de existir está em DEFAULT_MIC_TREBLE: a FONTE entrega abafado e o
+ * caminho elétrico está inocente, os dois medidos. Compensar aqui é o que uma
+ * mesa de som faria com um microfone de resposta pobre.
+ *
+ * O estado do filtro é preservado entre blocos -- reiniciá-lo a cada chamada
+ * produziria um degrau em cada fronteira, que é justamente o tipo de
+ * descontinuidade que já custou estalos neste projeto. */
+static void aplicar_realce_agudos(int16_t *buf, size_t amostras)
+{
+    const int32_t nivel = s_mic_treble;
+    if (nivel <= 0) {
+        return;
+    }
+    /* 0-100 -> 0..512 (0 a ~+9,5dB na banda aguda). */
+    const int32_t ganho = (nivel * 512) / 100;
+    static int32_t shelf_y;
+
+    for (size_t i = 0; i + 1 < amostras; i += 2) {
+        int32_t x = buf[i];
+        shelf_y += ((x - shelf_y) * MIC_SHELF_K) >> 8;
+        int32_t agudo = x - shelf_y;              /* o que passa de ~2kHz */
+        int16_t v = clamp_s16(x + ((agudo * ganho) >> 8));
+        buf[i] = v;
+        buf[i + 1] = v;
+    }
+}
+
 static bool aplicar_expansor(int16_t *buf, size_t amostras, int32_t peak)
 {
     (void)peak; /* a decisao nao usa mais o pico do bloco -- ver abaixo */
@@ -958,6 +1092,10 @@ esp_err_t audio_codec_init(void)
     storage_get_i32(NVS_KEY_MIC_GAIN, &mic_gain, DEFAULT_MIC_GAIN);
     s_mic_digital_gain_x100 = mic_gain * 4;
 
+    int32_t mic_treble = DEFAULT_MIC_TREBLE;
+    storage_get_i32(NVS_KEY_MIC_TREBLE, &mic_treble, DEFAULT_MIC_TREBLE);
+    s_mic_treble = mic_treble;
+
     int32_t gate_level = MIC_GATE_THRESHOLD;
     storage_get_i32(NVS_KEY_MIC_GATE_LEVEL, &gate_level, MIC_GATE_THRESHOLD);
     s_mic_gate_threshold = gate_level;
@@ -1074,16 +1212,6 @@ esp_err_t audio_codec_set_mute(bool mute)
     return es8388_set_mute(mute);
 }
 
-static inline int16_t clamp_s16(int32_t v)
-{
-    if (v > INT16_MAX) {
-        return INT16_MAX;
-    }
-    if (v < INT16_MIN) {
-        return INT16_MIN;
-    }
-    return (int16_t)v;
-}
 
 /* Karaokê: mistura o PCM do microfone por cima do que está prestes a ir pro
  * DAC. Fica aqui (não em bt_audio.c/dlna_renderer.c) de propósito -- os
@@ -1142,9 +1270,10 @@ static esp_err_t write_with_mic_mix(const uint8_t *data, size_t len, size_t *byt
         static int32_t lpf_y;
         /* Janela do supressor de impulso, preservada entre blocos. */
         static int16_t m1, m2;
+        const size_t ch = mic_canal_offset();
         for (size_t i = 0; i + 1 < mic_samples; i += 2) {
             /* 1) mata impulsos de 1 amostra (ver mediana3); 2) passa-baixa. */
-            int16_t bruta = mic_mut[i];
+            int16_t bruta = mic_mut[i + ch];
             int32_t esq = mediana3(m1, m2, bruta);
             m1 = m2;
             m2 = bruta;
@@ -1168,6 +1297,9 @@ static esp_err_t write_with_mic_mix(const uint8_t *data, size_t len, size_t *byt
          * ver aplicar_expansor(). O que havia antes zerava mic_samples de uma
          * vez, o que e um degrau: entrava e saia som instantaneamente, com o
          * piso do receptor junto. */
+        /* Realce ANTES do expansor: o portão deve decidir pelo sinal que
+         * vai sair, não por um que ainda será alterado. */
+        aplicar_realce_agudos(mic_mut, mic_samples);
         aplicar_expansor(mic_mut, mic_samples, peak);
 
         /* Ganho digital do microfone, ajustavel em tempo real (0-100 ->
@@ -1390,8 +1522,9 @@ static void mic_live_task(void *arg)
         int16_t vmin = INT16_MAX, vmax = INT16_MIN;
         static int16_t lm1, lm2;
         static int32_t llpf;
+        const size_t ch = mic_canal_offset();
         for (size_t i = 0; i + 1 < amostras; i += 2) {
-            int16_t bruta = buf[i];
+            int16_t bruta = buf[i + ch];
             int32_t f = mediana3(lm1, lm2, bruta);
             lm1 = lm2;
             lm2 = bruta;
@@ -1458,6 +1591,7 @@ static void mic_live_task(void *arg)
 
         /* Mesmo expansor da mixagem -- os dois caminhos TEM que receber o
          * mesmo tratamento. Ver o comentario em aplicar_expansor(). */
+        aplicar_realce_agudos(buf, amostras);
         bool passar = aplicar_expansor(buf, amostras, peak);
 
         /* NAO EXISTE MAIS "portao fechado, pula o bloco".
@@ -1481,6 +1615,23 @@ static void mic_live_task(void *arg)
         int32_t g = s_mic_digital_gain_x100;
         for (size_t i = 0; i < amostras; i++) {
             buf[i] = clamp_s16(((int32_t)buf[i] * g) / 100);
+        }
+
+        /* ACUMULA o resultado final para inspecao -- ver s_mic_saida.
+         *
+         * Um bloco sozinho tem ~128 amostras (~3ms), pouco demais para
+         * separar bandas de frequencia. Preenche em volta ate juntar
+         * MIC_SAIDA_AMOSTRAS e recomeca, de modo que uma leitura pegue sempre
+         * uma janela contigua e recente. */
+        {
+            size_t n = amostras / 2;
+            for (size_t i = 0; i < n; i++) {
+                s_mic_saida[s_mic_saida_pos] = buf[i * 2];
+                s_mic_saida_pos = (s_mic_saida_pos + 1) % MIC_SAIDA_AMOSTRAS;
+                if (s_mic_saida_n < MIC_SAIDA_AMOSTRAS) {
+                    s_mic_saida_n++;
+                }
+            }
         }
 
         /* DESMUTA ANTES da voz chegar, nao quando ela chega.
@@ -1858,78 +2009,25 @@ const char *audio_codec_mic_get_input_name(void)
     return es8388_mic_input_name(es8388_mic_get_input_mode());
 }
 
-/* Blocos por entrada na varredura. Cada bloco sao 4096 amostras do canal
- * esquerdo, ~93ms a 44,1kHz -- 12 blocos dao ~1,1s de escuta por entrada, o
- * bastante para uma frase cantada, e a varredura inteira fica em ~6s. */
-#define MIC_SCAN_AMOSTRAS 4096
-#define MIC_SCAN_BLOCOS   12
-
-esp_err_t audio_codec_mic_scan_inputs(char *out, size_t max)
-{
-    if (out == NULL || max == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (s_rx_handle == NULL) {
-        snprintf(out, max, "{\"erro\":\"microfone desligado\"}");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    int16_t *buf = heap_caps_malloc(MIC_SCAN_AMOSTRAS * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    if (buf == NULL) {
-        snprintf(out, max, "{\"erro\":\"sem PSRAM\"}");
-        return ESP_ERR_NO_MEM;
-    }
-
-    es8388_mic_input_t original = es8388_mic_get_input_mode();
-    int melhor = -1;
-    int32_t melhor_media = -1;
-
-    size_t pos = 0;
-    pos += snprintf(out + pos, max - pos, "{\"entradas\":[");
-
-    for (int m = 0; m < ES8388_IN_COUNT && pos < max; m++) {
-        es8388_mic_set_input_mode((es8388_mic_input_t)m);
-        /* Descarta o transiente da troca: o PGA e o filtro passa-alta levam
-         * um instante para assentar, e o primeiro bloco depois de mexer na
-         * entrada traz um degrau que nao representa nada. */
-        vTaskDelay(pdMS_TO_TICKS(250));
-        audio_codec_mic_capture_raw(buf, MIC_SCAN_AMOSTRAS);
-
-        int32_t pico = 0;
-        int64_t soma = 0;
-        int64_t n_total = 0;
-        for (int b = 0; b < MIC_SCAN_BLOCOS; b++) {
-            size_t n = audio_codec_mic_capture_raw(buf, MIC_SCAN_AMOSTRAS);
-            for (size_t k = 0; k < n; k++) {
-                int32_t a = buf[k] < 0 ? -(int32_t)buf[k] : (int32_t)buf[k];
-                if (a > pico) {
-                    pico = a;
-                }
-                soma += a;
-            }
-            n_total += (int64_t)n;
-        }
-        int32_t media = n_total > 0 ? (int32_t)(soma / n_total) : 0;
-        if (media > melhor_media) {
-            melhor_media = media;
-            melhor = m;
-        }
-        pos += snprintf(out + pos, max - pos,
-                        "%s{\"modo\":%d,\"nome\":\"%s\",\"media\":%ld,\"pico\":%ld}",
-                        m == 0 ? "" : ",", m, es8388_mic_input_name((es8388_mic_input_t)m),
-                        (long)media, (long)pico);
-    }
-
-    es8388_mic_set_input_mode(original);
-    heap_caps_free(buf);
-
-    if (pos < max) {
-        pos += snprintf(out + pos, max - pos, "],\"maior\":%d,\"atual\":%d}", melhor, (int)original);
-    }
-    logger_log(ESP_LOG_INFO, TAG, "mic: varredura de entradas concluida (maior=%s)",
-               melhor >= 0 ? es8388_mic_input_name((es8388_mic_input_t)melhor) : "?");
-    return ESP_OK;
-}
+/* A VARREDURA DE ENTRADAS FOI REMOVIDA (2026-09-19).
+ *
+ * Ela media as quatro entradas analogicas do codec para descobrir em qual a
+ * fonte estava ligada, e cumpriu o papel: foi com ela que se descobriu que o
+ * receptor entra em LIN2-RIN2 (diferencial do jack), 130x mais sinal que a
+ * entrada que o firmware usava antes.
+ *
+ * Saiu por dois motivos, nesta ordem:
+ *  1. TRAVAVA. Lia 4096 amostras x 12 blocos x 4 entradas DENTRO do handler
+ *     HTTP -- trabalho pesado e demorado no contexto do servidor web, com
+ *     ~13KB de RAM interna livre. E o mesmo erro de contexto que ja tinha
+ *     acontecido com a consulta de RSSI do Bluetooth.
+ *  2. A resposta ja e conhecida e esta fixa em DEFAULT_MIC_INPUT. Decisao do
+ *     Celio: "se ja sabemos a entrada correta, entao vamos ficar com ela".
+ *
+ * A entrada continua trocavel por /api/config {"mic_input":N} e pelo seletor
+ * da pagina de configuracoes -- saiu a DESCOBERTA automatica, nao a escolha.
+ * Se um dia precisar varrer de novo, fazer FORA do contexto HTTP: uma task
+ * propria que publica o resultado, com o HTTP so lendo. */
 
 void audio_codec_set_mic_auto_gate(bool enabled)
 {

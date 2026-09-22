@@ -77,6 +77,7 @@
 #define NVS_KEY_RELAY_ACTIVE_LOW "relay_act_lo"
 #define NVS_KEY_RELAY_OPEN_DRAIN "relay_od"
 #define NVS_KEY_BT_RSSI_INTERVAL "bt_rssi_s"
+#define NVS_KEY_MIC_TREBLE      "mic_treble"
 
 /* -------------------------------------------------------------------------
  * Valores padrão
@@ -172,7 +173,11 @@
  * dois microfones embutidos -- eles captam quase o mesmo som, entao a voz
  * era cancelada na subtracao e sobrava o ruido de cada um. Ver o
  * comentario de historico em es8388.c. */
-#define DEFAULT_MIC_INPUT       3
+/* 4 = ES8388_IN_LIN2_SE_DIR. Ver o comentario do enum em es8388.h: o plugue
+ * de 2 faixas do microfone aterra um canal do jack, e ler o canal com sinal
+ * diretamente da +8dB em 2-3kHz contra o modo diferencial, que recuperava o
+ * audio por subtracao mas filtrava os agudos no caminho. */
+#define DEFAULT_MIC_INPUT       4
 
 /* Deteccao automatica de voz no mic (noise gate) -- ligada por padrao.
  * Relato do usuario 2026-08-24: com o mic ligado, um chiado ficava
@@ -191,6 +196,29 @@
  * audivel e com folga pra nao saturar nos gritos. Ajustavel em tempo real
  * pela API/web, ja que o nivel util depende do microfone e da distancia. */
 #define DEFAULT_MIC_GAIN        60
+
+/* Realce de agudos do microfone, 0-100 (0 = desligado, 100 = ~+12dB acima de
+ * ~2kHz).
+ *
+ * Existe porque a FONTE entrega abafado, e isso foi medido (2026-09-22): com o
+ * Célio cantando, a energia cai ~25dB entre 500Hz e 4kHz, e a razão
+ * graves/agudos fica em ~230x. O caminho elétrico está inocente -- o piso de
+ * ruído do próprio conversor chega PLANO até 18kHz (razão 7x), e a entrada
+ * diferencial tem a mesma forma de espectro que a simples. Quem não entrega
+ * agudo é o conjunto microfone de mão + receptor sem fio.
+ *
+ * Compensar isso no firmware é o que qualquer mesa de som faz com um microfone
+ * de resposta pobre. Aqui é seguro por dois motivos medidos: o piso de ruído é
+ * mediana 7-8 (não há chiado para realçar junto) e sobra headroom (pico ~12400
+ * de 32767).
+ *
+ * 40 é um ponto de partida (~+5dB); quem afina é o ouvido, pela página. */
+/* 0 = desligado. Nasceu em 40 para compensar um abafamento que se acreditava
+ * vir da fonte. Depois se descobriu que a causa real era outra -- o adaptador
+ * de 2 faixas aterrando um canal do jack, e o ganho digital saturando a saida
+ * -- e com as duas corrigidas o Celio aprovou o som COM o realce em zero.
+ * O controle fica porque a fonte pode mudar; o padrao e nao mexer no timbre. */
+#define DEFAULT_MIC_TREBLE      0
 
 /* -------------------------------------------------------------------------
  * Volume fino (escala perceptual) — ver audio_codec.c

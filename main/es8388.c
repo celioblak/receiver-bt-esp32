@@ -397,6 +397,7 @@ static const uint8_t s_input_regs[ES8388_IN_COUNT][2] = {
     [ES8388_IN_LIN2_SE]   = {0x50, 0x00},
     [ES8388_IN_DIFF_MIC1] = {0xF0, 0x02},
     [ES8388_IN_DIFF_MIC2] = {0xF0, 0x82},
+    [ES8388_IN_LIN2_SE_DIR] = {0x50, 0x00},
 };
 
 static const char *const s_input_nomes[ES8388_IN_COUNT] = {
@@ -404,7 +405,13 @@ static const char *const s_input_nomes[ES8388_IN_COUNT] = {
     [ES8388_IN_LIN2_SE]   = "jack_entrada",
     [ES8388_IN_DIFF_MIC1] = "diferencial_mic",
     [ES8388_IN_DIFF_MIC2] = "diferencial_jack",
+    [ES8388_IN_LIN2_SE_DIR] = "jack_canal_direito",
 };
+
+bool es8388_mic_input_usa_canal_direito(void)
+{
+    return s_input_mode == ES8388_IN_LIN2_SE_DIR;
+}
 
 const char *es8388_mic_input_name(es8388_mic_input_t modo)
 {
@@ -494,7 +501,32 @@ esp_err_t es8388_mic_config_begin(void)
     res |= es8388_write_reg(0x2B, 0x80);              /* ADC e DAC no mesmo LRCK */
     res |= es8388_write_reg(ES8388_ADCPOWER, 0x00);   /* liga ADC e entradas LIN/RIN */
 
-    res |= es8388_write_reg(ES8388_ADCCONTROL1, 0x77); /* PGA +21dB (0x88 TRAVA o ADC) */
+    /* PGA +9dB, nao mais +21dB. MEDIDO com o Celio cantando (2026-09-22):
+     *
+     *   PGA    mediana   pico   fator de crista   graves/agudos
+     *   +21dB   16.952  29.106      1,7:1            1232x
+     *   +15dB   10.987  28.892      2,6:1
+     *   +9dB     3.540  12.465      3,5:1   <- este
+     *   +3dB       584   2.887      4,9:1
+     *    0dB       860   2.345      2,7:1             258x
+     *
+     * Fator de crista de 1,7:1 e sinal ESMAGADO -- voz natural fica entre 4:1
+     * e 10:1 -- e nenhuma amostra batia em 32767, ou seja nao era clipe
+     * digital: era SATURACAO ANALOGICA no proprio PGA, antes do conversor. Som
+     * abafado e sem presenca e exatamente o que isso produz, e foi a queixa do
+     * Celio ("parece caixa antiga").
+     *
+     * O 0x77 nao era um erro de calculo: foi escolhido quando o firmware lia a
+     * ENTRADA ERRADA (os microfones embutidos subtraidos), onde o sinal era
+     * minusculo e +21dB ainda era pouco. Com a entrada correta o sinal ficou
+     * 130x maior e ninguem revisitou o ganho -- mesmo padrao do passa-baixa em
+     * MIC_LPF_K: parametro certo para uma condicao que deixou de existir.
+     *
+     * +9dB equilibra crista (3,5:1) e nivel utilizavel. O volume que falta vem
+     * do ganho DIGITAL (audio_codec_set_mic_gain), onde nao ha saturacao
+     * analogica. Se a fonte mudar, e este o numero a revisar -- medindo o
+     * fator de crista, nao o volume. */
+    res |= es8388_write_reg(ES8388_ADCCONTROL1, 0x33); /* PGA +9dB (0x88 TRAVA o ADC) */
     res |= es8388_mic_set_input_mode(s_input_mode);    /* escreve 0x0A e 0x0B */
     res |= es8388_write_reg(ES8388_ADCCONTROL4, 0x0C); /* I2S 16 bits (nosso caso) */
     res |= es8388_write_reg(ES8388_ADCCONTROL5, 0x02); /* MCLK/LRCK = 256 */

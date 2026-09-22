@@ -92,6 +92,11 @@ bool audio_codec_get_mic_auto_gate(void);
  * ultimo bloco captado (0-32767), util como "medidor" pra saber se o
  * microfone esta captando e se o limiar do portao esta bem escolhido. */
 void audio_codec_set_mic_gain(int gain_0_to_100);
+
+/* Realce de agudos do microfone, 0-100 (0 desliga). Compensa uma fonte que
+ * entrega abafada -- ver DEFAULT_MIC_TREBLE em config.h. */
+void audio_codec_set_mic_treble(int nivel_0_to_100);
+int audio_codec_get_mic_treble(void);
 int audio_codec_get_mic_gain(void);
 void audio_codec_set_mic_gate_threshold(int threshold);
 int audio_codec_get_mic_gate_threshold(void);
@@ -108,6 +113,14 @@ const char *audio_codec_get_mic_adc_estado(void);
 /* Captura amostras CRUAS do microfone (canal esquerdo, antes de filtro,
  * portao, ganho e mixagem) -- diagnostico. Ver GET /api/mic/raw. */
 size_t audio_codec_mic_capture_raw(int16_t *dest, size_t max_amostras);
+
+/* Escolhe qual canal do conversor a captura crua devolve (false = esquerdo,
+ * que e o usado pelo audio). Diagnostico -- ver GET /api/mic/raw?ch=r. */
+void audio_codec_mic_raw_set_canal(bool direito);
+
+/* Ultimo bloco JA PROCESSADO (o que vai para o alto-falante), para conferir se
+ * um ajuste teve efeito de verdade. Ver GET /api/mic/raw?stage=out. */
+size_t audio_codec_mic_capture_saida(int16_t *dest, size_t max_amostras);
 
 /* Liga/desliga o microfone em RUNTIME, sem reiniciar o aparelho, e persiste em
  * NVS. Ligar cria o canal I2S RX naquele instante e mede em que estado o ADC
@@ -129,12 +142,6 @@ esp_err_t audio_codec_mic_set_input(int modo);
 int audio_codec_mic_get_input(void);
 const char *audio_codec_mic_get_input_name(void);
 
-/* Varre TODAS as entradas analogicas medindo o que cada uma capta, e devolve
- * o resultado em JSON. Leva ~6s, durante os quais quem estiver testando deve
- * cantar/falar sem parar na fonte de verdade (o microfone de mao), LONGE da
- * placa. A entrada certa e a que reage; nao a que da o numero maior parado.
- * Ver POST /api/mic/scan. Restaura a entrada original ao terminar. */
-esp_err_t audio_codec_mic_scan_inputs(char *out, size_t max);
 
 /* Derruba o MCLK por 500ms e reconstroi I2S e codec do zero -- o unico jeito
  * conhecido de tirar o conversor do estado em que ele sobe gerando ruido, sem
