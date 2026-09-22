@@ -122,6 +122,11 @@ void audio_codec_mic_raw_set_canal(bool direito);
  * um ajuste teve efeito de verdade. Ver GET /api/mic/raw?stage=out. */
 size_t audio_codec_mic_capture_saida(int16_t *dest, size_t max_amostras);
 
+/* Quantas amostras saturaram no ultimo segundo de saida. Zero = folga.
+ * Qualquer valor acima disso significa que o ganho esta alto demais para a
+ * fonte -- e saturacao soa ABAFADA, nao alta. */
+int audio_codec_mic_get_clip(void);
+
 /* Liga/desliga o microfone em RUNTIME, sem reiniciar o aparelho, e persiste em
  * NVS. Ligar cria o canal I2S RX naquele instante e mede em que estado o ADC
  * subiu; desligar o remove. Como o RX e a unica coisa que sobe instavel nesta

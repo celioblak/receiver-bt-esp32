@@ -139,6 +139,7 @@ static esp_err_t api_status_get(httpd_req_t *req)
      * ganho/limiar olhando o numero enquanto fala/canta. */
 cJSON_AddStringToObject(root, "mic_adc", audio_codec_get_mic_adc_estado());
     cJSON_AddNumberToObject(root, "mic_peak", audio_codec_get_mic_peak());
+    cJSON_AddNumberToObject(root, "mic_clip", audio_codec_mic_get_clip());
     cJSON_AddBoolToObject(root, "bt_connected", bt.connected);
     /* Qualidade dos dois enlaces de radio.
      *

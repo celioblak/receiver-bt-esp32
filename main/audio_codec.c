@@ -252,6 +252,17 @@ static int16_t s_mic_saida[MIC_SAIDA_AMOSTRAS];
 static volatile size_t s_mic_saida_n = 0;
 static volatile size_t s_mic_saida_pos = 0;
 
+/* Quantas amostras saturaram no ultimo segundo de saida.
+ *
+ * Existe porque saturacao NAO SOA COMO ALTO -- soa como ABAFADO, o que leva
+ * quem esta ajustando a subir o ganho ainda mais, piorando. Foi exatamente o
+ * circulo em que o Celio entrou (ganho digital em 4x, pico batendo em 32767) e
+ * que so apareceu quando surgiu um ponto de medicao na saida. Um numero na
+ * tela evita repetir isso -- e evita ter de cravar um limite fixo no ganho,
+ * que seria errado de outro jeito: o teto seguro depende da FONTE. */
+static volatile int s_mic_clip_conta = 0;
+static volatile int s_mic_clip_janela = 0;
+
 /* Deslocamento dentro do par estereo do I2S: 0 = canal esquerdo, 1 = direito.
  * Depende da entrada selecionada -- ver ES8388_IN_LIN2_SE_DIR em es8388.h. */
 static inline size_t mic_canal_offset(void)
@@ -342,6 +353,11 @@ static volatile bool s_raw_canal_direito = false;
 void audio_codec_mic_raw_set_canal(bool direito)
 {
     s_raw_canal_direito = direito;
+}
+
+int audio_codec_mic_get_clip(void)
+{
+    return s_mic_clip_conta;
 }
 
 size_t audio_codec_mic_capture_saida(int16_t *dest, size_t max_amostras)
@@ -1615,6 +1631,25 @@ static void mic_live_task(void *arg)
         int32_t g = s_mic_digital_gain_x100;
         for (size_t i = 0; i < amostras; i++) {
             buf[i] = clamp_s16(((int32_t)buf[i] * g) / 100);
+        }
+
+        /* Conta saturacao no sinal que REALMENTE sai. */
+        {
+            int clipes = 0;
+            for (size_t i = 0; i < amostras; i += 2) {
+                int32_t v = buf[i] < 0 ? -(int32_t)buf[i] : (int32_t)buf[i];
+                if (v >= 32000) {
+                    clipes++;
+                }
+            }
+            s_mic_clip_janela += clipes;
+            /* ~344 blocos/s: fecha a janela a cada ~1s. */
+            static int blocos_janela;
+            if (++blocos_janela >= 344) {
+                s_mic_clip_conta = s_mic_clip_janela;
+                s_mic_clip_janela = 0;
+                blocos_janela = 0;
+            }
         }
 
         /* ACUMULA o resultado final para inspecao -- ver s_mic_saida.

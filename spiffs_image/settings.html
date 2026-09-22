@@ -61,12 +61,10 @@
                 <option value="4">Cabo mono no jack &mdash; sinal no ANEL (atual)</option>
                 <option value="1">Cabo mono no jack &mdash; sinal na PONTA</option>
                 <option value="3">Cabo estéreo ou balanceado no jack</option>
-                <option value="0">Microfones da própria placa</option>
-                <option value="2">Microfones da placa &mdash; balanceado</option>
             </select>
             <div class="track-sub" style="margin:-0.2rem 0 0.6rem"><strong>Se trocar o cabo, o adaptador ou o microfone, pode ser preciso mudar aqui.</strong><br>
                 Um plugue <strong>mono</strong> (2 faixas, o comum em microfone) encaixado num jack estéreo aterra um dos canais &mdash; e o sinal fica no outro. Qual deles depende do adaptador, por isso há duas opções de cabo mono. Se o som <strong>sumir ou ficar muito fraco</strong> depois de trocar algo, é quase sempre isto.<br><br>
-                <strong>Como descobrir:</strong> escolha uma opção, cante, e olhe o <em>Nível captado agora</em>, no fim desta seção. A opção certa é a que faz o número <strong>subir bastante</strong> quando você canta e cair no silêncio. Teste as duas de cabo mono primeiro.</div>
+                <strong>Como descobrir:</strong> escolha uma opção, cante, e olhe o <em>Nível captado agora</em>, no fim desta seção. A opção certa é a que faz o número <strong>subir bastante</strong> quando você canta e cair no silêncio. As duas opções de cabo mono são as que interessam &mdash; teste uma e depois a outra.</div>
             <div class="row">
                 <span class="label">Detecção automática de voz (mic)</span>
                 <input type="checkbox" id="mic_auto_gate">
@@ -89,6 +87,11 @@
                 <span class="label">Nível captado agora</span>
                 <span id="mic-peak">—</span>
             </div>
+            <div class="row">
+                <span class="label">Saturação</span>
+                <span id="mic-clip">—</span>
+            </div>
+            <div class="track-sub" style="margin:0.3rem 0 0.6rem">Deve ficar em <strong>sem saturação</strong> enquanto você canta. Se acusar saturação, <strong>baixe o volume do microfone</strong> &mdash; som saturado soa <em>abafado</em>, não alto, e a reação natural de subir ainda mais só piora. Se faltar volume de verdade, aumente no amplificador.</div>
             <div class="meter" aria-hidden="true"><div id="mic-peak-bar"></div></div>
             <div class="track-sub" style="margin:0.3rem 0 0.6rem">Fale/cante e observe: o valor deve subir bem acima do portão na voz, e ficar bem abaixo no silêncio. Só atualiza com o microfone ligado.</div>
 
@@ -323,6 +326,26 @@ const micInput = document.getElementById("mic_input");
 micInput.addEventListener("change", async () => {
     await apiPost("/api/config", { mic_input: parseInt(micInput.value, 10) });
 });
+
+/* Indicador de saturação: conta amostras que bateram no teto no último
+   segundo. Zero é o único valor bom. */
+async function refreshClip() {
+    try {
+        const r = await fetch("/api/status");
+        const d = await r.json();
+        const el = document.getElementById("mic-clip");
+        if (d.mic_clip === undefined) { el.textContent = "—"; return; }
+        if (d.mic_clip === 0) {
+            el.textContent = "sem saturação";
+            el.style.color = "";
+        } else {
+            el.textContent = "SATURANDO (" + d.mic_clip + " amostras/s)";
+            el.style.color = "#e06c6c";
+        }
+    } catch (e) { /* offline: o refresh seguinte tenta de novo */ }
+}
+refreshClip();
+setInterval(refreshClip, 1000);
 
 const micTreble = document.getElementById("mic_treble");
 micTreble.addEventListener("input", () => {

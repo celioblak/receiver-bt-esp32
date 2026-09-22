@@ -226,12 +226,20 @@ Por isso a entrada é selecionável em Configurações, com as opções descrita
 | **Cabo mono no jack — sinal no ANEL** | padrão atual desta montagem | `0x0A=0x50`, lê canal direito |
 | **Cabo mono no jack — sinal na PONTA** | se a de cima não captar | `0x0A=0x50`, lê canal esquerdo |
 | Cabo estéreo ou balanceado no jack | fonte realmente balanceada | `0x0A=0xF0`, `0x0B=0x82` |
-| Microfones da própria placa | sem cabo, captação pelos embutidos | `0x0A=0x00` |
-| Microfones da placa — balanceado | diferencial entre os dois embutidos | `0x0A=0xF0`, `0x0B=0x02` |
+
+Os modos que leem os **microfones embutidos** existem no firmware (`ES8388_IN_LIN1_SE` e `ES8388_IN_DIFF_MIC1`) mas **saíram da interface**: o aparelho vive dentro de uma caixa, os embutidos não captam nada útil ali, e um deles está mal soldado. Eles continuam soldados na placa de propósito — sem microfone no lugar o ADC **não sobe** (0 boots saudáveis em 18 tentativas com resistor). Ver [Armadilhas já pagas](#armadilhas-já-pagas).
 
 **Como escolher sem instrumento:** troque a opção, cante, e olhe o **Nível captado agora** no fim da seção. A certa é a que faz o número subir bastante na voz e cair no silêncio. Comece pelas duas de cabo mono.
 
 Existiu uma varredura automática (`/api/mic/scan`) que media as quatro sozinha — foi ela que descobriu a entrada correta originalmente. Removida em 2026-09-19 por travar: fazia leitura pesada dentro do handler HTTP com pouca RAM interna livre. O medidor ao vivo resolve o mesmo problema sem esse risco.
+
+### Saturação: por que não há limite fixo no ganho
+
+O ganho digital vai de 0 a 100 (0 a 4×) e **não é limitado por baixo de propósito**, mesmo tendo sido justamente ele que estourou a saída nesta montagem. O motivo: o teto seguro **depende da fonte**. Com o receptor atual ele fica em ~3,5×; com um microfone mais fraco, 4× seria pouco — e um limite gravado travaria o ajuste do mesmo jeito que o PGA de +21 dB travou.
+
+O que existe no lugar é o que uma mesa de som faz: **avisar**. O campo `mic_clip` em `/api/status` conta quantas amostras bateram no teto no último segundo, e a página mostra isso como **"sem saturação"** ou **"SATURANDO"**, em vermelho.
+
+Isso importa porque **saturação não soa alta, soa abafada** — e a reação natural de quem está ajustando é subir mais o volume, o que piora. Foi exatamente o círculo em que esta montagem entrou, e ele só ficou visível quando surgiu um ponto de medição na saída.
 
 ### Medir a SAÍDA, não só a entrada
 
