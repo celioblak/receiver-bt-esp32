@@ -140,6 +140,7 @@ static esp_err_t api_status_get(httpd_req_t *req)
 cJSON_AddStringToObject(root, "mic_adc", audio_codec_get_mic_adc_estado());
     cJSON_AddNumberToObject(root, "mic_peak", audio_codec_get_mic_peak());
     cJSON_AddNumberToObject(root, "mic_clip", audio_codec_mic_get_clip());
+    cJSON_AddNumberToObject(root, "mic_limit_hits", audio_codec_mic_get_limit_hits());
     cJSON_AddBoolToObject(root, "bt_connected", bt.connected);
     /* Qualidade dos dois enlaces de radio.
      *
@@ -252,6 +253,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "mic_auto_gate", audio_codec_get_mic_auto_gate());
     cJSON_AddNumberToObject(root, "mic_gain", audio_codec_get_mic_gain());
     cJSON_AddNumberToObject(root, "mic_treble", audio_codec_get_mic_treble());
+    cJSON_AddNumberToObject(root, "mic_limiter", audio_codec_get_mic_limiter());
     cJSON_AddNumberToObject(root, "mic_gate_level", audio_codec_get_mic_gate_threshold());
     cJSON_AddBoolToObject(root, "relay_active_low", relay_control_get_active_low());
     cJSON_AddBoolToObject(root, "relay_open_drain", relay_control_get_open_drain());
@@ -335,6 +337,9 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
     if ((item = cJSON_GetObjectItem(root, "mic_treble")) && cJSON_IsNumber(item)) {
         audio_codec_set_mic_treble(item->valueint);
+    }
+    if ((item = cJSON_GetObjectItem(root, "mic_limiter")) && cJSON_IsNumber(item)) {
+        audio_codec_set_mic_limiter(item->valueint);
     }
     if ((item = cJSON_GetObjectItem(root, "mic_gate_level")) && cJSON_IsNumber(item)) {
         audio_codec_set_mic_gate_threshold(item->valueint);

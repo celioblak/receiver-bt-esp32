@@ -97,6 +97,12 @@ void audio_codec_set_mic_gain(int gain_0_to_100);
  * entrega abafada -- ver DEFAULT_MIC_TREBLE em config.h. */
 void audio_codec_set_mic_treble(int nivel_0_to_100);
 int audio_codec_get_mic_treble(void);
+
+/* Limitador de picos do microfone, 0-100 (0 desliga). Permite subir o volume
+ * medio -- necessario para a voz competir com a musica de fundo -- sem que os
+ * picos batam no teto. Ver DEFAULT_MIC_LIMITER em config.h. */
+void audio_codec_set_mic_limiter(int nivel_0_to_100);
+int audio_codec_get_mic_limiter(void);
 int audio_codec_get_mic_gain(void);
 void audio_codec_set_mic_gate_threshold(int threshold);
 int audio_codec_get_mic_gate_threshold(void);
@@ -126,6 +132,10 @@ size_t audio_codec_mic_capture_saida(int16_t *dest, size_t max_amostras);
  * Qualquer valor acima disso significa que o ganho esta alto demais para a
  * fonte -- e saturacao soa ABAFADA, nao alta. */
 int audio_codec_mic_get_clip(void);
+
+/* Quantas amostras o limitador segurou no ultimo segundo. Zero = ele nao esta
+ * atuando; valores altos = esta trabalhando muito (ou o ganho esta demais). */
+int audio_codec_mic_get_limit_hits(void);
 
 /* Liga/desliga o microfone em RUNTIME, sem reiniciar o aparelho, e persiste em
  * NVS. Ligar cria o canal I2S RX naquele instante e mede em que estado o ADC

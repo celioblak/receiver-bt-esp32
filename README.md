@@ -247,6 +247,62 @@ Isso importa porque **saturação não soa alta, soa abafada** — e a reação 
 
 **`GET /api/mic/raw?stage=out`** devolve o sinal **já processado** (canal, filtros, realce, portão e ganho): é o que de fato vai para o alto-falante. Ao investigar qualquer queixa de timbre ou volume, comparar os dois pontos antes de mexer em parâmetro.
 
+### Estado do microfone — ponto de parada (2026-09-22)
+
+Resumo do que foi resolvido, do que ficou aberto e do que medir quando o adaptador novo chegar.
+
+#### O que foi resolvido, com números
+
+| problema | causa encontrada | efeito medido |
+|---|---|---|
+| voz baixa, cantar colado | entrada errada do codec — lia a **diferença entre os dois microfones embutidos** | jack: **130× mais sinal** (13.064 contra 100) |
+| ADC subindo ruidoso | nada acessível por software; o conversor precisa ver o **MCLK morrer** | **28/28 boots** utilizáveis, correção em 1,5 s |
+| estalo por palavra | a task **parava de escrever** no I2S no silêncio | fluxo contínuo, sem descontinuidade |
+| atraso no início | detecção pelo **pico do bloco** + unmute no caminho crítico | envelope por amostra, ~70 ms → ~35 ms |
+| som esmagado | PGA em **+21 dB** saturando no analógico | crista 1,7:1 → 3,5:1 |
+| "caixa antiga" | **adaptador de 2 faixas aterra um canal**; a subtração recuperava o sinal mas filtrava agudos | **+8 dB** em 2-3 kHz, +7,7 dB em 4-6 kHz |
+| saturação na saída | ganho digital em 4× | pico 34.014 → sem clipping |
+
+#### O teto que restou
+
+A **crista do sinal cru nunca passou de ~3,5:1** em nenhuma configuração testada — entrada, PGA ou modo. Voz natural fica entre 4:1 e 10:1.
+
+Isso é assinatura de **compressão na fonte**: receptores sem fio usam *compander*, e o do Célio **não tem ajuste nenhum** para desligar. É o que dá o som achatado que sobrou.
+
+#### O que medir quando o adaptador novo chegar
+
+Um adaptador **P10 TS → P2 TRS com ponta e anel unidos** (ou cabo direto, sem empilhar) põe sinal nos dois canais e elimina o curto no jack.
+
+1. **fator de crista do cru** — se subir acima de 3,5:1, o adaptador antigo também estava comprimindo, não só a fonte;
+2. **nível em cada entrada** — com os dois canais ativos, o modo **diferencial** volta a fazer sentido e passa a rejeitar ruído de verdade, em vez de recuperar sinal por acidente;
+3. **espectro** — comparar 2-6 kHz com os números de hoje.
+
+#### Ponto de referência aprovado
+
+Voltar para cá se algum ajuste piorar:
+
+```
+entrada ............ jack_canal_direito (mic_input 4)
+PGA ................ 0x33 (+9 dB)
+mic_gain ........... 40
+mic_treble ......... 0
+mic_gate_level ..... 4000
+mic_limiter ........ 0
+supressor de impulso ... ATIVO (remover deixou "horrível")
+```
+
+#### Aprendizados de método
+
+**Medir a saída, não só a entrada.** A sessão inteira mediu o sinal **cru**, que achou três causas reais — mas deixou o fim da cadeia invisível, e foi lá que estava o clipping. `GET /api/mic/raw?stage=out` existe por isso.
+
+**Amostra pontual mente.** Três capturas de 23 ms deram "0% saturadas"; monitorando 20 segundos, apareceram 17 leituras com saturação. O relato do Célio estava certo e o número estava errado.
+
+**Um tipo de saturação não enxerga o outro.** O indicador contava clipping digital (amostras em 32.767), mas a saturação que começou tudo era **analógica**, no PGA — e essa não aparece assim. O sintoma dela é o **fator de crista** baixo.
+
+**Nem todo parâmetro herdado estava sobrando.** PGA +21 dB e passa-baixa em 3,7 kHz eram resquícios da entrada errada e saíram bem. O supressor de impulso, pela mesma lógica, **não** — removê-lo deixou "horrível". Testar um de cada vez e ouvir antes de concluir.
+
+**Instrumento antes de conclusão.** A medição de RSSI do Bluetooth quase foi removida na 2ª tentativa, sem nenhuma medição isolando a causa. Com um interruptor para isolar, ficou provado que ela não degradava nada — o problema era RAM e o servidor recusando conexões.
+
 ### Armadilhas já pagas
 
 - **Não remover os microfones embutidos.** Eles não captam nada útil na entrada em uso (medido: falar alto a 10 cm não move o nível), mas **sem microfone na placa o ADC não sobe** — com resistor de 1 kΩ e de 10 kΩ no lugar do MIC1 foram 0 boots saudáveis em 18 tentativas. Captar e inicializar são coisas diferentes.

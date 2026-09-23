@@ -187,6 +187,16 @@ static int s_current_volume = DEFAULT_VOLUME_USER;
  * duas vizinhas, ela e substituida pela do meio do trio. Impulso isolado
  * desaparece; sinal de audio real (que varia suavemente entre amostras
  * consecutivas) passa intacto. Custa duas comparacoes por amostra. */
+/* Supressor de impulso por mediana de 3 amostras. NAO REMOVER.
+ *
+ * Em 2026-09-22 ele foi tirado do caminho, com a teoria de que uma mediana de
+ * 3 borra transientes e por isso tiraria nitidez -- e que, com o piso de ruido
+ * ja em ~30, tinha perdido a funcao. A teoria era razoavel e o resultado foi
+ * "ficou horrivel" (palavras do Celio). Revertido na hora.
+ *
+ * Licao: nem todo filtro herdado da epoca da entrada errada estava sobrando. O
+ * PGA em +21dB e o passa-baixa em 3,7kHz estavam; este NAO. Testar um de cada
+ * vez e ouvir antes de concluir. */
 static inline int16_t mediana3(int16_t a, int16_t b, int16_t c)
 {
     if (a > b) { int16_t t = a; a = b; b = t; }
@@ -238,6 +248,13 @@ static volatile bool s_mic_auto_gate = DEFAULT_MIC_AUTO_GATE;
 static volatile int32_t s_mic_digital_gain_x100 = DEFAULT_MIC_GAIN;      /* 100 = 1.0x */
 /* Realce de agudos, 0-100. Ver DEFAULT_MIC_TREBLE em config.h. */
 static volatile int32_t s_mic_treble = DEFAULT_MIC_TREBLE;
+/* Limitador, 0-100. Ver DEFAULT_MIC_LIMITER. */
+static volatile int32_t s_mic_limiter = DEFAULT_MIC_LIMITER;
+/* Quantas amostras o limitador segurou no ultimo segundo -- e o medidor de
+ * atuacao que as mesas chamam de "gain reduction". Sem ver ISSO, ajustar o
+ * limitador e adivinhacao. */
+static volatile int s_mic_limit_conta = 0;
+static volatile int s_mic_limit_janela = 0;
 
 /* Ultimo bloco depois de TODO o processamento (canal, filtros, realce,
  * expansor e ganho) -- e o que realmente vai para o alto-falante.
@@ -284,6 +301,22 @@ static volatile int16_t s_mic_peak = 0;
  * e mesmo assim nao sai som. min ~= max denuncia isso na hora. */
 static volatile int16_t s_mic_min = 0;
 static volatile int16_t s_mic_max = 0;
+void audio_codec_set_mic_limiter(int nivel_0_to_100)
+{
+    if (nivel_0_to_100 < 0) {
+        nivel_0_to_100 = 0;
+    } else if (nivel_0_to_100 > 100) {
+        nivel_0_to_100 = 100;
+    }
+    s_mic_limiter = nivel_0_to_100;
+    storage_set_i32(NVS_KEY_MIC_LIMITER, nivel_0_to_100);
+}
+
+int audio_codec_get_mic_limiter(void)
+{
+    return (int)s_mic_limiter;
+}
+
 void audio_codec_set_mic_treble(int nivel_0_to_100)
 {
     if (nivel_0_to_100 < 0) {
@@ -353,6 +386,11 @@ static volatile bool s_raw_canal_direito = false;
 void audio_codec_mic_raw_set_canal(bool direito)
 {
     s_raw_canal_direito = direito;
+}
+
+int audio_codec_mic_get_limit_hits(void)
+{
+    return s_mic_limit_conta;
 }
 
 int audio_codec_mic_get_clip(void)
@@ -680,6 +718,49 @@ static inline int16_t clamp_s16(int32_t v)
  * O estado do filtro é preservado entre blocos -- reiniciá-lo a cada chamada
  * produziria um degrau em cada fronteira, que é justamente o tipo de
  * descontinuidade que já custou estalos neste projeto. */
+/* Limitador de picos, in-place.
+ *
+ * Deixa o sinal passar intacto ate um limiar e comprime progressivamente o que
+ * passa dele, em vez de cortar seco. Cortar seco (o que o clamp faz) gera
+ * harmonicos e soa como distorcao; comprimir progressivamente soa como a voz
+ * ficando "firme" no pico -- que e o efeito que se quer no canal de voz.
+ *
+ * Existe porque ganho fixo nao resolve o problema do karaoke: a voz precisa de
+ * volume MEDIO alto para competir com a musica, mas os PICOS estouram muito
+ * antes. Com limitador da para subir o ganho medio sem que os transientes
+ * batam no teto -- e foi exatamente o impasse medido aqui, entre "qualidade
+ * boa mas baixo" e "saturando um pouco".
+ *
+ * Razao 4:1 acima do limiar: cada 4 de excesso viram 1 na saida. Com o limiar
+ * em 70%% da escala, um pico que chegaria a 32767 sai em ~26000 -- audivelmente
+ * mais alto que o resto, sem nunca encostar no teto. */
+static void aplicar_limitador(int16_t *buf, size_t amostras)
+{
+    const int32_t nivel = s_mic_limiter;
+    if (nivel <= 0) {
+        return;
+    }
+    /* 0-100 -> limiar de 95%% a 45%% da escala: quanto MAIOR o controle, mais
+     * cedo o limitador age (e mais compressao se ouve). */
+    const int32_t limiar = (INT16_MAX * (95 - (nivel * 50) / 100)) / 100;
+
+    for (size_t i = 0; i + 1 < amostras; i += 2) {
+        int32_t x = buf[i];
+        int32_t a = x < 0 ? -x : x;
+        if (a > limiar) {
+            s_mic_limit_janela++;
+            /* razao 4:1 no excesso */
+            a = limiar + ((a - limiar) >> 2);
+            if (a > INT16_MAX) {
+                a = INT16_MAX;
+            }
+            int16_t v = (int16_t)(x < 0 ? -a : a);
+            buf[i] = v;
+            buf[i + 1] = v;
+        }
+    }
+}
+
 static void aplicar_realce_agudos(int16_t *buf, size_t amostras)
 {
     const int32_t nivel = s_mic_treble;
@@ -1112,6 +1193,10 @@ esp_err_t audio_codec_init(void)
     storage_get_i32(NVS_KEY_MIC_TREBLE, &mic_treble, DEFAULT_MIC_TREBLE);
     s_mic_treble = mic_treble;
 
+    int32_t mic_limit = DEFAULT_MIC_LIMITER;
+    storage_get_i32(NVS_KEY_MIC_LIMITER, &mic_limit, DEFAULT_MIC_LIMITER);
+    s_mic_limiter = mic_limit;
+
     int32_t gate_level = MIC_GATE_THRESHOLD;
     storage_get_i32(NVS_KEY_MIC_GATE_LEVEL, &gate_level, MIC_GATE_THRESHOLD);
     s_mic_gate_threshold = gate_level;
@@ -1325,8 +1410,13 @@ static esp_err_t write_with_mic_mix(const uint8_t *data, size_t len, size_t *byt
          * acima, sobe a voz sem trazer o chiado do silencio junto. */
         int32_t g = s_mic_digital_gain_x100;
         for (size_t i = 0; i < mic_samples; i++) {
-            int32_t amostra = ((int32_t)mic[i] * g) / 100;
-            music[i] = clamp_s16((int32_t)music[i] + amostra);
+            mic_mut[i] = clamp_s16(((int32_t)mic[i] * g) / 100);
+        }
+        /* Limitador antes de somar na musica: segurar o pico da VOZ e o que
+         * evita que a soma estoure. Ver aplicar_limitador(). */
+        aplicar_limitador(mic_mut, mic_samples);
+        for (size_t i = 0; i < mic_samples; i++) {
+            music[i] = clamp_s16((int32_t)music[i] + mic_mut[i]);
         }
 
         size_t chunk_written = 0;
@@ -1632,6 +1722,9 @@ static void mic_live_task(void *arg)
         for (size_t i = 0; i < amostras; i++) {
             buf[i] = clamp_s16(((int32_t)buf[i] * g) / 100);
         }
+        /* Limitador DEPOIS do ganho: e o ganho que cria os picos que ele
+         * precisa segurar. Ver aplicar_limitador(). */
+        aplicar_limitador(buf, amostras);
 
         /* Conta saturacao no sinal que REALMENTE sai. */
         {
@@ -1648,6 +1741,8 @@ static void mic_live_task(void *arg)
             if (++blocos_janela >= 344) {
                 s_mic_clip_conta = s_mic_clip_janela;
                 s_mic_clip_janela = 0;
+                s_mic_limit_conta = s_mic_limit_janela;
+                s_mic_limit_janela = 0;
                 blocos_janela = 0;
             }
         }

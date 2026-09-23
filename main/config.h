@@ -78,6 +78,7 @@
 #define NVS_KEY_RELAY_OPEN_DRAIN "relay_od"
 #define NVS_KEY_BT_RSSI_INTERVAL "bt_rssi_s"
 #define NVS_KEY_MIC_TREBLE      "mic_treble"
+#define NVS_KEY_MIC_LIMITER     "mic_limit"
 
 /* -------------------------------------------------------------------------
  * Valores padrão
@@ -219,6 +220,22 @@
  * -- e com as duas corrigidas o Celio aprovou o som COM o realce em zero.
  * O controle fica porque a fonte pode mudar; o padrao e nao mexer no timbre. */
 #define DEFAULT_MIC_TREBLE      0
+
+/* Limitador do microfone: 0 = desligado, 1-100 = quanto os picos sao segurados.
+ *
+ * Resolve o impasse do karaoke, que ganho fixo nao resolve: a voz precisa de
+ * volume MEDIO alto para competir com a musica de fundo, mas os PICOS estouram
+ * muito antes disso. Medido nesta montagem (2026-09-22) -- com ganho baixo o
+ * Celio relatou "qualidade boa mais baixo, nao cobriria um fundo de karaoke";
+ * subindo o ganho, "saturando um pouco".
+ *
+ * O limitador segura so os picos, deixando o resto passar inteiro. E o que
+ * qualquer mesa de som tem no canal de voz, e permite subir o volume medio sem
+ * que os transientes batam no teto.
+ *
+ * 60 e um ponto de partida: comeca a agir em ~70%% da escala, com reducao
+ * progressiva. Quem afina e o ouvido, pela pagina. */
+#define DEFAULT_MIC_LIMITER     60
 
 /* -------------------------------------------------------------------------
  * Volume fino (escala perceptual) — ver audio_codec.c

@@ -75,6 +75,10 @@
             <input type="range" id="mic_gain" min="0" max="100" value="60">
             <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Aplica na hora — dá pra cantar e ajustar ao vivo. Se ficar baixo, suba; se distorcer ou chiar muito, desça.</div>
 
+            <label for="mic_limiter">Limitador de picos <span id="mic-limiter-value">60</span></label>
+            <input type="range" id="mic_limiter" min="0" max="100" value="60">
+            <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Segura os picos da voz sem abaixar o resto &mdash; é o que permite o microfone <strong>cobrir a música</strong> sem estourar. <strong>Maior</strong> = segura mais cedo (voz mais firme e constante, pode soar comprimida). <strong>Menor</strong> = deixa passar mais pico (mais natural, mas satura antes). 0 desliga.</div>
+
             <label for="mic_treble">Brilho do microfone <span id="mic-treble-value">40</span></label>
             <input type="range" id="mic_treble" min="0" max="100" value="40">
             <div class="track-sub" style="margin:-0.4rem 0 0.6rem">Realça os agudos da voz. O microfone sem fio entrega o som abafado &mdash; medido: a energia cai ~25&nbsp;dB entre 500&nbsp;Hz e 4&nbsp;kHz, enquanto o caminho da placa está limpo (o ruído de fundo chega plano até 18&nbsp;kHz). Isto compensa, como o agudo de uma mesa de som. Aplica na hora: suba até a voz ficar clara, desça se ficar estridente.</div>
@@ -91,7 +95,15 @@
                 <span class="label">Saturação</span>
                 <span id="mic-clip">—</span>
             </div>
-            <div class="track-sub" style="margin:0.3rem 0 0.6rem">Deve ficar em <strong>sem saturação</strong> enquanto você canta. Se acusar saturação, <strong>baixe o volume do microfone</strong> &mdash; som saturado soa <em>abafado</em>, não alto, e a reação natural de subir ainda mais só piora. Se faltar volume de verdade, aumente no amplificador.</div>
+            <div class="row">
+                <span class="label">Limitador agindo</span>
+                <span id="mic-limit">—</span>
+            </div>
+            <div class="track-sub" style="margin:0.3rem 0 0.8rem"><strong>Como acertar, cantando:</strong><br>
+                1. Suba o <em>volume do microfone</em> até a voz cobrir bem a música.<br>
+                2. Olhe a <em>Saturação</em>: tem que ficar em <strong>sem saturação</strong>. Se acusar, suba o <em>limitador</em> &mdash; e só baixe o volume se mesmo assim continuar.<br>
+                3. Olhe o <em>Limitador agindo</em>: <strong>de vez em quando</strong> é o certo (ele está segurando os picos). <strong>O tempo todo</strong> quer dizer que o volume está alto demais e a voz vai soar sem vida.<br>
+                Som saturado soa <em>abafado</em>, não alto &mdash; por isso a reação de subir mais o volume costuma piorar.</div>
             <div class="meter" aria-hidden="true"><div id="mic-peak-bar"></div></div>
             <div class="track-sub" style="margin:0.3rem 0 0.6rem">Fale/cante e observe: o valor deve subir bem acima do portão na voz, e ficar bem abaixo no silêncio. Só atualiza com o microfone ligado.</div>
 
@@ -245,6 +257,10 @@ async function load() {
     document.getElementById("mic_auto_gate").checked = c.mic_auto_gate;
     document.getElementById("mic_gain").value = c.mic_gain;
     document.getElementById("mic-gain-value").textContent = c.mic_gain;
+    if (c.mic_limiter !== undefined) {
+        document.getElementById("mic_limiter").value = c.mic_limiter;
+        document.getElementById("mic-limiter-value").textContent = c.mic_limiter;
+    }
     if (c.mic_treble !== undefined) {
         document.getElementById("mic_treble").value = c.mic_treble;
         document.getElementById("mic-treble-value").textContent = c.mic_treble;
@@ -333,6 +349,21 @@ async function refreshClip() {
     try {
         const r = await fetch("/api/status");
         const d = await r.json();
+        /* Limitador agindo: e o "gain reduction" das mesas. Sem ver isso,
+           ajustar o limitador seria adivinhacao. */
+        const elLim = document.getElementById("mic-limit");
+        if (d.mic_limit_hits !== undefined) {
+            if (d.mic_limit_hits === 0) {
+                elLim.textContent = "não está agindo";
+                elLim.style.color = "";
+            } else if (d.mic_limit_hits < 800) {
+                elLim.textContent = "segurando picos (" + d.mic_limit_hits + "/s)";
+                elLim.style.color = "#6ce08a";
+            } else {
+                elLim.textContent = "agindo o tempo todo (" + d.mic_limit_hits + "/s)";
+                elLim.style.color = "#e0c06c";
+            }
+        }
         const el = document.getElementById("mic-clip");
         if (d.mic_clip === undefined) { el.textContent = "—"; return; }
         if (d.mic_clip === 0) {
@@ -346,6 +377,14 @@ async function refreshClip() {
 }
 refreshClip();
 setInterval(refreshClip, 1000);
+
+const micLimiter = document.getElementById("mic_limiter");
+micLimiter.addEventListener("input", () => {
+    document.getElementById("mic-limiter-value").textContent = micLimiter.value;
+});
+micLimiter.addEventListener("change", async () => {
+    await apiPost("/api/config", { mic_limiter: parseInt(micLimiter.value, 10) });
+});
 
 const micTreble = document.getElementById("mic_treble");
 micTreble.addEventListener("input", () => {
