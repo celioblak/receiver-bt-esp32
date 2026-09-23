@@ -175,9 +175,10 @@
  * era cancelada na subtracao e sobrava o ruido de cada um. Ver o
  * comentario de historico em es8388.c. */
 /* 4 = ES8388_IN_LIN2_SE_DIR. Ver o comentario do enum em es8388.h: o plugue
- * de 2 faixas do microfone aterra um canal do jack, e ler o canal com sinal
- * diretamente da +8dB em 2-3kHz contra o modo diferencial, que recuperava o
- * audio por subtracao mas filtrava os agudos no caminho. */
+ * mono do microfone chega em so um dos contatos do plugue, deixando o outro
+ * SOLTO. Ler o canal com sinal diretamente da +8dB em 2-3kHz contra o modo
+ * diferencial, que subtrai de um pino flutuando -- e pino flutuando e antena,
+ * entao o ruido que ele capta entra junto com a voz. */
 #define DEFAULT_MIC_INPUT       4
 
 /* Deteccao automatica de voz no mic (noise gate) -- ligada por padrao.
@@ -216,7 +217,7 @@
  * 40 é um ponto de partida (~+5dB); quem afina é o ouvido, pela página. */
 /* 0 = desligado. Nasceu em 40 para compensar um abafamento que se acreditava
  * vir da fonte. Depois se descobriu que a causa real era outra -- o adaptador
- * de 2 faixas aterrando um canal do jack, e o ganho digital saturando a saida
+ * levando o sinal a so um canal do jack, e o ganho digital saturando a saida
  * -- e com as duas corrigidas o Celio aprovou o som COM o realce em zero.
  * O controle fica porque a fonte pode mudar; o padrao e nao mexer no timbre. */
 #define DEFAULT_MIC_TREBLE      0

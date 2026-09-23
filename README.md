@@ -199,9 +199,9 @@ O microfone passou a captar bem, mas o som soava "abafado, como caixa antiga". N
 
 Crista de 1,7:1 é sinal esmagado (voz natural fica entre 4:1 e 10:1) — e **nenhuma amostra batia em 32.767**, ou seja não era clipe digital: era saturação analógica no próprio PGA. Hoje `0x33` (+9 dB).
 
-**2. O adaptador do microfone aterra um canal do jack.** O plugue de 2 faixas (TS) tem o corpo encostando no anel *e* no terra, então um canal fica em curto e o sinal aparece só no outro. Medido: canal esquerdo pico 51, diferencial 8.045, **canal direito 3.077**.
+**2. O sinal chega em só um dos canais do jack.** A fonte é mono (receptor com saída P10 mono) e o adaptador leva o sinal a apenas um dos contatos do P2, deixando o outro **solto**. Medido: canal esquerdo pico 51, diferencial 8.045, **canal direito 3.077**.
 
-O modo diferencial "funcionava" recuperando o sinal como `0 − sinal`, mas o capacitor de acoplamento do canal aterrado ficava em curto, formando um filtro que comia os agudos:
+O modo diferencial funciona — ele subtrai os dois canais e a voz aparece — mas subtrai de um **pino flutuando**, e pino flutuando é antena: o ruído que ele capta entra na conta junto com a voz. Lendo o canal com sinal diretamente:
 
 | faixa | diferencial | canal direto |
 |---|---|---|
@@ -217,7 +217,7 @@ Daí o modo `ES8388_IN_LIN2_SE_DIR`, que lê o canal direito direto.
 
 Essa é a mudança mais provável de quebrar a captação no futuro, e o sintoma é confuso: **o som some ou fica muito fraco**, sem nenhum erro no log.
 
-A causa é mecânica. Um plugue **mono** (2 faixas — o comum em microfone) encaixado num jack estéreo tem o corpo encostando no anel *e* no terra: **um dos canais fica aterrado**, e o sinal aparece só no outro. Qual deles depende de como o adaptador foi montado, e não há padrão confiável entre fabricantes.
+A causa é a ligação do adaptador. Uma fonte **mono** chega a apenas um dos contatos do plugue P2, e o outro fica **solto** — ou, se o adaptador for de 2 faixas, **aterrado**. Em qualquer dos casos **só um canal recebe sinal**, e qual deles depende de como o adaptador foi montado: não há padrão confiável entre fabricantes.
 
 Por isso a entrada é selecionável em Configurações, com as opções descritas pela **situação física** e não pela eletrônica:
 
@@ -260,7 +260,7 @@ Resumo do que foi resolvido, do que ficou aberto e do que medir quando o adaptad
 | estalo por palavra | a task **parava de escrever** no I2S no silêncio | fluxo contínuo, sem descontinuidade |
 | atraso no início | detecção pelo **pico do bloco** + unmute no caminho crítico | envelope por amostra, ~70 ms → ~35 ms |
 | som esmagado | PGA em **+21 dB** saturando no analógico | crista 1,7:1 → 3,5:1 |
-| "caixa antiga" | **adaptador de 2 faixas aterra um canal**; a subtração recuperava o sinal mas filtrava agudos | **+8 dB** em 2-3 kHz, +7,7 dB em 4-6 kHz |
+| "caixa antiga" | **sinal em só um canal do jack**; o modo diferencial subtraía de um pino flutuando (antena) | **+8 dB** em 2-3 kHz, +7,7 dB em 4-6 kHz |
 | saturação na saída | ganho digital em 4× | pico 34.014 → sem clipping |
 
 #### O teto que restou

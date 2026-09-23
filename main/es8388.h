@@ -86,18 +86,23 @@ typedef enum {
     ES8388_IN_DIFF_MIC2,   /* 0x0A=0xF0 0x0B=0x82: diferencial LIN2-RIN2 */
     /* 0x0A=0x50 lendo o canal DIREITO do conversor.
      *
-     * E o modo certo para um microfone com plugue de 2 faixas (TS) ligado por
-     * adaptador: o corpo do plugue encosta no anel E no terra do jack, entao
-     * um canal fica curto-circuitado ao terra e o sinal fica no outro. Medido
-     * nesta montagem (2026-09-22): canal esquerdo pico 51 (nada), diferencial
-     * 8045, canal direito 3077.
+     * E o modo certo quando a fonte e MONO e o adaptador leva o sinal para so
+     * um dos contatos do plugue, deixando o outro SOLTO. E o caso desta
+     * montagem: receptor com saida P10 mono, adaptador para P2 estereo (3
+     * faixas). Medido em 2026-09-22: canal esquerdo pico 51 (nada), canal
+     * direito 3077, diferencial 8045.
      *
-     * O diferencial "funciona" por acidente -- recupera o sinal como 0 menos
-     * sinal -- mas paga caro: o capacitor de acoplamento do canal aterrado
-     * fica em curto e forma um filtro que come os agudos. Medido lado a lado,
-     * ler o canal direto da +8dB em 2-3kHz e +7,7dB em 4-6kHz, e a relacao
-     * graves/agudos cai de 487x para 117x. Era a causa do "parece caixa
-     * antiga". */
+     * O modo diferencial funciona -- ele subtrai os dois canais e o sinal
+     * aparece -- mas subtrai de um PINO FLUTUANDO, e pino flutuando e antena.
+     * O ruido que ele capta entra na conta junto com a voz. Medido lado a
+     * lado, ler o canal com sinal diretamente da +8dB em 2-3kHz e +7,7dB em
+     * 4-6kHz, com a relacao graves/agudos caindo de 487x para 117x. Era a
+     * causa do "parece caixa antiga".
+     *
+     * CORRECAO DE UMA EXPLICACAO ERRADA: a primeira versao deste comentario
+     * dizia que o plugue era de 2 faixas e aterrava um canal, formando um
+     * curto que filtrava agudos. O Celio corrigiu -- o adaptador dele ja e de
+     * 3 faixas. Os NUMEROS estavam certos, a explicacao nao. */
     ES8388_IN_LIN2_SE_DIR,
     ES8388_IN_COUNT
 } es8388_mic_input_t;
